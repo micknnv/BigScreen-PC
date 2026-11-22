@@ -36,6 +36,12 @@ add_custom_command(TARGET driver_bigscreen_desktop POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:driver_bigscreen_desktop>" "${DRIVER_ROOT}/bin/win64/driver_bigscreen_desktop.dll"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/driver.vrdrivermanifest" "${DRIVER_ROOT}/driver.vrdrivermanifest"
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/resources/settings/default.vrsettings" "${DRIVER_ROOT}/resources/settings/default.vrsettings"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/runtime/driver/bin/win64"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/runtime/driver/resources/settings"
+  COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:driver_bigscreen_desktop>" "${CMAKE_BINARY_DIR}/runtime/driver/bin/win64/driver_bigscreen_desktop.dll"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/driver.vrdrivermanifest" "${CMAKE_BINARY_DIR}/runtime/driver/driver.vrdrivermanifest"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/resources/settings/default.vrsettings" "${CMAKE_BINARY_DIR}/runtime/driver/resources/settings/default.vrsettings"
+  COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:driver_bigscreen_desktop>" "${CMAKE_BINARY_DIR}/runtime/driver_bigscreen_desktop.dll"
 )
 
 add_executable(BigscreenDesktopBridge WIN32
@@ -44,9 +50,19 @@ add_executable(BigscreenDesktopBridge WIN32
 target_include_directories(BigscreenDesktopBridge PRIVATE src)
 target_compile_features(BigscreenDesktopBridge PRIVATE cxx_std_17)
 target_compile_definitions(BigscreenDesktopBridge PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _AMD64_ _WIN64)
-target_include_directories(BigscreenDesktopBridge PRIVATE
-  "C:/Program Files (x86)/Windows Kits/10/Include/10.0.19041.0/cppwinrt"
-)
+
+if(DEFINED ENV{WindowsSdkDir} AND DEFINED ENV{WindowsSDKVersion})
+  target_include_directories(BigscreenDesktopBridge PRIVATE "$ENV{WindowsSdkDir}Include/$ENV{WindowsSDKVersion}cppwinrt")
+elseif(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+  target_include_directories(BigscreenDesktopBridge PRIVATE "C:/Program Files (x86)/Windows Kits/10/Include/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/cppwinrt")
+else()
+  file(GLOB WINSDK_DIRS "C:/Program Files (x86)/Windows Kits/10/Include/10.*/cppwinrt")
+  if(WINSDK_DIRS)
+    list(GET WINSDK_DIRS -1 LATEST_CPPWINRT)
+    target_include_directories(BigscreenDesktopBridge PRIVATE "${LATEST_CPPWINRT}")
+  endif()
+endif()
+
 target_link_libraries(BigscreenDesktopBridge PRIVATE setupapi hid runtimeobject)
 set_target_properties(BigscreenDesktopBridge PROPERTIES
   OUTPUT_NAME "BigscreenDesktopBridge"
@@ -74,6 +90,9 @@ add_custom_command(TARGET BigscreenDesktopViewer POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${OPENVR_SDK_ROOT}/bin/win64/openvr_api.dll"
     "$<TARGET_FILE_DIR:BigscreenDesktopViewer>/openvr_api.dll"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${OPENVR_SDK_ROOT}/bin/win64/openvr_api.dll"
+    "${CMAKE_BINARY_DIR}/runtime/openvr_api.dll"
 )
 
 add_library(BigscreenThirdPersonGpuExport SHARED
@@ -89,14 +108,6 @@ set_target_properties(BigscreenThirdPersonGpuExport PROPERTIES
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
 )
 
-foreach(runtime_target BigscreenDesktopBridge BigscreenDesktopViewer BigscreenThirdPersonGpuExport)
-  set_target_properties(${runtime_target} PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/runtime"
-    LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/runtime"
-    ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/runtime"
-  )
-endforeach()
-
 add_executable(BigscreenThirdPersonHost WIN32
   src/third_person_host.cpp
 )
@@ -107,8 +118,30 @@ target_link_libraries(BigscreenThirdPersonHost PRIVATE "${FRIDA_CORE_DEVKIT_ROOT
 set_target_properties(BigscreenThirdPersonHost PROPERTIES
   OUTPUT_NAME "BigscreenThirdPersonHost"
   WIN32_EXECUTABLE TRUE
-  RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/runtime"
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+
+foreach(runtime_target BigscreenDesktopBridge BigscreenDesktopViewer BigscreenThirdPersonGpuExport BigscreenThirdPersonHost)
+  set_target_properties(${runtime_target} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/runtime"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/runtime"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/runtime"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/runtime"
+    LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/runtime"
+    LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/runtime"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/runtime"
+    ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/runtime"
+    ARCHIVE_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/runtime"
+  )
+endforeach()
+
+add_custom_target(stage_bundle_assets ALL
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/runtime"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/licenses/FRIDA-CORE-COPYING.txt" "${CMAKE_BINARY_DIR}/runtime/FRIDA-CORE-COPYING.txt"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/licenses/FRIDA-GUM-COPYING.txt" "${CMAKE_BINARY_DIR}/runtime/FRIDA-GUM-COPYING.txt"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/licenses/FRIDA-IL2CPP-BRIDGE-LICENSE.txt" "${CMAKE_BINARY_DIR}/runtime/FRIDA-IL2CPP-BRIDGE-LICENSE.txt"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/licenses/FRIDA-THIRD-PARTY-NOTICES.txt" "${CMAKE_BINARY_DIR}/runtime/FRIDA-THIRD-PARTY-NOTICES.txt"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/runtime_camera_probe/v24_gpu_only.js" "${CMAKE_BINARY_DIR}/runtime/third_person_agent.js"
 )
 
 add_executable(BigscreenFrameDump

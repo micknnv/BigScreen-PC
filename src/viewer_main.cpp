@@ -184,27 +184,42 @@ bool OpenLiveMapping() {
     return true;
 }
 
-bool SelectNvidiaAdapter() {
+bool SelectGraphicsAdapter() {
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+    IDXGIAdapter1* fallback = nullptr;
+    DXGI_ADAPTER_DESC1 fallbackDesc{};
     for (UINT index = 0; ; ++index) {
         IDXGIAdapter1* candidate = nullptr;
         if (factory->EnumAdapters1(index, &candidate) == DXGI_ERROR_NOT_FOUND) break;
         DXGI_ADAPTER_DESC1 desc{};
         if (candidate && SUCCEEDED(candidate->GetDesc1(&desc)) &&
-            (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 && desc.VendorId == 0x10DE) {
-            g_adapter = candidate;
-            Log("Viewer adapter: %ls", desc.Description);
-            break;
+            (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
+            if (desc.VendorId == 0x10DE) {
+                g_adapter = candidate;
+                Log("Viewer adapter (NVIDIA): %ls", desc.Description);
+                break;
+            } else if (!fallback) {
+                fallback = candidate;
+                fallbackDesc = desc;
+                continue;
+            }
         }
         if (candidate) candidate->Release();
+    }
+    if (!g_adapter && fallback) {
+        g_adapter = fallback;
+        Log("Viewer adapter (Hardware): %ls", fallbackDesc.Description);
+        fallback = nullptr;
+    } else if (fallback) {
+        fallback->Release();
     }
     factory->Release();
     return g_adapter != nullptr;
 }
 
 bool InitD3D() {
-    if (!SelectNvidiaAdapter()) return false;
+    if (!SelectGraphicsAdapter()) return false;
     RECT rect{};
     GetClientRect(g_hwnd, &rect);
     DXGI_SWAP_CHAIN_DESC swapDesc{};

@@ -61,8 +61,10 @@ std::string read_agent(const fs::path& path, const fs::path& runtime) {
     std::ifstream input(path, std::ios::binary);
     if (!input) return {};
     std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    const std::string dll = utf8(runtime / "BigscreenThirdPersonGpuExport.dll");
-    const std::string report = utf8(local_app_data() / "BigscreenNOVR" / "BigscreenV24-GPU.txt");
+    std::string dll = utf8(runtime / "BigscreenThirdPersonGpuExport.dll");
+    std::string report = utf8(local_app_data() / "BigscreenNOVR" / "BigscreenV24-GPU.txt");
+    for (char& c : dll) if (c == '\\') c = '/';
+    for (char& c : report) if (c == '\\') c = '/';
     size_t pos = 0;
     const std::string dll_token = "BigscreenThirdPersonGpuExport.dll";
     while ((pos = source.find(dll_token, pos)) != std::string::npos) { source.replace(pos, dll_token.size(), dll); pos += dll.size(); }
@@ -80,9 +82,25 @@ void on_detached(FridaSession*, FridaSessionDetachReason, FridaCrash*, gpointer)
 void on_message(FridaScript*, const gchar* message, GBytes*, gpointer) {
     if (!message) return;
     const std::string text(message);
-    if (text.find("agent_ready") != std::string::npos || text.find("hooks_installed") != std::string::npos) status("Starting");
-    if (text.find("running") != std::string::npos) status("Running");
-    if (text.find("metadata_missing") != std::string::npos || text.find("objects_missing") != std::string::npos || text.find("activation_error") != std::string::npos || text.find("frame_error") != std::string::npos) status("Unavailable");
+    if (text.find("agent_ready") != std::string::npos ||
+        text.find("hooks_installed") != std::string::npos ||
+        text.find("hooks installed") != std::string::npos) {
+        status("Starting");
+    }
+    if (text.find("running") != std::string::npos ||
+        text.find("live GPU frames") != std::string::npos) {
+        status("Running");
+    }
+    if (text.find("metadata_missing") != std::string::npos ||
+        text.find("metadata missing") != std::string::npos ||
+        text.find("objects_missing") != std::string::npos ||
+        text.find("objects missing") != std::string::npos ||
+        text.find("activation_error") != std::string::npos ||
+        text.find("activation error") != std::string::npos ||
+        text.find("frame_error") != std::string::npos ||
+        text.find("frame error") != std::string::npos) {
+        status("Unavailable");
+    }
 }
 
 gboolean monitor_target(gpointer user_data) {

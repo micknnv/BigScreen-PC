@@ -363,6 +363,14 @@ fn get_settings() -> SettingState {
 fn get_bindings() -> BindingFile { load_bindings() }
 
 #[tauri::command]
+fn reset_bindings() -> Result<BindingFile, String> {
+    let defaults = default_bindings();
+    let _ = fs::remove_file(bindings_path());
+    save_bindings_file(&defaults)?;
+    Ok(defaults)
+}
+
+#[tauri::command]
 fn save_bindings(bindings: BindingFile) -> Result<BindingFile, String> {
     let defaults = default_bindings();
     if bindings.bindings.keys().any(|name| !defaults.bindings.contains_key(name)) {
@@ -382,9 +390,9 @@ fn controller_snapshot() -> ControllerSnapshot {
     unsafe {
         let mapping = OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr());
         if mapping == 0 { return ControllerSnapshot { connected: false, buttons: 0, dpad: 8 }; }
-        let ptr = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, size_of::<[u8; 40]>());
+        let ptr = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, size_of::<[u8; 48]>());
         if ptr.is_null() { CloseHandle(mapping); return ControllerSnapshot { connected: false, buttons: 0, dpad: 8 }; }
-        let bytes = std::slice::from_raw_parts(ptr as *const u8, 40);
+        let bytes = std::slice::from_raw_parts(ptr as *const u8, 48);
         let connected = u32::from_ne_bytes(bytes[12..16].try_into().unwrap()) != 0;
         let buttons = u32::from_ne_bytes(bytes[40..44].try_into().unwrap());
         let dpad = u32::from_ne_bytes(bytes[44..48].try_into().unwrap());
@@ -409,9 +417,9 @@ fn controller_command() -> ControllerCommand {
     unsafe {
         let mapping = OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr());
         if mapping == 0 { return ControllerCommand { view_request: 0, reset_epoch: 0, virtual_controllers_enabled: true, camera_index: 0, camera_distance: 2.5, camera_height: 0.6, camera_fov: 60.0 }; }
-        let ptr = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, size_of::<[u8; 48]>());
+        let ptr = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, size_of::<[u8; 40]>());
         if ptr.is_null() { CloseHandle(mapping); return ControllerCommand { view_request: 0, reset_epoch: 0, virtual_controllers_enabled: true, camera_index: 0, camera_distance: 2.5, camera_height: 0.6, camera_fov: 60.0 }; }
-        let bytes = std::slice::from_raw_parts(ptr as *const u8, 48);
+        let bytes = std::slice::from_raw_parts(ptr as *const u8, 40);
         let u32_at = |offset: usize| u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
         let f32_at = |offset: usize| f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
         let result = ControllerCommand {
@@ -449,8 +457,51 @@ fn save_settings(settings: SettingState) -> SettingState {
     settings
 }
 
+fn ensure_driver_registered() {
+    let driver_dir = runtime_candidates()
+        .into_iter()
+        .find_map(|p| {
+            if p.join("driver").join("driver.vrdrivermanifest").is_file() {
+                Some(p.join("driver"))
+            } else if p.join("driver.vrdrivermanifest").is_file() {
+                Some(p)
+            } else {
+                None
+            }
+        });
+
+    let Some(driver_path) = driver_dir else { return; };
+
+    let openvr_paths = dirs::data_local_dir()
+        .map(|p| p.join("openvr").join("openvrpaths.vrpath"));
+
+    let vrpathreg = openvr_paths.and_then(|p| {
+        let content = fs::read_to_string(p).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let runtimes = v.get("runtime")?.as_array()?;
+        for r in runtimes {
+            if let Some(r_str) = r.as_str() {
+                let candidate = PathBuf::from(r_str).join("bin").join("win64").join("vrpathreg.exe");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    });
+
+    if let Some(reg) = vrpathreg {
+        let _ = Command::new(&reg)
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["adddriver", &driver_path.to_string_lossy()])
+            .output();
+        log_event("steamvr_driver_registered");
+    }
+}
+
 #[tauri::command]
 fn start_novr(state: tauri::State<'_, RuntimeState>) -> Result<String, String> {
+    ensure_driver_registered();
     let settings = get_settings();
     let mut owned = state
         .0
@@ -608,6 +659,7 @@ pub fn run() {
             get_settings,
             get_bindings,
             save_bindings,
+            reset_bindings,
             get_controller_status,
             get_controller_command,
             save_settings,

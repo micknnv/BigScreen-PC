@@ -18,7 +18,7 @@ Il2Cpp.perform(() => {
     const controllerClass = allClasses().find(c => c.namespace === "Bigscreen.CaptureMode" && c.name === "CaptureCameraController");
     const late = captureClass?.methods.find(m => m.name === "LateUpdate" && m.parameterCount === 0);
     const controllerUpdate = controllerClass?.methods.find(m => m.name === "Update" && m.parameterCount === 0);
-    if (!goClass || !resources || !cameraClass || !componentClass || !rtClass || !texClass || !vec3Class || !quatClass || !captureClass || !late || !controllerUpdate) { console.log("V24 STOP required metadata missing"); return; }
+    if (!goClass || !resources || !cameraClass || !componentClass || !rtClass || !texClass || !vec3Class || !quatClass || !captureClass || !late || !controllerUpdate) { console.log("V24 STOP required metadata_missing"); return; }
     console.log(`V24 metadata CaptureCamera.LateUpdate=${late} Controller.Update=${controllerUpdate}`);
 
     const findAll = resources.methods.find(m => m.name === "FindObjectsOfTypeAll" && m.parameterCount === 1);
@@ -35,7 +35,7 @@ Il2Cpp.perform(() => {
             if (name === "LocalAvatar_Stronk(Clone)") { avatarGo = go; avatarTransform = go.method("get_transform").invoke(); }
         } catch (_) {}
     }
-    if (!captureGo || !captureCamera || !avatarGo || !avatarTransform) { console.log(`V24 STOP objects capture=${!!captureGo} avatar=${!!avatarGo}`); return; }
+    if (!captureGo || !captureCamera || !avatarGo || !avatarTransform) { console.log(`V24 STOP objects_missing capture=${!!captureGo} avatar=${!!avatarGo}`); return; }
     console.log(`V24 live objects captureGo=${captureGo.handle} avatar=${avatarGo.handle}`);
 
     const zeroObject = () => new Il2Cpp.Object(ptr(0));
@@ -95,7 +95,7 @@ Il2Cpp.perform(() => {
             const rc = initExport(p, Memory.allocUtf16String(exportReportPath));
             if (rc !== 0) throw new Error(`GPU export init rc=${rc}`);
             initialized = true; console.log(`V24 CaptureCamera activated RT=${rt.handle} native=${p} export initialized rc=${rc}`);
-        } catch (e) { console.log(`V24 activation error=${e}`); cleanup(); }
+        } catch (e) { console.log(`V24 activation_error=${e}`); cleanup(); }
         updateHook?.detach();
     }});
     lateHook = Interceptor.attach(late.virtualAddress, { onLeave() {
@@ -118,9 +118,12 @@ Il2Cpp.perform(() => {
             if (setFieldOfView) setFieldOfView.invoke(control.cameraFov);
             const native = rt.method("GetNativeTexturePtr").invoke(); const p = native.handle ?? native;
             const rc = copyExport(p); if (rc !== 0 && frame % 60 === 0) console.log(`V24 export copy rc=${rc}`);
-            if (++frame % 60 === 0) console.log(`V24 live GPU frames=${frame} mainTid=${Process.getCurrentThreadId()} camera=${cameraPos.x.toFixed(2)},${cameraPos.y.toFixed(2)},${cameraPos.z.toFixed(2)}`);
-        } catch (e) { console.log(`V24 frame error=${e}`); cleanup(); }
+            if (++frame === 1) {
+                console.log("V24 running");
+            }
+            if (frame % 60 === 0) console.log(`V24 running live GPU frames=${frame} mainTid=${Process.getCurrentThreadId()} camera=${cameraPos.x.toFixed(2)},${cameraPos.y.toFixed(2)},${cameraPos.z.toFixed(2)}`);
+        } catch (e) { console.log(`V24 frame_error=${e}`); cleanup(); }
     }});
-    console.log("V24 GPU-only hooks installed; waiting for activation");
+    console.log("V24 GPU-only hooks_installed; waiting for activation");
     setTimeout(cleanup, 120000);
 });

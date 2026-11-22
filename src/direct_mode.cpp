@@ -67,29 +67,50 @@ bool DirectMode::InitializeGraphicsIdentity() {
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
 
-    bool found = false;
-    for (UINT index = 0; !found; ++index) {
+    IDXGIAdapter1* fallbackAdapter = nullptr;
+    DXGI_ADAPTER_DESC1 fallbackDesc{};
+
+    for (UINT index = 0; !adapter_; ++index) {
         IDXGIAdapter1* candidate = nullptr;
         if (factory->EnumAdapters1(index, &candidate) == DXGI_ERROR_NOT_FOUND) break;
         if (!candidate) continue;
 
         DXGI_ADAPTER_DESC1 desc{};
         if (SUCCEEDED(candidate->GetDesc1(&desc)) &&
-            (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 &&
-            desc.VendorId == 0x10DE) {
-            adapter_ = candidate;
-            adapterLuid_ = (static_cast<uint64_t>(static_cast<uint32_t>(desc.AdapterLuid.HighPart)) << 32) |
-                           static_cast<uint64_t>(desc.AdapterLuid.LowPart);
-            found = true;
-            char line[192];
-            sprintf_s(line, "Direct Mode graphics adapter selected: %ls LUID=0x%016llX",
-                      desc.Description, static_cast<unsigned long long>(adapterLuid_));
-            vr::VRDriverLog()->Log(line);
-        } else {
-            candidate->Release();
+            (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
+            if (desc.VendorId == 0x10DE) {
+                adapter_ = candidate;
+                adapterLuid_ = (static_cast<uint64_t>(static_cast<uint32_t>(desc.AdapterLuid.HighPart)) << 32) |
+                               static_cast<uint64_t>(desc.AdapterLuid.LowPart);
+                char line[192];
+                sprintf_s(line, "Direct Mode graphics adapter selected (NVIDIA): %ls LUID=0x%016llX",
+                          desc.Description, static_cast<unsigned long long>(adapterLuid_));
+                vr::VRDriverLog()->Log(line);
+                break;
+            } else if (!fallbackAdapter) {
+                fallbackAdapter = candidate;
+                fallbackDesc = desc;
+                continue;
+            }
         }
+        candidate->Release();
     }
 
+    if (!adapter_ && fallbackAdapter) {
+        adapter_ = fallbackAdapter;
+        adapterLuid_ = (static_cast<uint64_t>(static_cast<uint32_t>(fallbackDesc.AdapterLuid.HighPart)) << 32) |
+                       static_cast<uint64_t>(fallbackDesc.AdapterLuid.LowPart);
+        char line[192];
+        sprintf_s(line, "Direct Mode graphics adapter selected (Hardware): %ls LUID=0x%016llX",
+                  fallbackDesc.Description, static_cast<unsigned long long>(adapterLuid_));
+        vr::VRDriverLog()->Log(line);
+        fallbackAdapter = nullptr;
+    } else if (fallbackAdapter) {
+        fallbackAdapter->Release();
+        fallbackAdapter = nullptr;
+    }
+
+    const bool found = adapter_ != nullptr;
     if (found) {
         D3D_FEATURE_LEVEL level{};
         ID3D11Device* device = nullptr;
@@ -102,6 +123,7 @@ bool DirectMode::InitializeGraphicsIdentity() {
             adapter_->Release();
             adapter_ = nullptr;
             adapterLuid_ = 0;
+            factory->Release();
             return false;
         }
         d3dDevice_ = device;

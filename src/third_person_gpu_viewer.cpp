@@ -60,11 +60,17 @@ bool InitD3D() {
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
     IDXGIAdapter1* adapter = nullptr;
+    IDXGIAdapter1* fallback = nullptr;
     for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
         DXGI_ADAPTER_DESC1 d{}; adapter->GetDesc1(&d);
-        if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && d.VendorId == 0x10DE) break;
+        if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            if (d.VendorId == 0x10DE) break;
+            if (!fallback) { fallback = adapter; continue; }
+        }
         adapter->Release(); adapter = nullptr;
     }
+    if (!adapter && fallback) { adapter = fallback; fallback = nullptr; }
+    if (fallback) fallback->Release();
     if (!adapter) { factory->Release(); return false; }
     DXGI_ADAPTER_DESC1 desc{}; adapter->GetDesc1(&desc);
     char name[256]{}; WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name), nullptr, nullptr);

@@ -41,10 +41,11 @@ bool ConfiguredGamepadAction(const std::map<bigscreen_bindings::Action, bigscree
     const auto it = bindings.find(action);
     if (it == bindings.end() || it->second.device != bigscreen_bindings::Device::Gamepad) return false;
     const int code = it->second.code;
-    if (code == 4) return controller.leftTrigger > 0.5f;
-    if (code == 5) return controller.rightTrigger > 0.5f;
     if (code >= 0x40) return (CanonicalDpadMask(controller.dpad) & static_cast<uint32_t>(code)) != 0;
-    return code >= 0 && code < 32 && (controller.buttons & (1u << code)) != 0;
+    if (code >= 0 && code < 32 && (controller.buttons & (1u << code)) != 0) return true;
+    if (code == 4 && controller.leftTrigger > 0.5f) return true;
+    if (code == 5 && controller.rightTrigger > 0.5f) return true;
+    return false;
 }
 vr::IVRServerDriverHost* g_host = nullptr;
 vr::IVRDriverInput* g_input = nullptr;

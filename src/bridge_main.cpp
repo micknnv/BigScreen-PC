@@ -81,10 +81,11 @@ bool GamepadActionDown(const std::map<bigscreen_bindings::Action, bigscreen_bind
     const auto it = bindings.find(action);
     if (it == bindings.end() || it->second.device != bigscreen_bindings::Device::Gamepad) return false;
     const int code = it->second.code;
-    if (code == 4) return xbox.leftTrigger > 0.5f;
-    if (code == 5) return xbox.rightTrigger > 0.5f;
     if (code >= 0x40) return (CanonicalDpadMask(xbox.dpad) & static_cast<uint32_t>(code)) != 0;
-    return code >= 0 && code < 32 && (xbox.buttons & (1u << code)) != 0;
+    if (code >= 0 && code < 32 && (xbox.buttons & (1u << code)) != 0) return true;
+    if (code == 4 && xbox.leftTrigger > 0.5f) return true;
+    if (code == 5 && xbox.rightTrigger > 0.5f) return true;
+    return false;
 }
 
 float NormalizeAxis(ULONG value, const HIDP_VALUE_CAPS& caps) {

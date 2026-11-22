@@ -62,7 +62,11 @@ The NSIS installer is generated under:
 ui/src-tauri/target/debug/bundle/nsis/
 ```
 
-The native runtime must be built into `build/native-frida/runtime` before bundling so the bridge, viewer, host, GPU export, OpenVR, and Frida runtime assets are included.
+The native runtime must be built into `build/native-frida/runtime` before bundling so the bridge, viewer, host, GPU export, OpenVR, and Frida runtime assets are included. You can use the helper script to verify and stage these assets:
+
+```powershell
+./scripts/prepare_runtime.ps1
+```
 
 ## Repository notes
 
