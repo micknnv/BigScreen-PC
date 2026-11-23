@@ -5,14 +5,31 @@ if(NOT WIN32)
   message(FATAL_ERROR "This prototype currently targets Windows only.")
 endif()
 
-set(OPENVR_SDK_ROOT "" CACHE PATH "Path to a Valve OpenVR SDK checkout")
-if(NOT EXISTS "${OPENVR_SDK_ROOT}/headers/openvr_driver.h")
-  message(FATAL_ERROR "Set OPENVR_SDK_ROOT to an OpenVR SDK checkout containing headers/openvr_driver.h")
+# Check Windows Environment variable first, fallback to your hardcoded path
+if(NOT OPENVR_SDK_ROOT)
+  if(DEFINED ENV{OPENVR_SDK_ROOT})
+    set(OPENVR_SDK_ROOT "$ENV{OPENVR_SDK_ROOT}")
+  else()
+    # Replace this path with your actual OpenVR folder (use forward slashes '/')
+    set(OPENVR_SDK_ROOT "D:/VS-Resources/openvr" CACHE PATH "Path to a Valve OpenVR SDK checkout" FORCE)
+  endif()
 endif()
 
-set(FRIDA_CORE_DEVKIT_ROOT "" CACHE PATH "Path to the official Frida Core Windows x64 devkit")
+if(NOT EXISTS "${OPENVR_SDK_ROOT}/headers/openvr_driver.h")
+  message(FATAL_ERROR "Set OPENVR_SDK_ROOT to an OpenVR SDK checkout containing headers/openvr_driver.h - Currently looking in: ${OPENVR_SDK_ROOT}")
+endif()
+
+if(NOT FRIDA_CORE_DEVKIT_ROOT)
+  if(DEFINED ENV{FRIDA_CORE_DEVKIT_ROOT})
+    set(FRIDA_CORE_DEVKIT_ROOT "$ENV{FRIDA_CORE_DEVKIT_ROOT}")
+  else()
+    # Replace with your actual path to the folder containing frida-core.h and frida-core.lib
+    set(FRIDA_CORE_DEVKIT_ROOT "D:/VS-Resources/frida-devkit" CACHE PATH "Path to an official Frida Core devkit" FORCE)
+  endif()
+endif()
+
 if(NOT EXISTS "${FRIDA_CORE_DEVKIT_ROOT}/frida-core.h" OR NOT EXISTS "${FRIDA_CORE_DEVKIT_ROOT}/frida-core.lib")
-  message(FATAL_ERROR "Set FRIDA_CORE_DEVKIT_ROOT to an official Frida Core devkit containing frida-core.h and frida-core.lib")
+  message(FATAL_ERROR "Set FRIDA_CORE_DEVKIT_ROOT to an official Frida Core devkit containing frida-core.h and frida-core.lib - Currently looking in: ${FRIDA_CORE_DEVKIT_ROOT}")
 endif()
 
 add_library(driver_bigscreen_desktop SHARED
@@ -49,7 +66,7 @@ add_executable(BigscreenDesktopBridge WIN32
 )
 target_include_directories(BigscreenDesktopBridge PRIVATE src)
 target_compile_features(BigscreenDesktopBridge PRIVATE cxx_std_17)
-target_compile_definitions(BigscreenDesktopBridge PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _AMD64_ _WIN64)
+target_compile_definitions(BigscreenDesktopBridge PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _AMD64_ _WIN64 _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
 
 if(DEFINED ENV{WindowsSdkDir} AND DEFINED ENV{WindowsSDKVersion})
   target_include_directories(BigscreenDesktopBridge PRIVATE "$ENV{WindowsSdkDir}Include/$ENV{WindowsSDKVersion}cppwinrt")
@@ -79,7 +96,7 @@ target_compile_definitions(BigscreenDesktopViewer PRIVATE WIN32_LEAN_AND_MEAN NO
 target_include_directories(BigscreenDesktopViewer PRIVATE src)
 target_link_libraries(BigscreenDesktopViewer PRIVATE
   "${OPENVR_SDK_ROOT}/lib/win64/openvr_api.lib"
-  d3d11 dxgi d3dcompiler
+  d3d11 dxgi d3dcompiler d2d1 dwrite
 )
 set_target_properties(BigscreenDesktopViewer PROPERTIES
   OUTPUT_NAME "BigscreenDesktopViewer"

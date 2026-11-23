@@ -1,10 +1,14 @@
 #include <Windows.h>
+#include <windowsx.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <d2d1.h>
+#include <dwrite.h>
 
 #include "live_frame_ipc.h"
 #include "third_person_gpu_ipc.h"
+#include "controller_control_ipc.h"
 
 #include <algorithm>
 #include <cstdarg>
@@ -14,6 +18,8 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
 
 namespace {
 
@@ -42,9 +48,9 @@ uint64_t g_dropped = 0;
 uint64_t g_opens = 0;
 ULONGLONG g_started = 0;
 ULONGLONG g_lastMetrics = 0;
-bool g_waitingLogged = false;
 uint32_t g_sourceWidth = 0;
 uint32_t g_sourceHeight = 0;
+
 enum class ViewSource { FirstPerson, ThirdPerson };
 ViewSource g_viewSource = ViewSource::FirstPerson;
 HANDLE g_thirdMapping = nullptr;
@@ -59,6 +65,81 @@ uint64_t g_thirdSequence = 0;
 ULONGLONG g_thirdLastFrame = 0;
 bool g_thirdUnavailable = false;
 
+// Remote Control & Presentation State (Segment 1)
+bool g_showRemote = true;
+bool g_movieOnly = false;
+bool g_isFullscreen = false;
+bool g_alwaysOnTop = false;
+WINDOWPLACEMENT g_wpPrev = { sizeof(g_wpPrev) };
+
+// Mouse Pointer & Look State
+bool g_pointerActive = false;
+bool g_pointerTrigger = false;
+float g_pointerYaw = 0.0f;
+float g_pointerPitch = 0.0f;
+float g_lookYaw = 0.0f;
+float g_lookPitch = 0.0f;
+float g_cursorX = 0.0f;
+float g_cursorY = 0.0f;
+bool g_isRightDragging = false;
+POINT g_lastRightPt{};
+
+// Remote UI Layout Rects & Hover States
+D2D1_RECT_F g_remoteRect{};
+D2D1_RECT_F g_closeRect{};
+D2D1_RECT_F g_btn1stPersonRect{};
+D2D1_RECT_F g_btn3rdPersonRect{};
+D2D1_RECT_F g_btnWholeTheaterRect{};
+D2D1_RECT_F g_btnMovieOnlyRect{};
+D2D1_RECT_F g_btnFullscreenRect{};
+D2D1_RECT_F g_btnPinOnTopRect{};
+D2D1_RECT_F g_btnRecenterRect{};
+D2D1_RECT_F g_btnMenuRect{};
+D2D1_RECT_F g_pillRect{};
+
+bool g_closeHovered = false;
+bool g_btn1stHovered = false;
+bool g_btn3rdHovered = false;
+bool g_btnWholeHovered = false;
+bool g_btnMovieHovered = false;
+bool g_btnFsHovered = false;
+bool g_btnPinHovered = false;
+bool g_btnRecenterHovered = false;
+bool g_btnMenuHovered = false;
+bool g_pillHovered = false;
+
+// Direct2D & DirectWrite Resources
+ID2D1Factory* g_d2dFactory = nullptr;
+IDWriteFactory* g_dwriteFactory = nullptr;
+ID2D1RenderTarget* g_d2dRenderTarget = nullptr;
+
+IDWriteTextFormat* g_textFormatTitle = nullptr;
+IDWriteTextFormat* g_textFormatSection = nullptr;
+IDWriteTextFormat* g_textFormatBtn = nullptr;
+IDWriteTextFormat* g_textFormatPill = nullptr;
+IDWriteTextFormat* g_textFormatFooter = nullptr;
+
+ID2D1SolidColorBrush* g_brushPanelBg = nullptr;
+ID2D1SolidColorBrush* g_brushPanelBorder = nullptr;
+ID2D1SolidColorBrush* g_brushBtnActiveBg = nullptr;
+ID2D1SolidColorBrush* g_brushBtnInactiveBg = nullptr;
+ID2D1SolidColorBrush* g_brushBtnHoverBg = nullptr;
+ID2D1SolidColorBrush* g_brushBtnBorder = nullptr;
+ID2D1SolidColorBrush* g_brushBtnActiveBorder = nullptr;
+ID2D1SolidColorBrush* g_brushTextWhite = nullptr;
+ID2D1SolidColorBrush* g_brushTextMuted = nullptr;
+ID2D1SolidColorBrush* g_brushTextSection = nullptr;
+ID2D1SolidColorBrush* g_brushAccent = nullptr;
+ID2D1SolidColorBrush* g_brushCloseHover = nullptr;
+ID2D1SolidColorBrush* g_brushSeparator = nullptr;
+ID2D1SolidColorBrush* g_brushPointerOuter = nullptr;
+ID2D1SolidColorBrush* g_brushPointerInner = nullptr;
+ID2D1SolidColorBrush* g_brushPointerActive = nullptr;
+
+// Controller Control IPC
+HANDLE g_controlMapping = nullptr;
+bigscreen_controller_control_ipc::State* g_controlState = nullptr;
+
 void Log(const char* fmt, ...) {
     char buffer[1024];
     va_list args;
@@ -69,6 +150,87 @@ void Log(const char* fmt, ...) {
     std::fflush(stdout);
     OutputDebugStringA(buffer);
     OutputDebugStringA("\n");
+}
+
+void EnsureControlMapping() {
+    if (!g_controlMapping) {
+        g_controlMapping = CreateFileMappingW(
+            INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+            sizeof(bigscreen_controller_control_ipc::State),
+            bigscreen_controller_control_ipc::kMappingName);
+    }
+    if (g_controlMapping && !g_controlState) {
+        g_controlState = static_cast<bigscreen_controller_control_ipc::State*>(
+            MapViewOfFile(g_controlMapping, FILE_MAP_ALL_ACCESS, 0, 0,
+                          sizeof(bigscreen_controller_control_ipc::State)));
+        if (g_controlState && GetLastError() != ERROR_ALREADY_EXISTS) {
+            g_controlState->magic = bigscreen_controller_control_ipc::kMagic;
+            g_controlState->version = bigscreen_controller_control_ipc::kVersion;
+            g_controlState->virtualControllersEnabled = 1;
+            g_controlState->cameraDistance = 2.5f;
+            g_controlState->cameraHeight = 0.6f;
+            g_controlState->cameraFov = 60.0f;
+        }
+    }
+}
+
+void SyncViewRequest(bigscreen_controller_control_ipc::ViewRequest req) {
+    EnsureControlMapping();
+    if (g_controlState) {
+        bigscreen_controller_control_ipc::SetViewRequest(g_controlState, req);
+    }
+}
+
+void SyncPointerAndLook() {
+    EnsureControlMapping();
+    if (g_controlState) {
+        bigscreen_controller_control_ipc::SetPointerState(
+            g_controlState, g_pointerYaw, g_pointerPitch, g_pointerTrigger, g_pointerActive);
+        bigscreen_controller_control_ipc::SetLookOffset(
+            g_controlState, g_lookYaw, g_lookPitch);
+    }
+}
+
+void ResetLook() {
+    g_lookYaw = 0.0f;
+    g_lookPitch = 0.0f;
+    g_pointerYaw = 0.0f;
+    g_pointerPitch = 0.0f;
+    EnsureControlMapping();
+    if (g_controlState) {
+        bigscreen_controller_control_ipc::TriggerReset(g_controlState);
+        SyncPointerAndLook();
+    }
+}
+
+void ToggleFullscreen(HWND hwnd) {
+    const DWORD style = GetWindowLong(hwnd, GWL_STYLE);
+    if (!g_isFullscreen) {
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetWindowPlacement(hwnd, &g_wpPrev) &&
+            GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            SetWindowLong(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+            SetWindowPos(hwnd, HWND_TOP,
+                         mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            g_isFullscreen = true;
+        }
+    } else {
+        SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(hwnd, &g_wpPrev);
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_isFullscreen = false;
+    }
+}
+
+void ToggleAlwaysOnTop(HWND hwnd) {
+    g_alwaysOnTop = !g_alwaysOnTop;
+    SetWindowPos(hwnd, g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
+                 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 }
 
 void ReleaseSharedResources() {
@@ -94,13 +256,313 @@ void ReleaseThirdPersonResources() {
     if (g_thirdShared) g_thirdShared->Release();
     if (g_thirdState) UnmapViewOfFile(g_thirdState);
     if (g_thirdMapping) CloseHandle(g_thirdMapping);
-    g_thirdSrv = nullptr; g_thirdLocal = nullptr; g_thirdMutex = nullptr; g_thirdShared = nullptr;
-    g_thirdState = nullptr; g_thirdMapping = nullptr; g_thirdGeneration = 0; g_thirdHandle = 0; g_thirdSequence = 0; g_thirdLastFrame = 0;
+    g_thirdSrv = nullptr;
+    g_thirdLocal = nullptr;
+    g_thirdMutex = nullptr;
+    g_thirdShared = nullptr;
+    g_thirdState = nullptr;
+    g_thirdMapping = nullptr;
+    g_thirdGeneration = 0;
+    g_thirdHandle = 0;
+    g_thirdSequence = 0;
+    g_thirdLastFrame = 0;
+}
+
+void ReleaseD2DDeviceResources() {
+    if (g_brushPointerActive) { g_brushPointerActive->Release(); g_brushPointerActive = nullptr; }
+    if (g_brushPointerInner) { g_brushPointerInner->Release(); g_brushPointerInner = nullptr; }
+    if (g_brushPointerOuter) { g_brushPointerOuter->Release(); g_brushPointerOuter = nullptr; }
+    if (g_brushSeparator) { g_brushSeparator->Release(); g_brushSeparator = nullptr; }
+    if (g_brushCloseHover) { g_brushCloseHover->Release(); g_brushCloseHover = nullptr; }
+    if (g_brushAccent) { g_brushAccent->Release(); g_brushAccent = nullptr; }
+    if (g_brushTextSection) { g_brushTextSection->Release(); g_brushTextSection = nullptr; }
+    if (g_brushTextMuted) { g_brushTextMuted->Release(); g_brushTextMuted = nullptr; }
+    if (g_brushTextWhite) { g_brushTextWhite->Release(); g_brushTextWhite = nullptr; }
+    if (g_brushBtnActiveBorder) { g_brushBtnActiveBorder->Release(); g_brushBtnActiveBorder = nullptr; }
+    if (g_brushBtnBorder) { g_brushBtnBorder->Release(); g_brushBtnBorder = nullptr; }
+    if (g_brushBtnHoverBg) { g_brushBtnHoverBg->Release(); g_brushBtnHoverBg = nullptr; }
+    if (g_brushBtnInactiveBg) { g_brushBtnInactiveBg->Release(); g_brushBtnInactiveBg = nullptr; }
+    if (g_brushBtnActiveBg) { g_brushBtnActiveBg->Release(); g_brushBtnActiveBg = nullptr; }
+    if (g_brushPanelBorder) { g_brushPanelBorder->Release(); g_brushPanelBorder = nullptr; }
+    if (g_brushPanelBg) { g_brushPanelBg->Release(); g_brushPanelBg = nullptr; }
+    if (g_d2dRenderTarget) { g_d2dRenderTarget->Release(); g_d2dRenderTarget = nullptr; }
+}
+
+bool CreateD2DDeviceResources() {
+    if (g_d2dRenderTarget) return true;
+    if (!g_swap || !g_d2dFactory) return false;
+
+    IDXGISurface* dxgiSurface = nullptr;
+    HRESULT hr = g_swap->GetBuffer(0, IID_PPV_ARGS(&dxgiSurface));
+    if (FAILED(hr)) return false;
+
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        0.0f, 0.0f
+    );
+    hr = g_d2dFactory->CreateDxgiSurfaceRenderTarget(dxgiSurface, &props, &g_d2dRenderTarget);
+    dxgiSurface->Release();
+    if (FAILED(hr)) return false;
+
+    g_d2dRenderTarget->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.047f, 0.086f, 0.141f, 0.94f), &g_brushPanelBg);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.165f, 0.490f, 1.000f, 0.50f), &g_brushPanelBorder);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.165f, 0.490f, 1.000f, 0.88f), &g_brushBtnActiveBg);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.086f, 0.133f, 0.204f, 0.82f), &g_brushBtnInactiveBg);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.125f, 0.204f, 0.306f, 0.92f), &g_brushBtnHoverBg);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.176f, 0.267f, 0.392f, 0.80f), &g_brushBtnBorder);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.431f, 0.706f, 1.000f, 0.95f), &g_brushBtnActiveBorder);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.941f, 0.961f, 1.000f, 1.00f), &g_brushTextWhite);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.569f, 0.659f, 0.765f, 1.00f), &g_brushTextMuted);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.431f, 0.686f, 1.000f, 0.95f), &g_brushTextSection);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.000f, 0.831f, 1.000f, 1.00f), &g_brushAccent);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.863f, 0.196f, 0.196f, 0.85f), &g_brushCloseHover);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.137f, 0.216f, 0.314f, 0.60f), &g_brushSeparator);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.000f, 0.831f, 1.000f, 0.75f), &g_brushPointerOuter);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.000f, 0.831f, 1.000f, 0.95f), &g_brushPointerInner);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(1.000f, 1.000f, 1.000f, 1.00f), &g_brushPointerActive);
+
+    return true;
+}
+
+bool InitD2D() {
+    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2dFactory);
+    if (FAILED(hr)) return false;
+
+    hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                             reinterpret_cast<IUnknown**>(&g_dwriteFactory));
+    if (FAILED(hr)) return false;
+
+    g_dwriteFactory->CreateTextFormat(
+        L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"en-us", &g_textFormatTitle);
+    if (g_textFormatTitle) {
+        g_textFormatTitle->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_textFormatTitle->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+
+    g_dwriteFactory->CreateTextFormat(
+        L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 10.5f, L"en-us", &g_textFormatSection);
+    if (g_textFormatSection) {
+        g_textFormatSection->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_textFormatSection->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+
+    g_dwriteFactory->CreateTextFormat(
+        L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 11.5f, L"en-us", &g_textFormatBtn);
+    if (g_textFormatBtn) {
+        g_textFormatBtn->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        g_textFormatBtn->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+
+    g_dwriteFactory->CreateTextFormat(
+        L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us", &g_textFormatPill);
+    if (g_textFormatPill) {
+        g_textFormatPill->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        g_textFormatPill->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+
+    g_dwriteFactory->CreateTextFormat(
+        L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 9.5f, L"en-us", &g_textFormatFooter);
+    if (g_textFormatFooter) {
+        g_textFormatFooter->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        g_textFormatFooter->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+
+    return CreateD2DDeviceResources();
+}
+
+void DrawButton(const D2D1_RECT_F& rect, const wchar_t* text, bool active, bool hovered, float radius = 6.0f) {
+    D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(rect, radius, radius);
+    ID2D1SolidColorBrush* bgBrush = active ? g_brushBtnActiveBg : (hovered ? g_brushBtnHoverBg : g_brushBtnInactiveBg);
+    ID2D1SolidColorBrush* borderBrush = active ? g_brushBtnActiveBorder : (hovered ? g_brushAccent : g_brushBtnBorder);
+    
+    g_d2dRenderTarget->FillRoundedRectangle(&rounded, bgBrush);
+    g_d2dRenderTarget->DrawRoundedRectangle(&rounded, borderBrush, active ? 1.5f : 1.0f);
+    
+    ID2D1SolidColorBrush* textBrush = active ? g_brushTextWhite : (hovered ? g_brushTextWhite : g_brushTextMuted);
+    g_d2dRenderTarget->DrawText(
+        text, static_cast<UINT32>(wcslen(text)),
+        g_textFormatBtn, &rect, textBrush);
+}
+
+void DrawCloseButton(const D2D1_RECT_F& rect, bool hovered) {
+    D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(rect, 4.0f, 4.0f);
+    if (hovered) {
+        g_d2dRenderTarget->FillRoundedRectangle(&rounded, g_brushCloseHover);
+    }
+    const float pad = 7.0f;
+    g_d2dRenderTarget->DrawLine(
+        D2D1::Point2F(rect.left + pad, rect.top + pad),
+        D2D1::Point2F(rect.right - pad, rect.bottom - pad),
+        g_brushTextWhite, 1.8f);
+    g_d2dRenderTarget->DrawLine(
+        D2D1::Point2F(rect.right - pad, rect.top + pad),
+        D2D1::Point2F(rect.left + pad, rect.bottom - pad),
+        g_brushTextWhite, 1.8f);
+}
+
+void DrawTriggerPill(float windowWidth) {
+    const float pillWidth = 120.0f;
+    const float pillHeight = 34.0f;
+    g_pillRect = D2D1::RectF(windowWidth - pillWidth - 18.0f, 16.0f, windowWidth - 18.0f, 16.0f + pillHeight);
+    
+    D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(g_pillRect, 17.0f, 17.0f);
+    ID2D1SolidColorBrush* bgBrush = g_pillHovered ? g_brushBtnHoverBg : g_brushPanelBg;
+    ID2D1SolidColorBrush* borderBrush = g_pillHovered ? g_brushAccent : g_brushPanelBorder;
+    
+    g_d2dRenderTarget->FillRoundedRectangle(&rounded, bgBrush);
+    g_d2dRenderTarget->DrawRoundedRectangle(&rounded, borderBrush, 1.2f);
+    
+    const D2D1_ELLIPSE dot = D2D1::Ellipse(
+        D2D1::Point2F(g_pillRect.left + 22.0f, (g_pillRect.top + g_pillRect.bottom) * 0.5f),
+        4.0f, 4.0f);
+    g_d2dRenderTarget->FillEllipse(&dot, g_brushAccent);
+
+    const wchar_t* pillText = L"REMOTE";
+    D2D1_RECT_F textRect = D2D1::RectF(g_pillRect.left + 28.0f, g_pillRect.top, g_pillRect.right - 10.0f, g_pillRect.bottom);
+    g_d2dRenderTarget->DrawText(
+        pillText, static_cast<UINT32>(wcslen(pillText)),
+        g_textFormatPill, &textRect, g_brushTextWhite);
+}
+
+void DrawPointerReticle(float x, float y, bool active) {
+    const D2D1_ELLIPSE outer = D2D1::Ellipse(D2D1::Point2F(x, y), 8.0f, 8.0f);
+    const D2D1_ELLIPSE inner = D2D1::Ellipse(D2D1::Point2F(x, y), active ? 4.0f : 2.5f, active ? 4.0f : 2.5f);
+    
+    g_d2dRenderTarget->DrawEllipse(&outer, g_brushPointerOuter, 1.2f);
+    g_d2dRenderTarget->FillEllipse(&inner, active ? g_brushPointerActive : g_brushPointerInner);
+}
+
+void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
+    const float panelWidth = 310.0f;
+    const float panelHeight = 410.0f;
+    const float left = windowWidth - panelWidth - 20.0f;
+    const float top = 20.0f;
+    const float right = left + panelWidth;
+    const float bottom = top + panelHeight;
+    g_remoteRect = D2D1::RectF(left, top, right, bottom);
+
+    D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(g_remoteRect, 10.0f, 10.0f);
+    g_d2dRenderTarget->FillRoundedRectangle(&rounded, g_brushPanelBg);
+    g_d2dRenderTarget->DrawRoundedRectangle(&rounded, g_brushPanelBorder, 1.5f);
+
+    // Header separator line
+    g_d2dRenderTarget->DrawLine(
+        D2D1::Point2F(left, top + 42.0f),
+        D2D1::Point2F(right, top + 42.0f),
+        g_brushSeparator, 1.0f);
+
+    // Header indicator dot
+    const D2D1_ELLIPSE headerDot = D2D1::Ellipse(
+        D2D1::Point2F(left + 20.0f, top + 21.0f),
+        4.0f, 4.0f);
+    g_d2dRenderTarget->FillEllipse(&headerDot, g_brushAccent);
+
+    // Header Title
+    const wchar_t* titleText = L"REMOTE CONTROL";
+    D2D1_RECT_F titleRect = D2D1::RectF(left + 32.0f, top, right - 40.0f, top + 42.0f);
+    g_d2dRenderTarget->DrawText(
+        titleText, static_cast<UINT32>(wcslen(titleText)),
+        g_textFormatTitle, &titleRect, g_brushTextWhite);
+
+    // Close button [✕]
+    g_closeRect = D2D1::RectF(right - 36.0f, top + 8.0f, right - 10.0f, top + 34.0f);
+    DrawCloseButton(g_closeRect, g_closeHovered);
+
+    // SECTION 1: VIEW MODE
+    const wchar_t* s1Text = L"VIEW MODE";
+    D2D1_RECT_F s1Rect = D2D1::RectF(left + 18.0f, top + 50.0f, right - 18.0f, top + 68.0f);
+    g_d2dRenderTarget->DrawText(
+        s1Text, static_cast<UINT32>(wcslen(s1Text)),
+        g_textFormatSection, &s1Rect, g_brushTextSection);
+
+    g_btn1stPersonRect = D2D1::RectF(left + 18.0f, top + 70.0f, left + 148.0f, top + 104.0f);
+    g_btn3rdPersonRect = D2D1::RectF(left + 156.0f, top + 70.0f, right - 18.0f, top + 104.0f);
+    DrawButton(g_btn1stPersonRect, L"1st Person", g_viewSource == ViewSource::FirstPerson, g_btn1stHovered);
+    DrawButton(g_btn3rdPersonRect, L"3rd Person", g_viewSource == ViewSource::ThirdPerson, g_btn3rdHovered);
+
+    // SECTION 2: THEATER FRAMING
+    const wchar_t* s2Text = L"THEATER FRAMING";
+    D2D1_RECT_F s2Rect = D2D1::RectF(left + 18.0f, top + 116.0f, right - 18.0f, top + 134.0f);
+    g_d2dRenderTarget->DrawText(
+        s2Text, static_cast<UINT32>(wcslen(s2Text)),
+        g_textFormatSection, &s2Rect, g_brushTextSection);
+
+    g_btnWholeTheaterRect = D2D1::RectF(left + 18.0f, top + 136.0f, left + 148.0f, top + 170.0f);
+    g_btnMovieOnlyRect = D2D1::RectF(left + 156.0f, top + 136.0f, right - 18.0f, top + 170.0f);
+    DrawButton(g_btnWholeTheaterRect, L"Whole Theater", !g_movieOnly, g_btnWholeHovered);
+    DrawButton(g_btnMovieOnlyRect, L"Movie Only", g_movieOnly, g_btnMovieHovered);
+
+    // SECTION 3: WINDOW & DISPLAY
+    const wchar_t* s3Text = L"WINDOW & DISPLAY";
+    D2D1_RECT_F s3Rect = D2D1::RectF(left + 18.0f, top + 182.0f, right - 18.0f, top + 200.0f);
+    g_d2dRenderTarget->DrawText(
+        s3Text, static_cast<UINT32>(wcslen(s3Text)),
+        g_textFormatSection, &s3Rect, g_brushTextSection);
+
+    g_btnFullscreenRect = D2D1::RectF(left + 18.0f, top + 202.0f, left + 148.0f, top + 236.0f);
+    g_btnPinOnTopRect = D2D1::RectF(left + 156.0f, top + 202.0f, right - 18.0f, top + 236.0f);
+    DrawButton(g_btnFullscreenRect, g_isFullscreen ? L"Windowed" : L"Fullscreen", g_isFullscreen, g_btnFsHovered);
+    DrawButton(g_btnPinOnTopRect, g_alwaysOnTop ? L"Pinned Top" : L"Pin on Top", g_alwaysOnTop, g_btnPinHovered);
+
+    // SECTION 4: QUICK ACTIONS
+    const wchar_t* s4Text = L"QUICK ACTIONS";
+    D2D1_RECT_F s4Rect = D2D1::RectF(left + 18.0f, top + 248.0f, right - 18.0f, top + 266.0f);
+    g_d2dRenderTarget->DrawText(
+        s4Text, static_cast<UINT32>(wcslen(s4Text)),
+        g_textFormatSection, &s4Rect, g_brushTextSection);
+
+    g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 268.0f, left + 148.0f, top + 302.0f);
+    g_btnMenuRect = D2D1::RectF(left + 156.0f, top + 268.0f, right - 18.0f, top + 302.0f);
+    DrawButton(g_btnRecenterRect, L"🎯 Recenter", false, g_btnRecenterHovered);
+    DrawButton(g_btnMenuRect, L"📋 Menu", false, g_btnMenuHovered);
+
+    // Footer separator line
+    g_d2dRenderTarget->DrawLine(
+        D2D1::Point2F(left + 18.0f, top + 318.0f),
+        D2D1::Point2F(right - 18.0f, top + 318.0f),
+        g_brushSeparator, 1.0f);
+
+    // Footer Hotkey Hints
+    const wchar_t* footerText = L"Mouse Move: Laser Pointer  |  Left-Click: Trigger\nRight-Click Drag: Look  |  Space: Menu  |  R: Recenter\nAlt+Drag or Header: Move Window";
+    D2D1_RECT_F footerRect = D2D1::RectF(left + 8.0f, top + 324.0f, right - 8.0f, bottom - 6.0f);
+    g_d2dRenderTarget->DrawText(
+        footerText, static_cast<UINT32>(wcslen(footerText)),
+        g_textFormatFooter, &footerRect, g_brushTextMuted);
 }
 
 void ReleaseAll() {
     ReleaseSharedResources();
     ReleaseThirdPersonResources();
+    ReleaseD2DDeviceResources();
+
+    if (g_textFormatFooter) g_textFormatFooter->Release();
+    if (g_textFormatPill) g_textFormatPill->Release();
+    if (g_textFormatBtn) g_textFormatBtn->Release();
+    if (g_textFormatSection) g_textFormatSection->Release();
+    if (g_textFormatTitle) g_textFormatTitle->Release();
+    if (g_dwriteFactory) g_dwriteFactory->Release();
+    if (g_d2dFactory) g_d2dFactory->Release();
+    g_textFormatFooter = nullptr;
+    g_textFormatPill = nullptr;
+    g_textFormatBtn = nullptr;
+    g_textFormatSection = nullptr;
+    g_textFormatTitle = nullptr;
+    g_dwriteFactory = nullptr;
+    g_d2dFactory = nullptr;
+
+    if (g_controlState) UnmapViewOfFile(g_controlState);
+    if (g_controlMapping) CloseHandle(g_controlMapping);
+    g_controlState = nullptr;
+    g_controlMapping = nullptr;
+
     if (g_state) UnmapViewOfFile(g_state);
     if (g_mapping) CloseHandle(g_mapping);
     if (g_rtv) g_rtv->Release();
@@ -167,6 +629,9 @@ void SelectViewSource(ViewSource source) {
     g_viewSource = source;
     if (source == ViewSource::ThirdPerson) g_thirdUnavailable = false;
     if (source == ViewSource::FirstPerson) ReleaseThirdPersonResources();
+    SyncViewRequest(source == ViewSource::ThirdPerson
+                        ? bigscreen_controller_control_ipc::ViewRequest::Third
+                        : bigscreen_controller_control_ipc::ViewRequest::First);
 }
 
 bool OpenLiveMapping() {
@@ -233,8 +698,9 @@ bool InitD3D() {
     swapDesc.BufferDesc.Width = static_cast<UINT>(std::max<LONG>(1, rect.right));
     swapDesc.BufferDesc.Height = static_cast<UINT>(std::max<LONG>(1, rect.bottom));
     D3D_FEATURE_LEVEL level{};
+    const UINT createDeviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        g_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+        g_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, createDeviceFlags, nullptr, 0, D3D11_SDK_VERSION,
         &swapDesc, &g_swap, &g_device, &level, &g_context);
     if (FAILED(hr)) {
         Log("D3D11CreateDeviceAndSwapChain failed: 0x%08X", static_cast<unsigned>(hr));
@@ -285,12 +751,14 @@ void ResizeSwapChain(UINT width, UINT height) {
     g_context->OMSetRenderTargets(0, nullptr, nullptr);
     if (g_rtv) g_rtv->Release();
     g_rtv = nullptr;
+    ReleaseD2DDeviceResources();
     g_swap->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
     ID3D11Texture2D* backBuffer = nullptr;
     if (SUCCEEDED(g_swap->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
         g_device->CreateRenderTargetView(backBuffer, nullptr, &g_rtv);
         backBuffer->Release();
     }
+    CreateD2DDeviceResources();
 }
 
 bool OpenSharedFrame(const bigscreen_live_frame_ipc::LiveFrameState& state) {
@@ -368,6 +836,17 @@ void Render(ID3D11ShaderResourceView* source, bool flipVertical) {
         viewport.Height = windowWidth / sourceAspect;
         viewport.TopLeftY = (windowHeight - viewport.Height) * 0.5f;
     }
+
+    if (g_movieOnly) {
+        const float zoom = 1.80f;
+        const float newWidth = viewport.Width * zoom;
+        const float newHeight = viewport.Height * zoom;
+        viewport.TopLeftX = (windowWidth - newWidth) * 0.5f;
+        viewport.TopLeftY = (windowHeight - newHeight) * 0.5f;
+        viewport.Width = newWidth;
+        viewport.Height = newHeight;
+    }
+
     const float clear[4] = {0.04f, 0.04f, 0.05f, 1.0f};
     g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
     g_context->ClearRenderTargetView(g_rtv, clear);
@@ -382,6 +861,24 @@ void Render(ID3D11ShaderResourceView* source, bool flipVertical) {
         ID3D11ShaderResourceView* nullSrv = nullptr;
         g_context->PSSetShaderResources(0, 1, &nullSrv);
     }
+
+    // Direct2D Overlay & Pointer Rendering
+    if (g_d2dRenderTarget || CreateD2DDeviceResources()) {
+        g_d2dRenderTarget->BeginDraw();
+        
+        // Draw Laser Pointer Reticle over VR client view when active
+        if (g_pointerActive && (!g_showRemote || g_cursorX < g_remoteRect.left || g_cursorY > g_remoteRect.bottom)) {
+            DrawPointerReticle(g_cursorX, g_cursorY, g_pointerTrigger);
+        }
+
+        if (g_showRemote) {
+            DrawRemotePanel(windowWidth, windowHeight);
+        } else {
+            DrawTriggerPill(windowWidth);
+        }
+        g_d2dRenderTarget->EndDraw();
+    }
+
     g_swap->Present(1, 0);
     ++g_frames;
 }
@@ -399,25 +896,300 @@ void UpdateMetrics() {
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == WM_KEYDOWN && (wParam == '1' || wParam == '3')) {
-        SelectViewSource(wParam == '3' ? ViewSource::ThirdPerson : ViewSource::FirstPerson);
+    if (message == WM_KEYDOWN) {
+        if (wParam == VK_TAB || wParam == 'M' || wParam == VK_F1) {
+            g_showRemote = !g_showRemote;
+            return 0;
+        }
+        if (wParam == VK_F11) {
+            ToggleFullscreen(hwnd);
+            return 0;
+        }
+        if (wParam == '1' || wParam == '3') {
+            SelectViewSource(wParam == '3' ? ViewSource::ThirdPerson : ViewSource::FirstPerson);
+            return 0;
+        }
+        if (wParam == VK_LEFT) {
+            g_lookYaw -= 0.05f;
+            SyncPointerAndLook();
+            return 0;
+        }
+        if (wParam == VK_RIGHT) {
+            g_lookYaw += 0.05f;
+            SyncPointerAndLook();
+            return 0;
+        }
+        if (wParam == VK_UP) {
+            g_lookPitch += 0.04f;
+            SyncPointerAndLook();
+            return 0;
+        }
+        if (wParam == VK_DOWN) {
+            g_lookPitch -= 0.04f;
+            SyncPointerAndLook();
+            return 0;
+        }
+        if (wParam == 'R' || wParam == 'Y') {
+            ResetLook();
+            return 0;
+        }
+        if (wParam == VK_SPACE) {
+            EnsureControlMapping();
+            if (g_controlState) {
+                bigscreen_controller_control_ipc::PulseMenuClick(g_controlState);
+            }
+            return 0;
+        }
+    }
+
+    if (message == WM_KEYUP) {
+        if (wParam == VK_SPACE) {
+            EnsureControlMapping();
+            if (g_controlState) {
+                bigscreen_controller_control_ipc::ClearMenuClick(g_controlState);
+            }
+            return 0;
+        }
+    }
+
+    if (message == WM_SIZE) {
+        ResizeSwapChain(LOWORD(lParam), HIWORD(lParam));
         return 0;
     }
-    if (message == WM_SIZE) ResizeSwapChain(LOWORD(lParam), HIWORD(lParam));
-    if (message == WM_NCHITTEST) {
-        // The viewer is display-only, so let the rendered client area act as
-        // a drag surface even when the title bar is outside the visible crop.
-        const LRESULT hit = DefWindowProc(hwnd, message, wParam, lParam);
-        return hit == HTCLIENT ? HTCAPTION : hit;
+
+    if (message == WM_MOUSEMOVE) {
+        const float mx = static_cast<float>(GET_X_LPARAM(lParam));
+        const float my = static_cast<float>(GET_Y_LPARAM(lParam));
+
+        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
+
+        auto inRect = [](float x, float y, const D2D1_RECT_F& r) {
+            return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+        };
+
+        RECT clientRect{};
+        GetClientRect(hwnd, &clientRect);
+        const float winW = static_cast<float>(std::max<LONG>(1, clientRect.right));
+        const float winH = static_cast<float>(std::max<LONG>(1, clientRect.bottom));
+
+        if (g_showRemote && inRect(mx, my, g_remoteRect)) {
+            g_pointerActive = false;
+            g_closeHovered = inRect(mx, my, g_closeRect);
+            g_btn1stHovered = inRect(mx, my, g_btn1stPersonRect);
+            g_btn3rdHovered = inRect(mx, my, g_btn3rdPersonRect);
+            g_btnWholeHovered = inRect(mx, my, g_btnWholeTheaterRect);
+            g_btnMovieHovered = inRect(mx, my, g_btnMovieOnlyRect);
+            g_btnFsHovered = inRect(mx, my, g_btnFullscreenRect);
+            g_btnPinHovered = inRect(mx, my, g_btnPinOnTopRect);
+            g_btnRecenterHovered = inRect(mx, my, g_btnRecenterRect);
+            g_btnMenuHovered = inRect(mx, my, g_btnMenuRect);
+        } else if (!g_showRemote && inRect(mx, my, g_pillRect)) {
+            g_pointerActive = false;
+            g_pillHovered = true;
+        } else {
+            // Interactive VR Client Area: mouse controls pointer aim & look
+            g_pillHovered = false;
+            g_closeHovered = false;
+            g_btn1stHovered = false;
+            g_btn3rdHovered = false;
+            g_btnWholeHovered = false;
+            g_btnMovieHovered = false;
+            g_btnFsHovered = false;
+            g_btnPinHovered = false;
+            g_btnRecenterHovered = false;
+            g_btnMenuHovered = false;
+
+            g_pointerActive = true;
+            g_cursorX = mx;
+            g_cursorY = my;
+
+            if (g_isRightDragging) {
+                const float dx = mx - static_cast<float>(g_lastRightPt.x);
+                const float dy = my - static_cast<float>(g_lastRightPt.y);
+                g_lookYaw += dx * 0.003f;
+                g_lookPitch -= dy * 0.003f;
+                g_lastRightPt = { static_cast<LONG>(mx), static_cast<LONG>(my) };
+            }
+
+            // Map screen coordinates to ray direction for laser pointer
+            const float nx = (mx - winW * 0.5f) / (winW * 0.5f);
+            const float ny = (my - winH * 0.5f) / (winH * 0.5f);
+            const float zoom = g_movieOnly ? 1.8f : 1.0f;
+            const float halfFovH = (45.0f * 3.14159265f / 180.0f) / zoom;
+            const float halfFovV = (28.0f * 3.14159265f / 180.0f) / zoom;
+            g_pointerYaw = nx * halfFovH;
+            g_pointerPitch = -ny * halfFovV;
+        }
+
+        SyncPointerAndLook();
+        return 0;
     }
+
+    if (message == WM_MOUSELEAVE) {
+        g_pillHovered = false;
+        g_closeHovered = false;
+        g_btn1stHovered = false;
+        g_btn3rdHovered = false;
+        g_btnWholeHovered = false;
+        g_btnMovieHovered = false;
+        g_btnFsHovered = false;
+        g_btnPinHovered = false;
+        g_btnRecenterHovered = false;
+        g_btnMenuHovered = false;
+        g_pointerActive = false;
+        g_pointerTrigger = false;
+        SyncPointerAndLook();
+        return 0;
+    }
+
+    if (message == WM_LBUTTONDOWN) {
+        const float mx = static_cast<float>(GET_X_LPARAM(lParam));
+        const float my = static_cast<float>(GET_Y_LPARAM(lParam));
+
+        auto inRect = [](float x, float y, const D2D1_RECT_F& r) {
+            return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+        };
+
+        if (g_showRemote) {
+            if (inRect(mx, my, g_closeRect)) {
+                g_showRemote = false;
+                return 0;
+            }
+            if (inRect(mx, my, g_btn1stPersonRect)) {
+                SelectViewSource(ViewSource::FirstPerson);
+                return 0;
+            }
+            if (inRect(mx, my, g_btn3rdPersonRect)) {
+                SelectViewSource(ViewSource::ThirdPerson);
+                return 0;
+            }
+            if (inRect(mx, my, g_btnWholeTheaterRect)) {
+                g_movieOnly = false;
+                return 0;
+            }
+            if (inRect(mx, my, g_btnMovieOnlyRect)) {
+                g_movieOnly = true;
+                return 0;
+            }
+            if (inRect(mx, my, g_btnFullscreenRect)) {
+                ToggleFullscreen(hwnd);
+                return 0;
+            }
+            if (inRect(mx, my, g_btnPinOnTopRect)) {
+                ToggleAlwaysOnTop(hwnd);
+                return 0;
+            }
+            if (inRect(mx, my, g_btnRecenterRect)) {
+                ResetLook();
+                return 0;
+            }
+            if (inRect(mx, my, g_btnMenuRect)) {
+                EnsureControlMapping();
+                if (g_controlState) {
+                    bigscreen_controller_control_ipc::PulseMenuClick(g_controlState);
+                }
+                return 0;
+            }
+        } else {
+            if (inRect(mx, my, g_pillRect)) {
+                g_showRemote = true;
+                return 0;
+            }
+        }
+
+        // Click on VR screen: Pull controller trigger for laser pointer selection!
+        g_pointerTrigger = true;
+        SyncPointerAndLook();
+        return 0;
+    }
+
+    if (message == WM_LBUTTONUP) {
+        if (g_pointerTrigger) {
+            g_pointerTrigger = false;
+            SyncPointerAndLook();
+        }
+        return 0;
+    }
+
+    if (message == WM_RBUTTONDOWN) {
+        const float mx = static_cast<float>(GET_X_LPARAM(lParam));
+        const float my = static_cast<float>(GET_Y_LPARAM(lParam));
+        auto inRect = [](float x, float y, const D2D1_RECT_F& r) {
+            return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+        };
+
+        if (!g_showRemote || !inRect(mx, my, g_remoteRect)) {
+            g_isRightDragging = true;
+            g_lastRightPt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            SetCapture(hwnd);
+        }
+        return 0;
+    }
+
+    if (message == WM_RBUTTONUP) {
+        if (g_isRightDragging) {
+            g_isRightDragging = false;
+            ReleaseCapture();
+        }
+        return 0;
+    }
+
+    if (message == WM_LBUTTONDBLCLK) {
+        const float mx = static_cast<float>(GET_X_LPARAM(lParam));
+        const float my = static_cast<float>(GET_Y_LPARAM(lParam));
+
+        auto inRect = [](float x, float y, const D2D1_RECT_F& r) {
+            return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+        };
+
+        if (!g_showRemote || !inRect(mx, my, g_remoteRect)) {
+            ToggleFullscreen(hwnd);
+            return 0;
+        }
+    }
+
+    if (message == WM_NCHITTEST) {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ScreenToClient(hwnd, &pt);
+        const float cx = static_cast<float>(pt.x);
+        const float cy = static_cast<float>(pt.y);
+
+        auto inRect = [](float x, float y, const D2D1_RECT_F& r) {
+            return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+        };
+
+        // Holding Alt lets user drag the window from anywhere
+        if ((GetKeyState(VK_MENU) & 0x8000) != 0) {
+            return HTCAPTION;
+        }
+
+        // Remote panel interaction: dragging the header bar moves the window
+        if (g_showRemote && inRect(cx, cy, g_remoteRect)) {
+            if (cy <= g_remoteRect.top + 42.0f && !inRect(cx, cy, g_closeRect)) {
+                return HTCAPTION;
+            }
+            return HTCLIENT;
+        }
+
+        // Floating trigger pill interaction
+        if (!g_showRemote && inRect(cx, cy, g_pillRect)) {
+            return HTCLIENT;
+        }
+
+        // Client area: Interactive VR display surface (laser pointer + trigger)
+        return HTCLIENT;
+    }
+
     if (message == WM_DESTROY) {
         PostQuitMessage(0);
         return 0;
     }
+
     return DefWindowProc(hwnd, message, wParam, lParam);
 }
 
-}
+} // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     HINSTANCE instance = GetModuleHandleA(nullptr);
@@ -426,11 +1198,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     windowClass.lpfnWndProc = WndProc;
     windowClass.lpszClassName = "BigscreenDesktopViewer";
     windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    windowClass.style = CS_DBLCLKS;
     RegisterClassA(&windowClass);
     g_hwnd = CreateWindowA(windowClass.lpszClassName, "Bigscreen Desktop Live Viewer",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 1280, 720,
                            nullptr, nullptr, instance, nullptr);
-    if (!g_hwnd || !InitD3D()) {
+    if (!g_hwnd || !InitD3D() || !InitD2D()) {
         ReleaseAll();
         return 2;
     }
@@ -463,7 +1236,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         char title[256]{};
         const char* view = g_viewSource == ViewSource::ThirdPerson ? "THIRD PERSON" : "FIRST PERSON";
         const char* status = g_thirdUnavailable ? " | Third-person camera unavailable" : "";
-        sprintf_s(title, "Bigscreen Desktop Live Viewer | View: %s | 1=FIRST PERSON  3=THIRD PERSON%s", view, status);
+        sprintf_s(title, "Bigscreen Desktop Live Viewer | View: %s | Tab/M=REMOTE  Click=Trigger  RMB=Look%s", view, status);
         SetWindowTextA(g_hwnd, title);
         Render(source, g_viewSource == ViewSource::ThirdPerson);
         UpdateMetrics();

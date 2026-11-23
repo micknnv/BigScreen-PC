@@ -60,6 +60,8 @@ $Candidates = @(
     (Join-Path $BuildDir "Release"),
     (Join-Path $BuildDir "Debug"),
     (Join-Path $BuildDir "runtime"),
+    (Join-Path $BuildDir "msvc/Release"),
+    (Join-Path $BuildDir "msvc/runtime"),
     (Join-Path $BuildDir "BigscreenDesktopDriver/bin/win64")
 )
 

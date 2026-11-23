@@ -333,6 +333,24 @@ public:
     }
 };
 
+HANDLE g_driverControlMapping = nullptr;
+const bigscreen_controller_control_ipc::State* g_driverControlState = nullptr;
+
+inline bool ReadDriverControl(bigscreen_controller_control_ipc::State& out) {
+    if (!g_driverControlMapping) {
+        g_driverControlMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, bigscreen_controller_control_ipc::kMappingName);
+        if (g_driverControlMapping) {
+            g_driverControlState = static_cast<const bigscreen_controller_control_ipc::State*>(
+                MapViewOfFile(g_driverControlMapping, FILE_MAP_READ, 0, 0, sizeof(bigscreen_controller_control_ipc::State)));
+            if (!g_driverControlState) {
+                CloseHandle(g_driverControlMapping);
+                g_driverControlMapping = nullptr;
+            }
+        }
+    }
+    return g_driverControlState && bigscreen_controller_control_ipc::Read(g_driverControlState, out);
+}
+
 class VirtualHmd final : public vr::ITrackedDeviceServerDriver {
 public:
     ~VirtualHmd() { ClosePoseIpc(); }
@@ -413,6 +431,17 @@ public:
             vr::VRDriverLog()->Log(ipcActive ? "Pose IPC connected" : "Pose IPC inactive");
         }
 
+        bigscreen_controller_control_ipc::State control{};
+        const bool controlReady = ReadDriverControl(control);
+        double totalYaw = yaw_;
+        double totalPitch = pitch_;
+        if (controlReady) {
+            totalYaw += static_cast<double>(control.lookYaw);
+            totalPitch += static_cast<double>(control.lookPitch);
+        }
+        totalPitch = std::clamp(totalPitch, -static_cast<double>(g_config.pitchLimit),
+                                static_cast<double>(g_config.pitchLimit));
+
         vr::DriverPose_t next{};
         next.poseTimeOffset = 0.0;
         next.qWorldFromDriverRotation = {1, 0, 0, 0};
@@ -421,11 +450,11 @@ public:
         double cameraY = 1.6;
         double cameraZ = positionZ_;
         if (viewMode == bigscreen_desktop_ipc::ViewMode::LegacyHmdOffset)
-            ApplyLegacyHmdOffset(yaw_, cameraX, cameraY, cameraZ);
+            ApplyLegacyHmdOffset(totalYaw, cameraX, cameraY, cameraZ);
         next.vecPosition[0] = cameraX;
         next.vecPosition[1] = cameraY;
         next.vecPosition[2] = cameraZ;
-        next.qRotation = QuaternionFromYawPitch(yaw_, pitch_);
+        next.qRotation = QuaternionFromYawPitch(totalYaw, totalPitch);
         next.poseIsValid = true;
         next.willDriftInYaw = false;
         next.result = vr::TrackingResult_Running_OK;
@@ -569,10 +598,12 @@ public:
         (void)dt;
         bigscreen_desktop_controller_ipc::ControllerState controller{};
         bigscreen_controller_control_ipc::State control{};
-        const bool controlReady = ReadControl(control);
+        const bool controlReady = ReadDriverControl(control);
         const bool thirdPerson = controlReady && control.viewRequest == static_cast<uint32_t>(bigscreen_controller_control_ipc::ViewRequest::Third);
-        const bool inputActive = ReadController(controller) && (!controlReady || control.virtualControllersEnabled != 0);
+        const bool virtualEnabled = !controlReady || control.virtualControllersEnabled != 0;
+        const bool inputActive = virtualEnabled;
         const bool syntheticInput = inputActive && !thirdPerson;
+        ReadController(controller);
 
         double positionX = 0.0;
         double positionZ = 0.0;
@@ -581,19 +612,33 @@ public:
         bool hmdActive = false;
         bigscreen_desktop_ipc::ViewMode viewMode = bigscreen_desktop_ipc::ViewMode::Normal;
         ReadHmdPose(positionX, positionZ, yaw, pitch, hmdActive, viewMode);
-        const vr::HmdQuaternion_t rotation = QuaternionFromYawPitch(yaw, pitch);
-        const float localX = 0.30f + static_cast<float>(armWidthOffset_);
-        const float localY = -0.25f + static_cast<float>(armHeightOffset_);
-        const float localZ = -0.40f;
-        const float rotatedX = static_cast<float>((1.0 - 2.0 * rotation.y * rotation.y - 2.0 * rotation.z * rotation.z) * localX +
-            (2.0 * rotation.x * rotation.y - 2.0 * rotation.z * rotation.w) * localY +
-            (2.0 * rotation.x * rotation.z + 2.0 * rotation.y * rotation.w) * localZ);
-        const float rotatedY = static_cast<float>((2.0 * rotation.x * rotation.y + 2.0 * rotation.z * rotation.w) * localX +
-            (1.0 - 2.0 * rotation.x * rotation.x - 2.0 * rotation.z * rotation.z) * localY +
-            (2.0 * rotation.y * rotation.z - 2.0 * rotation.x * rotation.w) * localZ);
-        const float rotatedZ = static_cast<float>((2.0 * rotation.x * rotation.z - 2.0 * rotation.y * rotation.w) * localX +
-            (2.0 * rotation.y * rotation.z + 2.0 * rotation.x * rotation.w) * localY +
-            (1.0 - 2.0 * rotation.x * rotation.x - 2.0 * rotation.y * rotation.y) * localZ);
+
+        if (controlReady) {
+            yaw += static_cast<double>(control.lookYaw);
+            pitch += static_cast<double>(control.lookPitch);
+        }
+        const vr::HmdQuaternion_t hmdRotation = QuaternionFromYawPitch(yaw, pitch);
+
+        double ctrlYaw = yaw;
+        double ctrlPitch = pitch;
+        if (controlReady && control.pointerActive != 0) {
+            ctrlYaw = yaw + static_cast<double>(control.pointerYaw);
+            ctrlPitch = pitch + static_cast<double>(control.pointerPitch);
+        }
+        const vr::HmdQuaternion_t ctrlRotation = QuaternionFromYawPitch(ctrlYaw, ctrlPitch);
+
+        const float localX = 0.22f + static_cast<float>(armWidthOffset_);
+        const float localY = -0.22f + static_cast<float>(armHeightOffset_);
+        const float localZ = -0.35f;
+        const float rotatedX = static_cast<float>((1.0 - 2.0 * hmdRotation.y * hmdRotation.y - 2.0 * hmdRotation.z * hmdRotation.z) * localX +
+            (2.0 * hmdRotation.x * hmdRotation.y - 2.0 * hmdRotation.z * hmdRotation.w) * localY +
+            (2.0 * hmdRotation.x * hmdRotation.z + 2.0 * hmdRotation.y * hmdRotation.w) * localZ);
+        const float rotatedY = static_cast<float>((2.0 * hmdRotation.x * hmdRotation.y + 2.0 * hmdRotation.z * hmdRotation.w) * localX +
+            (1.0 - 2.0 * hmdRotation.x * hmdRotation.x - 2.0 * hmdRotation.z * hmdRotation.z) * localY +
+            (2.0 * hmdRotation.y * hmdRotation.z - 2.0 * hmdRotation.x * hmdRotation.w) * localZ);
+        const float rotatedZ = static_cast<float>((2.0 * hmdRotation.x * hmdRotation.z - 2.0 * hmdRotation.y * hmdRotation.w) * localX +
+            (2.0 * hmdRotation.y * hmdRotation.z + 2.0 * hmdRotation.x * hmdRotation.w) * localY +
+            (1.0 - 2.0 * hmdRotation.x * hmdRotation.x - 2.0 * hmdRotation.y * hmdRotation.y) * localZ);
 
         vr::DriverPose_t next{};
         next.qWorldFromDriverRotation = {1, 0, 0, 0};
@@ -606,10 +651,10 @@ public:
         next.vecPosition[0] = static_cast<float>(cameraX) + rotatedX;
         next.vecPosition[1] = static_cast<float>(cameraY) + rotatedY;
         next.vecPosition[2] = static_cast<float>(cameraZ) + rotatedZ;
-        next.qRotation = rotation;
-        next.poseIsValid = hmdActive;
-        next.result = hmdActive ? vr::TrackingResult_Running_OK : vr::TrackingResult_Uninitialized;
-        next.deviceIsConnected = inputActive;
+        next.qRotation = ctrlRotation;
+        next.poseIsValid = true;
+        next.result = vr::TrackingResult_Running_OK;
+        next.deviceIsConnected = virtualEnabled;
         pose_ = next;
         if (g_host) g_host->TrackedDevicePoseUpdated(index_, pose_, sizeof(pose_));
 
@@ -660,8 +705,10 @@ public:
             vr::VRDriverLog()->Log(dpadMessage);
             lastDpad_ = controller.dpad;
         }
+        const bool mouseTrigger = controlReady && control.pointerTrigger != 0;
+        const bool mouseMenu = controlReady && control.menuClick != 0;
         const bool rightGrip = inputActive && controller.rightTrigger > 0.5f;
-        const bool rightTriggerButton = configuredTrigger || rightBumper;
+        const bool rightTriggerButton = configuredTrigger || rightBumper || mouseTrigger;
         if (inputActive && dpadActive) {
             armHeightOffset_ = std::clamp(armHeightOffset_ +
                                           static_cast<double>(dpadY) * kArmAdjustRateMetersPerSecond * dt,
@@ -675,11 +722,11 @@ public:
         // some menu surfaces consume the trackpad-click action instead. Keep
         // A on the proven trigger path and mirror it to trackpad click for
         // compatibility with those surfaces.
-        const bool trackpadPress = configuredTrackpad || a || b || rightStick || leftStick;
+        const bool trackpadPress = configuredTrackpad || a || b || rightStick || leftStick || mouseTrigger;
         const bool grip = configuredGrip || x || leftBumper || leftStick || rightGrip;
         // Keep Xbox Menu exclusively on SteamVR's system/dashboard action;
         // do not also send it to Bigscreen's in-game application menu.
-        const bool applicationMenu = configuredMenu || y || view;
+        const bool applicationMenu = configuredMenu || y || view || mouseMenu;
         const float rightTriggerPull = rightTriggerButton ? 1.0f : 0.0f;
         vr::VRDriverInput()->UpdateBooleanComponent(triggerClick_, rightTriggerButton, 0.0);
         vr::VRDriverInput()->UpdateScalarComponent(triggerValue_, rightTriggerPull, 0.0);
@@ -700,15 +747,7 @@ public:
 
 private:
     bool ReadControl(bigscreen_controller_control_ipc::State& out) {
-        if (!controlMapping_) {
-            controlMapping_ = OpenFileMappingW(FILE_MAP_READ, FALSE, bigscreen_controller_control_ipc::kMappingName);
-            if (controlMapping_) {
-                controlState_ = static_cast<const bigscreen_controller_control_ipc::State*>(
-                    MapViewOfFile(controlMapping_, FILE_MAP_READ, 0, 0, sizeof(bigscreen_controller_control_ipc::State)));
-                if (!controlState_) { CloseHandle(controlMapping_); controlMapping_ = nullptr; }
-            }
-        }
-        return controlState_ && bigscreen_controller_control_ipc::Read(controlState_, out);
+        return ReadDriverControl(out);
     }
 
     bool ReadController(bigscreen_desktop_controller_ipc::ControllerState& out) {
