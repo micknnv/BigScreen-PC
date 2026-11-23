@@ -96,7 +96,7 @@ target_compile_definitions(BigscreenDesktopViewer PRIVATE WIN32_LEAN_AND_MEAN NO
 target_include_directories(BigscreenDesktopViewer PRIVATE src)
 target_link_libraries(BigscreenDesktopViewer PRIVATE
   "${OPENVR_SDK_ROOT}/lib/win64/openvr_api.lib"
-  d3d11 dxgi d3dcompiler d2d1 dwrite
+  d3d11 dxgi d3dcompiler d2d1 dwrite ole32
 )
 set_target_properties(BigscreenDesktopViewer PROPERTIES
   OUTPUT_NAME "BigscreenDesktopViewer"

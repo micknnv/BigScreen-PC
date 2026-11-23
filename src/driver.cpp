@@ -371,6 +371,16 @@ public:
         vr::VRProperties()->SetUint64Property(props_, vr::Prop_CurrentUniverseId_Uint64, 2);
         vr::VRProperties()->SetBoolProperty(props_, vr::Prop_HasDriverDirectModeComponent_Bool, true);
         vr::VRProperties()->SetBoolProperty(props_, vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, false);
+        vr::VRProperties()->SetBoolProperty(props_, vr::Prop_ContainsProximitySensor_Bool, true);
+        vr::VRProperties()->SetBoolProperty(props_, vr::Prop_IgnoreMotionForStandby_Bool, false);
+        auto* input = vr::VRDriverInput();
+        if (input) {
+            input->CreateBooleanComponent(props_, "/input/proximity", &proximity_);
+            if (proximity_ != vr::k_ulInvalidInputComponentHandle) {
+                input->UpdateBooleanComponent(proximity_, true, 0.0);
+                vr::VRDriverLog()->Log("Virtual HMD proximity sensor activated (user present)");
+            }
+        }
         if (!directMode_.InitializeGraphicsIdentity()) {
             vr::VRDriverLog()->Log("Direct Mode graphics adapter initialization failed");
             return vr::VRInitError_Driver_Failed;
@@ -407,6 +417,9 @@ public:
     void RunFrame(double dt) {
         if (!active_) return;
         (void)dt;
+        if (proximity_ != vr::k_ulInvalidInputComponentHandle && vr::VRDriverInput()) {
+            vr::VRDriverInput()->UpdateBooleanComponent(proximity_, true, 0.0);
+        }
         bool ipcActive = false;
         double ipcPositionX = positionX_;
         double ipcPositionZ = positionZ_;
@@ -446,9 +459,19 @@ public:
         next.poseTimeOffset = 0.0;
         next.qWorldFromDriverRotation = {1, 0, 0, 0};
         next.qDriverFromHeadRotation = {1, 0, 0, 0};
-        double cameraX = positionX_;
-        double cameraY = 1.6;
-        double cameraZ = positionZ_;
+
+        // Organic micro-sway & breathing tremor to satisfy SteamVR's motion presence watchdog
+        hmdTimeAccum_ += dt;
+        const double hmdJitterX = std::sin(hmdTimeAccum_ * 12.0) * 0.0003 + std::sin(hmdTimeAccum_ * 1.5) * 0.002;
+        const double hmdJitterY = std::cos(hmdTimeAccum_ * 15.0) * 0.0003 + std::cos(hmdTimeAccum_ * 1.2) * 0.002;
+        const double hmdJitterZ = std::sin(hmdTimeAccum_ * 18.0) * 0.0003;
+        const double hmdSwayYaw = std::sin(hmdTimeAccum_ * 1.0) * 0.001; // ~0.057 degrees
+
+        double cameraX = positionX_ + hmdJitterX;
+        double cameraY = 1.6 + hmdJitterY;
+        double cameraZ = positionZ_ + hmdJitterZ;
+        totalYaw += hmdSwayYaw;
+
         if (viewMode == bigscreen_desktop_ipc::ViewMode::LegacyHmdOffset)
             ApplyLegacyHmdOffset(totalYaw, cameraX, cameraY, cameraZ);
         next.vecPosition[0] = cameraX;
@@ -513,10 +536,12 @@ private:
     bigscreen_desktop_ipc::ViewMode lastViewMode_ = bigscreen_desktop_ipc::ViewMode::Normal;
     double positionX_ = 0.0, positionZ_ = 0.0;
     double yaw_ = 0.0, pitch_ = 0.0, logAccumulator_ = 0.0;
+    double hmdTimeAccum_ = 0.0;
     HANDLE mapping_ = nullptr;
     const bigscreen_desktop_ipc::PoseState* sharedState_ = nullptr;
     DirectMode directMode_;
     DisplayComponent display_;
+    vr::VRInputComponentHandle_t proximity_ = vr::k_ulInvalidInputComponentHandle;
 };
 
 class SyntheticRightController final : public vr::ITrackedDeviceServerDriver {
@@ -532,7 +557,7 @@ public:
         vr::VRProperties()->SetStringProperty(props_, vr::Prop_ManufacturerName_String, "BigscreenDesktopBridge");
         vr::VRProperties()->SetInt32Property(props_, vr::Prop_ControllerRoleHint_Int32, vr::TrackedControllerRole_RightHand);
         vr::VRProperties()->SetStringProperty(props_, vr::Prop_ControllerType_String, "vive_controller");
-        vr::VRProperties()->SetStringProperty(props_, vr::Prop_RenderModelName_String, "vr_controller_vive_1_5");
+        vr::VRProperties()->SetStringProperty(props_, vr::Prop_RenderModelName_String, "");
         vr::VRProperties()->SetStringProperty(props_, vr::Prop_InputProfilePath_String,
                                               "{htc}/input/vive_controller_profile.json");
 
@@ -627,9 +652,14 @@ public:
         }
         const vr::HmdQuaternion_t ctrlRotation = QuaternionFromYawPitch(ctrlYaw, ctrlPitch);
 
-        const float localX = 0.22f + static_cast<float>(armWidthOffset_);
-        const float localY = -0.22f + static_cast<float>(armHeightOffset_);
-        const float localZ = -0.35f;
+        // When mouse pointer is active, place the controller slightly behind the camera
+        // (localZ = +0.20m). This hides the 3D avatar hand model (outside view frustum /
+        // behind near-clip plane) and eliminates parallax so the laser beam projects 1:1
+        // directly from the eye line through the mouse cursor.
+        const bool useMousePointer = (controlReady && control.pointerActive != 0);
+        const float localX = useMousePointer ? 0.0f : (0.22f + static_cast<float>(armWidthOffset_));
+        const float localY = useMousePointer ? 0.0f : (-0.22f + static_cast<float>(armHeightOffset_));
+        const float localZ = useMousePointer ? 0.20f : -0.35f;
         const float rotatedX = static_cast<float>((1.0 - 2.0 * hmdRotation.y * hmdRotation.y - 2.0 * hmdRotation.z * hmdRotation.z) * localX +
             (2.0 * hmdRotation.x * hmdRotation.y - 2.0 * hmdRotation.z * hmdRotation.w) * localY +
             (2.0 * hmdRotation.x * hmdRotation.z + 2.0 * hmdRotation.y * hmdRotation.w) * localZ);
@@ -707,6 +737,7 @@ public:
         }
         const bool mouseTrigger = controlReady && control.pointerTrigger != 0;
         const bool mouseMenu = controlReady && control.menuClick != 0;
+        const bool mouseSystem = controlReady && control.systemClick != 0;
         const bool rightGrip = inputActive && controller.rightTrigger > 0.5f;
         const bool rightTriggerButton = configuredTrigger || rightBumper || mouseTrigger;
         if (inputActive && dpadActive) {
@@ -731,9 +762,11 @@ public:
         vr::VRDriverInput()->UpdateBooleanComponent(triggerClick_, rightTriggerButton, 0.0);
         vr::VRDriverInput()->UpdateScalarComponent(triggerValue_, rightTriggerPull, 0.0);
         vr::VRDriverInput()->UpdateBooleanComponent(triggerTouch_, rightTriggerButton, 0.0);
-        vr::VRDriverInput()->UpdateBooleanComponent(menuClick_, applicationMenu, 0.0);
-        // Xbox Menu (three lines) is the SteamVR system/dashboard toggle.
-        vr::VRDriverInput()->UpdateBooleanComponent(systemClick_, menu, 0.0);
+        // In-theater menu is suppressed completely per design; desktop companion menu is used instead.
+        vr::VRDriverInput()->UpdateBooleanComponent(menuClick_, false, 0.0);
+        // Xbox Menu (three lines) and mouseSystem toggle the SteamVR system/dashboard.
+        const bool systemButton = menu || mouseSystem;
+        vr::VRDriverInput()->UpdateBooleanComponent(systemClick_, systemButton, 0.0);
         vr::VRDriverInput()->UpdateScalarComponent(trackpadX_, 0.0, 0.0);
         vr::VRDriverInput()->UpdateScalarComponent(trackpadY_, (configuredMic || leftStick) ? -1.0 : 0.0, 0.0);
         vr::VRDriverInput()->UpdateBooleanComponent(trackpadClick_, trackpadPress, 0.0);
@@ -742,6 +775,14 @@ public:
         if (rightTriggerButton != lastA_) {
             vr::VRDriverLog()->Log(rightTriggerButton ? "Synthetic controller trigger active" : "Synthetic controller trigger released");
             lastA_ = rightTriggerButton;
+        }
+        if (systemButton != lastSystem_) {
+            vr::VRDriverLog()->Log(systemButton ? "Synthetic controller system button active" : "Synthetic controller system button released");
+            lastSystem_ = systemButton;
+        }
+        if (applicationMenu != lastMenu_) {
+            vr::VRDriverLog()->Log(applicationMenu ? "Synthetic controller menu button active" : "Synthetic controller menu button released");
+            lastMenu_ = applicationMenu;
         }
     }
 
@@ -819,6 +860,8 @@ private:
     vr::DriverPose_t pose_{};
     bool active_ = false;
     bool lastA_ = false;
+    bool lastSystem_ = false;
+    bool lastMenu_ = false;
     uint32_t lastDpad_ = 8;
     bool lastReadA_ = false;
     double armHeightOffset_ = 0.0;
@@ -884,7 +927,7 @@ public:
         if (hmd_) hmd_->RunFrame(dt);
         if (controller_) controller_->RunFrame(dt);
     }
-    bool ShouldBlockStandbyMode() override { return false; }
+    bool ShouldBlockStandbyMode() override { return true; }
     void EnterStandby() override {}
     void LeaveStandby() override {}
 private:

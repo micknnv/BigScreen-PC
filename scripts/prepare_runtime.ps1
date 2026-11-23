@@ -56,12 +56,12 @@ if (Test-Path $Settings) {
 
 # 4. Copy built binaries if available in CMake build tree
 $Candidates = @(
-    $BuildDir,
+    (Join-Path $BuildDir "msvc/runtime"),
+    (Join-Path $BuildDir "msvc/Release"),
+    (Join-Path $BuildDir "runtime"),
     (Join-Path $BuildDir "Release"),
     (Join-Path $BuildDir "Debug"),
-    (Join-Path $BuildDir "runtime"),
-    (Join-Path $BuildDir "msvc/Release"),
-    (Join-Path $BuildDir "msvc/runtime"),
+    $BuildDir,
     (Join-Path $BuildDir "BigscreenDesktopDriver/bin/win64")
 )
 
@@ -79,11 +79,15 @@ foreach ($name in $BinaryNames) {
     foreach ($cand in $Candidates) {
         $p = Join-Path $cand $name
         if (Test-Path $p) {
-            Copy-Item $p -Destination $RuntimeDir -Force
-            if ($name -eq "driver_bigscreen_desktop.dll") {
-                Copy-Item $p -Destination $DriverBinDir -Force
+            try {
+                Copy-Item $p -Destination $RuntimeDir -Force
+                if ($name -eq "driver_bigscreen_desktop.dll") {
+                    Copy-Item $p -Destination $DriverBinDir -Force
+                }
+                Write-Host "  [Binary] Copied $name from $cand" -ForegroundColor Green
+            } catch {
+                Write-Host "  [Warning] Could not copy $name (currently in use/running). Close running instance to replace." -ForegroundColor Yellow
             }
-            Write-Host "  [Binary] Copied $name from $cand" -ForegroundColor Green
             $found = $true
             break
         }

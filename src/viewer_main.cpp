@@ -5,6 +5,9 @@
 #include <dxgi1_2.h>
 #include <d2d1.h>
 #include <dwrite.h>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
+#include <tlhelp32.h>
 
 #include "live_frame_ipc.h"
 #include "third_person_gpu_ipc.h"
@@ -20,6 +23,7 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "ole32.lib")
 
 namespace {
 
@@ -95,6 +99,7 @@ D2D1_RECT_F g_btnFullscreenRect{};
 D2D1_RECT_F g_btnPinOnTopRect{};
 D2D1_RECT_F g_btnRecenterRect{};
 D2D1_RECT_F g_btnMenuRect{};
+D2D1_RECT_F g_btnSystemRect{};
 D2D1_RECT_F g_pillRect{};
 
 bool g_closeHovered = false;
@@ -106,7 +111,9 @@ bool g_btnFsHovered = false;
 bool g_btnPinHovered = false;
 bool g_btnRecenterHovered = false;
 bool g_btnMenuHovered = false;
+bool g_btnSystemHovered = false;
 bool g_pillHovered = false;
+bool g_btnSystemDown = false;
 
 // Direct2D & DirectWrite Resources
 ID2D1Factory* g_d2dFactory = nullptr;
@@ -135,6 +142,8 @@ ID2D1SolidColorBrush* g_brushSeparator = nullptr;
 ID2D1SolidColorBrush* g_brushPointerOuter = nullptr;
 ID2D1SolidColorBrush* g_brushPointerInner = nullptr;
 ID2D1SolidColorBrush* g_brushPointerActive = nullptr;
+ID2D1SolidColorBrush* g_brushFeedActive = nullptr;
+ID2D1SolidColorBrush* g_brushFeedStandby = nullptr;
 
 // Controller Control IPC
 HANDLE g_controlMapping = nullptr;
@@ -150,6 +159,169 @@ void Log(const char* fmt, ...) {
     std::fflush(stdout);
     OutputDebugStringA(buffer);
     OutputDebugStringA("\n");
+}
+
+class AudioFeedDetector {
+public:
+    AudioFeedDetector() = default;
+    ~AudioFeedDetector() { Release(); }
+
+    bool Initialize() {
+        if (meter_) return true;
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        IMMDeviceEnumerator* enumerator = nullptr;
+        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                      __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
+        if (FAILED(hr) || !enumerator) return false;
+
+        IMMDevice* defaultDevice = nullptr;
+        hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &defaultDevice);
+        enumerator->Release();
+        if (FAILED(hr) || !defaultDevice) return false;
+
+        hr = defaultDevice->Activate(__uuidof(IAudioMeterInformation), CLSCTX_ALL, nullptr,
+                                     reinterpret_cast<void**>(&meter_));
+        defaultDevice->Release();
+        return SUCCEEDED(hr) && meter_ != nullptr;
+    }
+
+    float GetPeak() {
+        if (!meter_) {
+            if (!Initialize()) return 0.0f;
+        }
+        float peak = 0.0f;
+        HRESULT hr = meter_->GetPeakValue(&peak);
+        if (FAILED(hr)) {
+            Release();
+            return 0.0f;
+        }
+        return peak;
+    }
+
+    void Release() {
+        if (meter_) {
+            meter_->Release();
+            meter_ = nullptr;
+        }
+    }
+
+private:
+    IAudioMeterInformation* meter_ = nullptr;
+};
+
+AudioFeedDetector g_audioDetector;
+bool g_feedActive = false;
+bool g_waitingForNewFeed = false;
+bool g_feedActiveWhenMenuOpened = false;
+bool g_feedSawDropAfterMenuOpen = false;
+ULONGLONG g_menuOpenedTime = 0;
+float g_audioPeak = 0.0f;
+ULONGLONG g_lastFeedCheck = 0;
+int g_feedActiveStreak = 0;
+
+HWND FindBigscreenWindow() {
+    HWND hwnd = FindWindowW(L"UnityWndClass", L"Bigscreen");
+    if (!hwnd) hwnd = FindWindowW(nullptr, L"Bigscreen");
+    if (!hwnd) {
+        DWORD targetPid = 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe{ sizeof(pe) };
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    if (_wcsicmp(pe.szExeFile, L"Bigscreen.exe") == 0) {
+                        targetPid = pe.th32ProcessID;
+                        break;
+                    }
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+        }
+        if (targetPid != 0) {
+            struct EnumCtx { DWORD pid; HWND hwnd; } ctx{ targetPid, nullptr };
+            EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+                auto* c = reinterpret_cast<EnumCtx*>(lp);
+                DWORD pid = 0;
+                GetWindowThreadProcessId(h, &pid);
+                if (pid == c->pid && IsWindowVisible(h)) {
+                    LONG style = GetWindowLongW(h, GWL_STYLE);
+                    if ((style & WS_CAPTION) || (style & WS_POPUP)) {
+                        c->hwnd = h;
+                        return FALSE;
+                    }
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&ctx));
+            hwnd = ctx.hwnd;
+        }
+    }
+    return hwnd;
+}
+
+void ToggleDesktopMenu() {
+    HWND hwnd = FindBigscreenWindow();
+    if (!hwnd) {
+        Log("Bigscreen desktop window not found.");
+        return;
+    }
+    if (IsIconic(hwnd) || GetForegroundWindow() != hwnd) {
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+        g_waitingForNewFeed = true;
+        g_menuOpenedTime = GetTickCount64();
+        g_feedActiveWhenMenuOpened = g_feedActive;
+        g_feedSawDropAfterMenuOpen = false;
+        Log("Restored Bigscreen desktop menu (feedActiveAtOpen=%d). Waiting for user selection / new feed...", g_feedActive);
+    } else {
+        ShowWindow(hwnd, SW_MINIMIZE);
+        SetForegroundWindow(g_hwnd);
+        g_waitingForNewFeed = false;
+        Log("User manually minimized Bigscreen desktop menu.");
+    }
+}
+
+void CheckFeedStatus() {
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_lastFeedCheck < 100) return;
+    g_lastFeedCheck = now;
+
+    g_audioPeak = g_audioDetector.GetPeak();
+    if (g_audioPeak > 0.005f) {
+        if (g_feedActiveStreak < 10) g_feedActiveStreak++;
+    } else {
+        if (g_feedActiveStreak > 0) g_feedActiveStreak--;
+    }
+    g_feedActive = (g_feedActiveStreak >= 3);
+
+    if (g_waitingForNewFeed) {
+        // Enforce a minimum 2-second grace period after opening menu before auto-minimizing
+        if (now - g_menuOpenedTime >= 2000) {
+            bool newFeedDetected = false;
+            if (!g_feedActiveWhenMenuOpened) {
+                // If there was no stream when menu opened, auto-minimize as soon as stream begins
+                if (g_feedActive) {
+                    newFeedDetected = true;
+                }
+            } else {
+                // If a stream was already playing when menu opened, wait for stream to stop/switch (silence) and then resume
+                if (!g_feedActive) {
+                    g_feedSawDropAfterMenuOpen = true;
+                } else if (g_feedSawDropAfterMenuOpen && g_feedActive) {
+                    newFeedDetected = true;
+                }
+            }
+
+            if (newFeedDetected) {
+                g_waitingForNewFeed = false;
+                HWND hwndBig = FindBigscreenWindow();
+                if (hwndBig && !IsIconic(hwndBig)) {
+                    ShowWindow(hwndBig, SW_MINIMIZE);
+                    SetForegroundWindow(g_hwnd);
+                    Log("New audio/video feed detected (audio peak=%.3f). Auto-minimized Bigscreen desktop menu.", g_audioPeak);
+                }
+            }
+        }
+    }
 }
 
 void EnsureControlMapping() {
@@ -184,10 +356,9 @@ void SyncViewRequest(bigscreen_controller_control_ipc::ViewRequest req) {
 void SyncPointerAndLook() {
     EnsureControlMapping();
     if (g_controlState) {
-        bigscreen_controller_control_ipc::SetPointerState(
-            g_controlState, g_pointerYaw, g_pointerPitch, g_pointerTrigger, g_pointerActive);
-        bigscreen_controller_control_ipc::SetLookOffset(
-            g_controlState, g_lookYaw, g_lookPitch);
+        bigscreen_controller_control_ipc::SetPointerAndLook(
+            g_controlState, g_pointerYaw, g_pointerPitch, g_pointerTrigger, g_pointerActive,
+            g_lookYaw, g_lookPitch);
     }
 }
 
@@ -269,6 +440,8 @@ void ReleaseThirdPersonResources() {
 }
 
 void ReleaseD2DDeviceResources() {
+    if (g_brushFeedStandby) { g_brushFeedStandby->Release(); g_brushFeedStandby = nullptr; }
+    if (g_brushFeedActive) { g_brushFeedActive->Release(); g_brushFeedActive = nullptr; }
     if (g_brushPointerActive) { g_brushPointerActive->Release(); g_brushPointerActive = nullptr; }
     if (g_brushPointerInner) { g_brushPointerInner->Release(); g_brushPointerInner = nullptr; }
     if (g_brushPointerOuter) { g_brushPointerOuter->Release(); g_brushPointerOuter = nullptr; }
@@ -323,6 +496,8 @@ bool CreateD2DDeviceResources() {
     g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.000f, 0.831f, 1.000f, 0.75f), &g_brushPointerOuter);
     g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.000f, 0.831f, 1.000f, 0.95f), &g_brushPointerInner);
     g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(1.000f, 1.000f, 1.000f, 1.00f), &g_brushPointerActive);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.000f, 0.900f, 0.450f, 1.00f), &g_brushFeedActive);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.450f, 0.520f, 0.620f, 0.80f), &g_brushFeedStandby);
 
     return true;
 }
@@ -442,7 +617,7 @@ void DrawPointerReticle(float x, float y, bool active) {
 
 void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
     const float panelWidth = 310.0f;
-    const float panelHeight = 410.0f;
+    const float panelHeight = 475.0f;
     const float left = windowWidth - panelWidth - 20.0f;
     const float top = 20.0f;
     const float right = left + panelWidth;
@@ -519,20 +694,51 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
         s4Text, static_cast<UINT32>(wcslen(s4Text)),
         g_textFormatSection, &s4Rect, g_brushTextSection);
 
-    g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 268.0f, left + 148.0f, top + 302.0f);
-    g_btnMenuRect = D2D1::RectF(left + 156.0f, top + 268.0f, right - 18.0f, top + 302.0f);
+    g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 268.0f, left + 140.0f, top + 300.0f);
+    g_btnMenuRect = D2D1::RectF(left + 148.0f, top + 268.0f, right - 18.0f, top + 300.0f);
     DrawButton(g_btnRecenterRect, L"🎯 Recenter", false, g_btnRecenterHovered);
-    DrawButton(g_btnMenuRect, L"📋 Menu", false, g_btnMenuHovered);
+    DrawButton(g_btnMenuRect, L"📋 Desktop Menu", false, g_btnMenuHovered);
+
+    g_btnSystemRect = D2D1::RectF(left + 18.0f, top + 306.0f, right - 18.0f, top + 338.0f);
+    DrawButton(g_btnSystemRect, L"⊞ SteamVR Dashboard", false, g_btnSystemHovered);
+
+    // SECTION 5: MEDIA FEED STATUS
+    const wchar_t* s5Text = L"MEDIA FEED STATUS";
+    D2D1_RECT_F s5Rect = D2D1::RectF(left + 18.0f, top + 346.0f, right - 18.0f, top + 364.0f);
+    g_d2dRenderTarget->DrawText(
+        s5Text, static_cast<UINT32>(wcslen(s5Text)),
+        g_textFormatSection, &s5Rect, g_brushTextSection);
+
+    D2D1_RECT_F feedBoxRect = D2D1::RectF(left + 18.0f, top + 366.0f, right - 18.0f, top + 396.0f);
+    D2D1_ROUNDED_RECT feedBox = D2D1::RoundedRect(feedBoxRect, 6.0f, 6.0f);
+    g_d2dRenderTarget->FillRoundedRectangle(&feedBox, g_brushBtnInactiveBg);
+    g_d2dRenderTarget->DrawRoundedRectangle(&feedBox, g_feedActive ? g_brushFeedActive : g_brushBtnBorder, 1.0f);
+
+    const D2D1_ELLIPSE feedDot = D2D1::Ellipse(
+        D2D1::Point2F(feedBoxRect.left + 14.0f, (feedBoxRect.top + feedBoxRect.bottom) * 0.5f),
+        4.0f, 4.0f);
+    g_d2dRenderTarget->FillEllipse(&feedDot, g_feedActive ? g_brushFeedActive : g_brushFeedStandby);
+
+    wchar_t feedText[64]{};
+    if (g_feedActive) {
+        swprintf_s(feedText, L"ACTIVE  |  Streaming (Audio: %.0f%%)", g_audioPeak * 100.0f);
+    } else {
+        wcscpy_s(feedText, L"IDLE  |  No Active Stream");
+    }
+    D2D1_RECT_F feedTextRect = D2D1::RectF(feedBoxRect.left + 24.0f, feedBoxRect.top, feedBoxRect.right - 8.0f, feedBoxRect.bottom);
+    g_d2dRenderTarget->DrawText(
+        feedText, static_cast<UINT32>(wcslen(feedText)),
+        g_textFormatFooter, &feedTextRect, g_feedActive ? g_brushFeedActive : g_brushTextMuted);
 
     // Footer separator line
     g_d2dRenderTarget->DrawLine(
-        D2D1::Point2F(left + 18.0f, top + 318.0f),
-        D2D1::Point2F(right - 18.0f, top + 318.0f),
+        D2D1::Point2F(left + 18.0f, top + 404.0f),
+        D2D1::Point2F(right - 18.0f, top + 404.0f),
         g_brushSeparator, 1.0f);
 
     // Footer Hotkey Hints
-    const wchar_t* footerText = L"Mouse Move: Laser Pointer  |  Left-Click: Trigger\nRight-Click Drag: Look  |  Space: Menu  |  R: Recenter\nAlt+Drag or Header: Move Window";
-    D2D1_RECT_F footerRect = D2D1::RectF(left + 8.0f, top + 324.0f, right - 8.0f, bottom - 6.0f);
+    const wchar_t* footerText = L"Mouse Move: Laser Pointer  |  Left-Click: Trigger\nRight-Click Drag: Look  |  Esc: SteamVR Dashboard\nR: Recenter  |  Alt+Drag or Header: Move Window";
+    D2D1_RECT_F footerRect = D2D1::RectF(left + 8.0f, top + 408.0f, right - 8.0f, bottom - 6.0f);
     g_d2dRenderTarget->DrawText(
         footerText, static_cast<UINT32>(wcslen(footerText)),
         g_textFormatFooter, &footerRect, g_brushTextMuted);
@@ -933,20 +1139,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             ResetLook();
             return 0;
         }
-        if (wParam == VK_SPACE) {
+        if (wParam == VK_ESCAPE) {
             EnsureControlMapping();
             if (g_controlState) {
-                bigscreen_controller_control_ipc::PulseMenuClick(g_controlState);
+                bigscreen_controller_control_ipc::PulseSystemClick(g_controlState);
             }
             return 0;
         }
     }
 
     if (message == WM_KEYUP) {
-        if (wParam == VK_SPACE) {
+        if (wParam == VK_ESCAPE) {
             EnsureControlMapping();
             if (g_controlState) {
-                bigscreen_controller_control_ipc::ClearMenuClick(g_controlState);
+                bigscreen_controller_control_ipc::ClearSystemClick(g_controlState);
             }
             return 0;
         }
@@ -984,6 +1190,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_btnPinHovered = inRect(mx, my, g_btnPinOnTopRect);
             g_btnRecenterHovered = inRect(mx, my, g_btnRecenterRect);
             g_btnMenuHovered = inRect(mx, my, g_btnMenuRect);
+            g_btnSystemHovered = inRect(mx, my, g_btnSystemRect);
         } else if (!g_showRemote && inRect(mx, my, g_pillRect)) {
             g_pointerActive = false;
             g_pillHovered = true;
@@ -999,6 +1206,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_btnPinHovered = false;
             g_btnRecenterHovered = false;
             g_btnMenuHovered = false;
+            g_btnSystemHovered = false;
 
             g_pointerActive = true;
             g_cursorX = mx;
@@ -1018,8 +1226,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             const float zoom = g_movieOnly ? 1.8f : 1.0f;
             const float halfFovH = (45.0f * 3.14159265f / 180.0f) / zoom;
             const float halfFovV = (28.0f * 3.14159265f / 180.0f) / zoom;
-            g_pointerYaw = nx * halfFovH;
-            g_pointerPitch = -ny * halfFovV;
+            g_pointerYaw = -nx * halfFovH;
+            g_pointerPitch = ny * halfFovV;
         }
 
         SyncPointerAndLook();
@@ -1037,6 +1245,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         g_btnPinHovered = false;
         g_btnRecenterHovered = false;
         g_btnMenuHovered = false;
+        g_btnSystemHovered = false;
         g_pointerActive = false;
         g_pointerTrigger = false;
         SyncPointerAndLook();
@@ -1085,9 +1294,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 return 0;
             }
             if (inRect(mx, my, g_btnMenuRect)) {
+                ToggleDesktopMenu();
+                return 0;
+            }
+            if (inRect(mx, my, g_btnSystemRect)) {
+                g_btnSystemDown = true;
                 EnsureControlMapping();
                 if (g_controlState) {
-                    bigscreen_controller_control_ipc::PulseMenuClick(g_controlState);
+                    bigscreen_controller_control_ipc::PulseSystemClick(g_controlState);
                 }
                 return 0;
             }
@@ -1105,6 +1319,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
     }
 
     if (message == WM_LBUTTONUP) {
+        if (g_btnSystemDown) {
+            g_btnSystemDown = false;
+            EnsureControlMapping();
+            if (g_controlState) {
+                bigscreen_controller_control_ipc::ClearSystemClick(g_controlState);
+            }
+        }
         if (g_pointerTrigger) {
             g_pointerTrigger = false;
             SyncPointerAndLook();
@@ -1218,6 +1439,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             TranslateMessage(&message);
             DispatchMessage(&message);
         }
+        CheckFeedStatus();
         ID3D11ShaderResourceView* source = nullptr;
         if (g_viewSource == ViewSource::ThirdPerson) {
             const bool copied = CopyThirdPersonFrame();

@@ -601,6 +601,8 @@ HWND CreateRawInputWindow() {
                            0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, instance, nullptr);
 }
 
+static bool g_rawMouseLeftDown = false;
+
 void ProcessRawMouse(HWND target, bool active, double sensitivity, double& yaw, double& pitch, XboxHidReader* xboxReader) {
     MSG message{};
     (void)target;
@@ -613,6 +615,8 @@ void ProcessRawMouse(HWND target, bool active, double sensitivity, double& yaw, 
                             buffer.data(), &size, sizeof(RAWINPUTHEADER)) != size) continue;
         const auto* raw = reinterpret_cast<const RAWINPUT*>(buffer.data());
         if (raw->header.dwType == RIM_TYPEMOUSE) {
+            if (raw->data.mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) g_rawMouseLeftDown = true;
+            if (raw->data.mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP) g_rawMouseLeftDown = false;
             if (!active) continue;
             yaw += static_cast<double>(raw->data.mouse.lLastX) * sensitivity;
             pitch -= static_cast<double>(raw->data.mouse.lLastY) * sensitivity;
@@ -782,6 +786,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         const XboxState hidXbox = xboxReader.Snapshot();
         const XboxState gamepadXbox = windowsGamepadReader.Snapshot();
         XboxState xbox = windowsGamepadReader.Available() ? gamepadXbox : hidXbox;
+        if (control.virtualControllersEnabled != 0) {
+            xbox.connected = true;
+        }
+        if (g_rawMouseLeftDown) {
+            xbox.rightTrigger = 1.0f;
+        }
         if (hidXbox.connected) {
             xbox.connected = true;
             xbox.leftX = hidXbox.leftX;
