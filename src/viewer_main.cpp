@@ -8,6 +8,9 @@
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <tlhelp32.h>
+#include <shellapi.h>
+#include <string>
+#include <vector>
 
 #include "live_frame_ipc.h"
 #include "third_person_gpu_ipc.h"
@@ -25,6 +28,9 @@
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "user32.lib")
 
 namespace {
 
@@ -95,27 +101,31 @@ POINT g_lastRightPt{};
 // Remote UI Layout Rects & Hover States
 D2D1_RECT_F g_remoteRect{};
 D2D1_RECT_F g_closeRect{};
+D2D1_RECT_F g_powerHeaderRect{};
 D2D1_RECT_F g_btn1stPersonRect{};
-D2D1_RECT_F g_btn3rdPersonRect{};
 D2D1_RECT_F g_btnWholeTheaterRect{};
 D2D1_RECT_F g_btnMovieOnlyRect{};
+D2D1_RECT_F g_btnProjectScreenRect{};
+D2D1_RECT_F g_btnProjectAppRect{};
 D2D1_RECT_F g_btnFullscreenRect{};
-D2D1_RECT_F g_btnPinOnTopRect{};
 D2D1_RECT_F g_btnRecenterRect{};
 D2D1_RECT_F g_btnMenuRect{};
 D2D1_RECT_F g_btnSystemRect{};
+D2D1_RECT_F g_btnPowerRect{};
 D2D1_RECT_F g_pillRect{};
 
 bool g_closeHovered = false;
+bool g_powerHeaderHovered = false;
 bool g_btn1stHovered = false;
-bool g_btn3rdHovered = false;
 bool g_btnWholeHovered = false;
 bool g_btnMovieHovered = false;
+bool g_btnProjectScreenHovered = false;
+bool g_btnProjectAppHovered = false;
 bool g_btnFsHovered = false;
-bool g_btnPinHovered = false;
 bool g_btnRecenterHovered = false;
 bool g_btnMenuHovered = false;
 bool g_btnSystemHovered = false;
+bool g_btnPowerHovered = false;
 bool g_pillHovered = false;
 bool g_btnSystemDown = false;
 
@@ -148,6 +158,19 @@ ID2D1SolidColorBrush* g_brushPointerInner = nullptr;
 ID2D1SolidColorBrush* g_brushPointerActive = nullptr;
 ID2D1SolidColorBrush* g_brushFeedActive = nullptr;
 ID2D1SolidColorBrush* g_brushFeedStandby = nullptr;
+ID2D1SolidColorBrush* g_brushPowerOn = nullptr;
+ID2D1SolidColorBrush* g_brushPowerOff = nullptr;
+
+// Isolated App Projection State
+HWND g_projectedHwnd = nullptr;
+std::wstring g_projectedTitle;
+ID3D11Texture2D* g_projectedTexture = nullptr;
+ID3D11ShaderResourceView* g_projectedSrv = nullptr;
+uint32_t g_projectedWidth = 0;
+uint32_t g_projectedHeight = 0;
+HDC g_captureMemDc = nullptr;
+HBITMAP g_captureBitmap = nullptr;
+void* g_captureBitmapBits = nullptr;
 
 // Controller Control IPC
 HANDLE g_controlMapping = nullptr;
@@ -330,6 +353,198 @@ void CheckFeedStatus() {
     }
 }
 
+bool IsProcessRunning(const wchar_t* exeName) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe{ sizeof(pe) };
+    bool found = false;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, exeName) == 0) {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+bool IsVrRunning() {
+    return IsProcessRunning(L"Bigscreen.exe") ||
+           IsProcessRunning(L"vrserver.exe") ||
+           IsProcessRunning(L"vrmonitor.exe");
+}
+
+void TerminateVrProcesses() {
+    const wchar_t* targets[] = {
+        L"Bigscreen.exe",
+        L"vrserver.exe",
+        L"vrmonitor.exe",
+        L"vrcompositor.exe",
+        L"vrdashboard.exe",
+        L"BigscreenDesktopBridge.exe"
+    };
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe{ sizeof(pe) };
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            for (const auto* target : targets) {
+                if (_wcsicmp(pe.szExeFile, target) == 0) {
+                    HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                    if (proc) {
+                        TerminateProcess(proc, 0);
+                        CloseHandle(proc);
+                    }
+                }
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+}
+
+void LaunchVrProcesses() {
+    ShellExecuteW(nullptr, L"open", L"steam://rungameid/250820", nullptr, nullptr, SW_SHOW);
+    ShellExecuteW(nullptr, L"open", L"steam://rungameid/457550", nullptr, nullptr, SW_SHOW);
+}
+
+void ReleaseProjectedAppResources() {
+    if (g_projectedSrv) { g_projectedSrv->Release(); g_projectedSrv = nullptr; }
+    if (g_projectedTexture) { g_projectedTexture->Release(); g_projectedTexture = nullptr; }
+    if (g_captureBitmap) { DeleteObject(g_captureBitmap); g_captureBitmap = nullptr; }
+    if (g_captureMemDc) { DeleteDC(g_captureMemDc); g_captureMemDc = nullptr; }
+    g_captureBitmapBits = nullptr;
+    g_projectedWidth = 0;
+    g_projectedHeight = 0;
+    g_projectedHwnd = nullptr;
+    g_projectedTitle.clear();
+}
+
+bool EnsureCaptureBuffers(uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0 || !g_device) return false;
+    if (g_projectedTexture && g_projectedWidth == width && g_projectedHeight == height) return true;
+
+    if (g_projectedSrv) { g_projectedSrv->Release(); g_projectedSrv = nullptr; }
+    if (g_projectedTexture) { g_projectedTexture->Release(); g_projectedTexture = nullptr; }
+    if (g_captureBitmap) { DeleteObject(g_captureBitmap); g_captureBitmap = nullptr; }
+    if (g_captureMemDc) { DeleteDC(g_captureMemDc); g_captureMemDc = nullptr; }
+
+    HDC screenDc = GetDC(nullptr);
+    g_captureMemDc = CreateCompatibleDC(screenDc);
+    ReleaseDC(nullptr, screenDc);
+    if (!g_captureMemDc) return false;
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = static_cast<LONG>(width);
+    bmi.bmiHeader.biHeight = -static_cast<LONG>(height);
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    g_captureBitmap = CreateDIBSection(g_captureMemDc, &bmi, DIB_RGB_COLORS, &g_captureBitmapBits, nullptr, 0);
+    if (!g_captureBitmap || !g_captureBitmapBits) return false;
+    SelectObject(g_captureMemDc, g_captureBitmap);
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &g_projectedTexture))) return false;
+    if (FAILED(g_device->CreateShaderResourceView(g_projectedTexture, nullptr, &g_projectedSrv))) return false;
+
+    g_projectedWidth = width;
+    g_projectedHeight = height;
+    return true;
+}
+
+bool CaptureProjectedWindowFrame() {
+    if (!g_projectedHwnd || !IsWindow(g_projectedHwnd)) {
+        ReleaseProjectedAppResources();
+        return false;
+    }
+    RECT rc{};
+    GetClientRect(g_projectedHwnd, &rc);
+    int width = rc.right - rc.left;
+    int height = rc.bottom - rc.top;
+    if (width <= 0 || height <= 0) {
+        GetWindowRect(g_projectedHwnd, &rc);
+        width = rc.right - rc.left;
+        height = rc.bottom - rc.top;
+    }
+    if (width <= 32 || height <= 32) return false;
+
+    if (!EnsureCaptureBuffers(static_cast<uint32_t>(width), static_cast<uint32_t>(height))) return false;
+
+    BOOL ok = PrintWindow(g_projectedHwnd, g_captureMemDc, 0x00000002);
+    if (!ok) {
+        ok = PrintWindow(g_projectedHwnd, g_captureMemDc, 0);
+    }
+    if (ok && g_context && g_projectedTexture && g_captureBitmapBits) {
+        g_context->UpdateSubresource(g_projectedTexture, 0, nullptr, g_captureBitmapBits, width * 4, 0);
+        return true;
+    }
+    return false;
+}
+
+struct AppWindowInfo {
+    HWND hwnd = nullptr;
+    std::wstring title;
+};
+
+std::vector<AppWindowInfo> EnumerateSelectableAppWindows() {
+    std::vector<AppWindowInfo> list;
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        auto* outList = reinterpret_cast<std::vector<AppWindowInfo>*>(lParam);
+        if (!IsWindowVisible(hwnd) && !IsIconic(hwnd)) return TRUE;
+        if (hwnd == g_hwnd) return TRUE;
+
+        LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+        if (!(style & WS_VISIBLE) && !IsIconic(hwnd)) return TRUE;
+        LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
+
+        wchar_t title[256]{};
+        int len = GetWindowTextW(hwnd, title, 256);
+        if (len <= 0) return TRUE;
+
+        if (wcscmp(title, L"Program Manager") == 0 ||
+            wcscmp(title, L"Windows Input Experience") == 0 ||
+            wcscmp(title, L"Settings") == 0) {
+            return TRUE;
+        }
+
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProcess) {
+            wchar_t exePath[MAX_PATH]{};
+            DWORD size = MAX_PATH;
+            if (QueryFullProcessImageNameW(hProcess, 0, exePath, &size)) {
+                if (wcsstr(exePath, L"BigscreenDesktopViewer") ||
+                    wcsstr(exePath, L"SteamVR") ||
+                    wcsstr(exePath, L"vrserver") ||
+                    wcsstr(exePath, L"vrmonitor")) {
+                    CloseHandle(hProcess);
+                    return TRUE;
+                }
+            }
+            CloseHandle(hProcess);
+        }
+
+        outList->push_back({ hwnd, title });
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&list));
+
+    return list;
+}
+
 void EnsureControlMapping() {
     if (!g_controlMapping) {
         g_controlMapping = CreateFileMappingW(
@@ -377,6 +592,37 @@ void ResetLook() {
     if (g_controlState) {
         bigscreen_controller_control_ipc::TriggerReset(g_controlState);
         SyncPointerAndLook();
+    }
+}
+
+void ShowProjectAppMenu(HWND parentHwnd, float clickX, float clickY) {
+    auto windows = EnumerateSelectableAppWindows();
+    HMENU hMenu = CreatePopupMenu();
+    if (windows.empty()) {
+        AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, L"No eligible video/app windows found");
+    } else {
+        AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, L"--- Select Video App to Project Privately ---");
+        for (size_t i = 0; i < windows.size() && i < 25; ++i) {
+            std::wstring itemText = windows[i].title;
+            if (itemText.length() > 45) {
+                itemText = itemText.substr(0, 42) + L"...";
+            }
+            AppendMenuW(hMenu, MF_STRING, static_cast<UINT_PTR>(1000 + i), itemText.c_str());
+        }
+    }
+    POINT pt{ static_cast<LONG>(clickX), static_cast<LONG>(clickY) };
+    ClientToScreen(parentHwnd, &pt);
+    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, parentHwnd, nullptr);
+    DestroyMenu(hMenu);
+    if (cmd >= 1000 && static_cast<size_t>(cmd - 1000) < windows.size()) {
+        ReleaseProjectedAppResources();
+        g_projectedHwnd = windows[cmd - 1000].hwnd;
+        g_projectedTitle = windows[cmd - 1000].title;
+        g_movieOnly = true;
+        g_lookYaw = 0.0f;
+        g_lookPitch = 0.0f;
+        SyncPointerAndLook();
+        Log("Started projecting isolated application window: %ls", g_projectedTitle.c_str());
     }
 }
 
@@ -446,6 +692,8 @@ void ReleaseThirdPersonResources() {
 }
 
 void ReleaseD2DDeviceResources() {
+    if (g_brushPowerOff) { g_brushPowerOff->Release(); g_brushPowerOff = nullptr; }
+    if (g_brushPowerOn) { g_brushPowerOn->Release(); g_brushPowerOn = nullptr; }
     if (g_brushFeedStandby) { g_brushFeedStandby->Release(); g_brushFeedStandby = nullptr; }
     if (g_brushFeedActive) { g_brushFeedActive->Release(); g_brushFeedActive = nullptr; }
     if (g_brushPointerActive) { g_brushPointerActive->Release(); g_brushPointerActive = nullptr; }
@@ -504,6 +752,8 @@ bool CreateD2DDeviceResources() {
     g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(1.000f, 1.000f, 1.000f, 1.00f), &g_brushPointerActive);
     g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.000f, 0.900f, 0.450f, 1.00f), &g_brushFeedActive);
     g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.450f, 0.520f, 0.620f, 0.80f), &g_brushFeedStandby);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.180f, 0.750f, 0.380f, 1.00f), &g_brushPowerOn);
+    g_d2dRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.880f, 0.220f, 0.220f, 1.00f), &g_brushPowerOff);
 
     return true;
 }
@@ -559,18 +809,43 @@ bool InitD2D() {
     return CreateD2DDeviceResources();
 }
 
-void DrawButton(const D2D1_RECT_F& rect, const wchar_t* text, bool active, bool hovered, float radius = 6.0f) {
+void DrawButton(const D2D1_RECT_F& rect, const wchar_t* text, bool active, bool hovered, float radius = 6.0f, bool disabled = false) {
     D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(rect, radius, radius);
-    ID2D1SolidColorBrush* bgBrush = active ? g_brushBtnActiveBg : (hovered ? g_brushBtnHoverBg : g_brushBtnInactiveBg);
-    ID2D1SolidColorBrush* borderBrush = active ? g_brushBtnActiveBorder : (hovered ? g_brushAccent : g_brushBtnBorder);
+    ID2D1SolidColorBrush* bgBrush = disabled ? g_brushBtnInactiveBg : (active ? g_brushBtnActiveBg : (hovered ? g_brushBtnHoverBg : g_brushBtnInactiveBg));
+    ID2D1SolidColorBrush* borderBrush = disabled ? g_brushBtnBorder : (active ? g_brushBtnActiveBorder : (hovered ? g_brushAccent : g_brushBtnBorder));
     
     g_d2dRenderTarget->FillRoundedRectangle(&rounded, bgBrush);
-    g_d2dRenderTarget->DrawRoundedRectangle(&rounded, borderBrush, active ? 1.5f : 1.0f);
+    g_d2dRenderTarget->DrawRoundedRectangle(&rounded, borderBrush, (!disabled && active) ? 1.5f : 1.0f);
     
-    ID2D1SolidColorBrush* textBrush = active ? g_brushTextWhite : (hovered ? g_brushTextWhite : g_brushTextMuted);
+    ID2D1SolidColorBrush* textBrush = disabled ? g_brushTextMuted : (active ? g_brushTextWhite : (hovered ? g_brushTextWhite : g_brushTextMuted));
     g_d2dRenderTarget->DrawText(
         text, static_cast<UINT32>(wcslen(text)),
         g_textFormatBtn, &rect, textBrush);
+}
+
+void DrawPowerHeaderButton(const D2D1_RECT_F& rect, bool vrRunning, bool hovered) {
+    D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(rect, 4.0f, 4.0f);
+    if (hovered) {
+        g_d2dRenderTarget->FillRoundedRectangle(&rounded, vrRunning ? g_brushCloseHover : g_brushBtnHoverBg);
+    }
+    ID2D1SolidColorBrush* iconBrush = vrRunning ? g_brushPowerOff : g_brushPowerOn;
+    g_d2dRenderTarget->DrawRoundedRectangle(&rounded, iconBrush, 1.0f);
+    
+    const wchar_t* powerIcon = L"\x23FB"; // ⏻
+    g_d2dRenderTarget->DrawText(
+        powerIcon, 1,
+        g_textFormatBtn, &rect, iconBrush);
+}
+
+void DrawPowerButton(const D2D1_RECT_F& rect, const wchar_t* text, bool vrRunning, bool hovered) {
+    D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(rect, 6.0f, 6.0f);
+    ID2D1SolidColorBrush* borderBrush = vrRunning ? g_brushPowerOff : g_brushPowerOn;
+    ID2D1SolidColorBrush* bgBrush = hovered ? (vrRunning ? g_brushCloseHover : g_brushBtnHoverBg) : g_brushBtnInactiveBg;
+    g_d2dRenderTarget->FillRoundedRectangle(&rounded, bgBrush);
+    g_d2dRenderTarget->DrawRoundedRectangle(&rounded, borderBrush, 1.4f);
+    g_d2dRenderTarget->DrawText(
+        text, static_cast<UINT32>(wcslen(text)),
+        g_textFormatBtn, &rect, g_brushTextWhite);
 }
 
 void DrawCloseButton(const D2D1_RECT_F& rect, bool hovered) {
@@ -623,7 +898,7 @@ void DrawPointerReticle(float x, float y, bool active) {
 
 void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
     const float panelWidth = 310.0f;
-    const float panelHeight = 475.0f;
+    const float panelHeight = 560.0f;
     const float left = windowWidth - panelWidth - 20.0f;
     const float top = 20.0f;
     const float right = left + panelWidth;
@@ -648,85 +923,114 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
     // Header Title
     const wchar_t* titleText = L"REMOTE CONTROL";
-    D2D1_RECT_F titleRect = D2D1::RectF(left + 32.0f, top, right - 40.0f, top + 42.0f);
+    D2D1_RECT_F titleRect = D2D1::RectF(left + 32.0f, top, right - 74.0f, top + 42.0f);
     g_d2dRenderTarget->DrawText(
         titleText, static_cast<UINT32>(wcslen(titleText)),
         g_textFormatTitle, &titleRect, g_brushTextWhite);
+
+    const bool vrRunning = IsVrRunning();
+
+    // Header Power Button [ ⏻ ]
+    g_powerHeaderRect = D2D1::RectF(right - 68.0f, top + 8.0f, right - 42.0f, top + 34.0f);
+    DrawPowerHeaderButton(g_powerHeaderRect, vrRunning, g_powerHeaderHovered);
 
     // Close button [✕]
     g_closeRect = D2D1::RectF(right - 36.0f, top + 8.0f, right - 10.0f, top + 34.0f);
     DrawCloseButton(g_closeRect, g_closeHovered);
 
-    // SECTION 1: VIEW MODE
-    const wchar_t* s1Text = L"VIEW MODE";
-    D2D1_RECT_F s1Rect = D2D1::RectF(left + 18.0f, top + 50.0f, right - 18.0f, top + 68.0f);
+    // SECTION 1: VIEW & FRAMING
+    const wchar_t* s1Text = L"VIEW & THEATER FRAMING";
+    D2D1_RECT_F s1Rect = D2D1::RectF(left + 18.0f, top + 48.0f, right - 18.0f, top + 64.0f);
     g_d2dRenderTarget->DrawText(
         s1Text, static_cast<UINT32>(wcslen(s1Text)),
         g_textFormatSection, &s1Rect, g_brushTextSection);
 
-    g_btn1stPersonRect = D2D1::RectF(left + 18.0f, top + 70.0f, left + 148.0f, top + 104.0f);
-    g_btn3rdPersonRect = D2D1::RectF(left + 156.0f, top + 70.0f, right - 18.0f, top + 104.0f);
-    DrawButton(g_btn1stPersonRect, L"1st Person", g_viewSource == ViewSource::FirstPerson, g_btn1stHovered);
-    DrawButton(g_btn3rdPersonRect, L"3rd Person", g_viewSource == ViewSource::ThirdPerson, g_btn3rdHovered);
+    g_btnWholeTheaterRect = D2D1::RectF(left + 18.0f, top + 66.0f, left + 148.0f, top + 98.0f);
+    g_btnMovieOnlyRect = D2D1::RectF(left + 156.0f, top + 66.0f, right - 18.0f, top + 98.0f);
+    DrawButton(g_btnWholeTheaterRect, L"Whole Theater", !g_movieOnly, g_btnWholeHovered);
+    DrawButton(g_btnMovieOnlyRect, L"Movie Only", g_movieOnly, g_btnMovieHovered);
 
-    // SECTION 2: THEATER FRAMING
-    const wchar_t* s2Text = L"THEATER FRAMING";
-    D2D1_RECT_F s2Rect = D2D1::RectF(left + 18.0f, top + 116.0f, right - 18.0f, top + 134.0f);
+    g_btn1stPersonRect = D2D1::RectF(left + 18.0f, top + 104.0f, right - 18.0f, top + 134.0f);
+    if (g_movieOnly) {
+        DrawButton(g_btn1stPersonRect, L"1st Person (Disabled in Movie Only)", false, false, 6.0f, true);
+    } else {
+        DrawButton(g_btn1stPersonRect, L"1st Person View (Active)", true, g_btn1stHovered, 6.0f, false);
+    }
+
+    // SECTION 2: PROJECTION & SOURCES
+    const wchar_t* s2Text = L"PROJECTION & SOURCES";
+    D2D1_RECT_F s2Rect = D2D1::RectF(left + 18.0f, top + 144.0f, right - 18.0f, top + 160.0f);
     g_d2dRenderTarget->DrawText(
         s2Text, static_cast<UINT32>(wcslen(s2Text)),
         g_textFormatSection, &s2Rect, g_brushTextSection);
 
-    g_btnWholeTheaterRect = D2D1::RectF(left + 18.0f, top + 136.0f, left + 148.0f, top + 170.0f);
-    g_btnMovieOnlyRect = D2D1::RectF(left + 156.0f, top + 136.0f, right - 18.0f, top + 170.0f);
-    DrawButton(g_btnWholeTheaterRect, L"Whole Theater", !g_movieOnly, g_btnWholeHovered);
-    DrawButton(g_btnMovieOnlyRect, L"Movie Only", g_movieOnly, g_btnMovieHovered);
+    g_btnProjectScreenRect = D2D1::RectF(left + 18.0f, top + 162.0f, left + 148.0f, top + 194.0f);
+    g_btnProjectAppRect = D2D1::RectF(left + 156.0f, top + 162.0f, right - 18.0f, top + 194.0f);
+    DrawButton(g_btnProjectScreenRect, L"Project Screen", false, g_btnProjectScreenHovered);
+    const wchar_t* appBtnText = g_projectedHwnd ? L"Stop Projecting" : L"Project Video App";
+    DrawButton(g_btnProjectAppRect, appBtnText, g_projectedHwnd != nullptr, g_btnProjectAppHovered);
 
     // SECTION 3: WINDOW & DISPLAY
     const wchar_t* s3Text = L"WINDOW & DISPLAY";
-    D2D1_RECT_F s3Rect = D2D1::RectF(left + 18.0f, top + 182.0f, right - 18.0f, top + 200.0f);
+    D2D1_RECT_F s3Rect = D2D1::RectF(left + 18.0f, top + 204.0f, right - 18.0f, top + 220.0f);
     g_d2dRenderTarget->DrawText(
         s3Text, static_cast<UINT32>(wcslen(s3Text)),
         g_textFormatSection, &s3Rect, g_brushTextSection);
 
-    g_btnFullscreenRect = D2D1::RectF(left + 18.0f, top + 202.0f, left + 148.0f, top + 236.0f);
-    g_btnPinOnTopRect = D2D1::RectF(left + 156.0f, top + 202.0f, right - 18.0f, top + 236.0f);
-    DrawButton(g_btnFullscreenRect, g_isFullscreen ? L"Windowed" : L"Fullscreen", g_isFullscreen, g_btnFsHovered);
-    DrawButton(g_btnPinOnTopRect, g_alwaysOnTop ? L"Pinned Top" : L"Pin on Top", g_alwaysOnTop, g_btnPinHovered);
+    g_btnFullscreenRect = D2D1::RectF(left + 18.0f, top + 222.0f, right - 18.0f, top + 254.0f);
+    DrawButton(g_btnFullscreenRect, g_isFullscreen ? L"Exit Fullscreen (Windowed)" : L"Toggle Fullscreen", g_isFullscreen, g_btnFsHovered);
 
     // SECTION 4: QUICK ACTIONS
     const wchar_t* s4Text = L"QUICK ACTIONS";
-    D2D1_RECT_F s4Rect = D2D1::RectF(left + 18.0f, top + 248.0f, right - 18.0f, top + 266.0f);
+    D2D1_RECT_F s4Rect = D2D1::RectF(left + 18.0f, top + 264.0f, right - 18.0f, top + 280.0f);
     g_d2dRenderTarget->DrawText(
         s4Text, static_cast<UINT32>(wcslen(s4Text)),
         g_textFormatSection, &s4Rect, g_brushTextSection);
 
-    g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 268.0f, left + 140.0f, top + 300.0f);
-    g_btnMenuRect = D2D1::RectF(left + 148.0f, top + 268.0f, right - 18.0f, top + 300.0f);
+    g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 282.0f, left + 148.0f, top + 314.0f);
+    g_btnMenuRect = D2D1::RectF(left + 156.0f, top + 282.0f, right - 18.0f, top + 314.0f);
     DrawButton(g_btnRecenterRect, L"Recenter", false, g_btnRecenterHovered);
     DrawButton(g_btnMenuRect, L"BigScreen Menu", false, g_btnMenuHovered);
 
-    g_btnSystemRect = D2D1::RectF(left + 18.0f, top + 306.0f, right - 18.0f, top + 338.0f);
+    g_btnSystemRect = D2D1::RectF(left + 18.0f, top + 320.0f, right - 18.0f, top + 350.0f);
     DrawButton(g_btnSystemRect, L"SteamVR Dashboard", false, g_btnSystemHovered);
 
-    // SECTION 5: MEDIA FEED STATUS
-    const wchar_t* s5Text = L"MEDIA FEED STATUS";
-    D2D1_RECT_F s5Rect = D2D1::RectF(left + 18.0f, top + 346.0f, right - 18.0f, top + 364.0f);
+    // SECTION 5: VR SYSTEM POWER
+    const wchar_t* s5Text = L"VR SYSTEM POWER";
+    D2D1_RECT_F s5Rect = D2D1::RectF(left + 18.0f, top + 360.0f, right - 18.0f, top + 376.0f);
     g_d2dRenderTarget->DrawText(
         s5Text, static_cast<UINT32>(wcslen(s5Text)),
         g_textFormatSection, &s5Rect, g_brushTextSection);
 
-    D2D1_RECT_F feedBoxRect = D2D1::RectF(left + 18.0f, top + 366.0f, right - 18.0f, top + 396.0f);
+    g_btnPowerRect = D2D1::RectF(left + 18.0f, top + 378.0f, right - 18.0f, top + 410.0f);
+    const wchar_t* pwrBtnText = vrRunning ? L"\x23FB Terminate SteamVR & Bigscreen" : L"\x23FB Start SteamVR & Bigscreen";
+    DrawPowerButton(g_btnPowerRect, pwrBtnText, vrRunning, g_btnPowerHovered);
+
+    // SECTION 6: MEDIA FEED STATUS
+    const wchar_t* s6Text = L"MEDIA FEED STATUS";
+    D2D1_RECT_F s6Rect = D2D1::RectF(left + 18.0f, top + 420.0f, right - 18.0f, top + 436.0f);
+    g_d2dRenderTarget->DrawText(
+        s6Text, static_cast<UINT32>(wcslen(s6Text)),
+        g_textFormatSection, &s6Rect, g_brushTextSection);
+
+    D2D1_RECT_F feedBoxRect = D2D1::RectF(left + 18.0f, top + 438.0f, right - 18.0f, top + 468.0f);
     D2D1_ROUNDED_RECT feedBox = D2D1::RoundedRect(feedBoxRect, 6.0f, 6.0f);
     g_d2dRenderTarget->FillRoundedRectangle(&feedBox, g_brushBtnInactiveBg);
-    g_d2dRenderTarget->DrawRoundedRectangle(&feedBox, g_feedActive ? g_brushFeedActive : g_brushBtnBorder, 1.0f);
+    
+    bool isIndicatorActive = (g_projectedHwnd != nullptr) || g_feedActive;
+    g_d2dRenderTarget->DrawRoundedRectangle(&feedBox, isIndicatorActive ? g_brushFeedActive : g_brushBtnBorder, 1.0f);
 
     const D2D1_ELLIPSE feedDot = D2D1::Ellipse(
         D2D1::Point2F(feedBoxRect.left + 14.0f, (feedBoxRect.top + feedBoxRect.bottom) * 0.5f),
         4.0f, 4.0f);
-    g_d2dRenderTarget->FillEllipse(&feedDot, g_feedActive ? g_brushFeedActive : g_brushFeedStandby);
+    g_d2dRenderTarget->FillEllipse(&feedDot, isIndicatorActive ? g_brushFeedActive : g_brushFeedStandby);
 
-    wchar_t feedText[64]{};
-    if (g_feedActive) {
+    wchar_t feedText[80]{};
+    if (g_projectedHwnd) {
+        std::wstring shortTitle = g_projectedTitle;
+        if (shortTitle.length() > 24) shortTitle = shortTitle.substr(0, 21) + L"...";
+        swprintf_s(feedText, L"PROJECTING  |  %ls (Private)", shortTitle.c_str());
+    } else if (g_feedActive) {
         swprintf_s(feedText, L"ACTIVE  |  Streaming (Audio: %.0f%%)", g_audioPeak * 100.0f);
     } else {
         wcscpy_s(feedText, L"IDLE  |  No Active Stream");
@@ -734,23 +1038,24 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
     D2D1_RECT_F feedTextRect = D2D1::RectF(feedBoxRect.left + 24.0f, feedBoxRect.top, feedBoxRect.right - 8.0f, feedBoxRect.bottom);
     g_d2dRenderTarget->DrawText(
         feedText, static_cast<UINT32>(wcslen(feedText)),
-        g_textFormatFooter, &feedTextRect, g_feedActive ? g_brushFeedActive : g_brushTextMuted);
+        g_textFormatFooter, &feedTextRect, isIndicatorActive ? g_brushFeedActive : g_brushTextMuted);
 
     // Footer separator line
     g_d2dRenderTarget->DrawLine(
-        D2D1::Point2F(left + 18.0f, top + 404.0f),
-        D2D1::Point2F(right - 18.0f, top + 404.0f),
+        D2D1::Point2F(left + 18.0f, top + 478.0f),
+        D2D1::Point2F(right - 18.0f, top + 478.0f),
         g_brushSeparator, 1.0f);
 
     // Footer Hotkey Hints
     const wchar_t* footerText = L"Mouse Move: Laser Pointer  |  Left-Click: Trigger\nRight-Click Drag: Look  |  Esc: SteamVR Dashboard\nR: Recenter  |  Alt+Drag or Header: Move Window";
-    D2D1_RECT_F footerRect = D2D1::RectF(left + 8.0f, top + 408.0f, right - 8.0f, bottom - 6.0f);
+    D2D1_RECT_F footerRect = D2D1::RectF(left + 8.0f, top + 482.0f, right - 8.0f, bottom - 6.0f);
     g_d2dRenderTarget->DrawText(
         footerText, static_cast<UINT32>(wcslen(footerText)),
         g_textFormatFooter, &footerRect, g_brushTextMuted);
 }
 
 void ReleaseAll() {
+    ReleaseProjectedAppResources();
     ReleaseSharedResources();
     ReleaseThirdPersonResources();
     ReleaseD2DDeviceResources();
@@ -1100,7 +1405,9 @@ void Render(ID3D11ShaderResourceView* source, bool flipVertical) {
         g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_context->VSSetShader(g_vs, nullptr, 0);
         ID3D11PixelShader* selectedPs = nullptr;
-        if (g_movieOnly) {
+        if (g_projectedHwnd) {
+            selectedPs = flipVertical ? g_psFlip : g_ps;
+        } else if (g_movieOnly) {
             selectedPs = flipVertical ? g_psMovieFlip : g_psMovie;
         } else {
             selectedPs = flipVertical ? g_psFlip : g_ps;
@@ -1227,15 +1534,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         if (g_showRemote && inRect(mx, my, g_remoteRect)) {
             g_pointerActive = false;
             g_closeHovered = inRect(mx, my, g_closeRect);
-            g_btn1stHovered = inRect(mx, my, g_btn1stPersonRect);
-            g_btn3rdHovered = inRect(mx, my, g_btn3rdPersonRect);
+            g_powerHeaderHovered = inRect(mx, my, g_powerHeaderRect);
+            g_btn1stHovered = !g_movieOnly && inRect(mx, my, g_btn1stPersonRect);
             g_btnWholeHovered = inRect(mx, my, g_btnWholeTheaterRect);
             g_btnMovieHovered = inRect(mx, my, g_btnMovieOnlyRect);
+            g_btnProjectScreenHovered = inRect(mx, my, g_btnProjectScreenRect);
+            g_btnProjectAppHovered = inRect(mx, my, g_btnProjectAppRect);
             g_btnFsHovered = inRect(mx, my, g_btnFullscreenRect);
-            g_btnPinHovered = inRect(mx, my, g_btnPinOnTopRect);
             g_btnRecenterHovered = inRect(mx, my, g_btnRecenterRect);
             g_btnMenuHovered = inRect(mx, my, g_btnMenuRect);
             g_btnSystemHovered = inRect(mx, my, g_btnSystemRect);
+            g_btnPowerHovered = inRect(mx, my, g_btnPowerRect);
         } else if (!g_showRemote && inRect(mx, my, g_pillRect)) {
             g_pointerActive = false;
             g_pillHovered = true;
@@ -1243,15 +1552,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // Interactive VR Client Area: mouse controls pointer aim & look
             g_pillHovered = false;
             g_closeHovered = false;
+            g_powerHeaderHovered = false;
             g_btn1stHovered = false;
-            g_btn3rdHovered = false;
             g_btnWholeHovered = false;
             g_btnMovieHovered = false;
+            g_btnProjectScreenHovered = false;
+            g_btnProjectAppHovered = false;
             g_btnFsHovered = false;
-            g_btnPinHovered = false;
             g_btnRecenterHovered = false;
             g_btnMenuHovered = false;
             g_btnSystemHovered = false;
+            g_btnPowerHovered = false;
 
             g_pointerActive = true;
             g_cursorX = mx;
@@ -1294,15 +1605,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
     if (message == WM_MOUSELEAVE) {
         g_pillHovered = false;
         g_closeHovered = false;
+        g_powerHeaderHovered = false;
         g_btn1stHovered = false;
-        g_btn3rdHovered = false;
         g_btnWholeHovered = false;
         g_btnMovieHovered = false;
+        g_btnProjectScreenHovered = false;
+        g_btnProjectAppHovered = false;
         g_btnFsHovered = false;
-        g_btnPinHovered = false;
         g_btnRecenterHovered = false;
         g_btnMenuHovered = false;
         g_btnSystemHovered = false;
+        g_btnPowerHovered = false;
         g_pointerActive = false;
         g_pointerTrigger = false;
         SyncPointerAndLook();
@@ -1322,16 +1635,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_showRemote = false;
                 return 0;
             }
-            if (inRect(mx, my, g_btn1stPersonRect)) {
-                SelectViewSource(ViewSource::FirstPerson);
-                return 0;
-            }
-            if (inRect(mx, my, g_btn3rdPersonRect)) {
-                SelectViewSource(ViewSource::ThirdPerson);
+            if (inRect(mx, my, g_powerHeaderRect) || inRect(mx, my, g_btnPowerRect)) {
+                if (IsVrRunning()) {
+                    TerminateVrProcesses();
+                } else {
+                    LaunchVrProcesses();
+                }
                 return 0;
             }
             if (inRect(mx, my, g_btnWholeTheaterRect)) {
                 g_movieOnly = false;
+                if (g_projectedHwnd) ReleaseProjectedAppResources();
                 return 0;
             }
             if (inRect(mx, my, g_btnMovieOnlyRect)) {
@@ -1341,12 +1655,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 SyncPointerAndLook();
                 return 0;
             }
-            if (inRect(mx, my, g_btnFullscreenRect)) {
-                ToggleFullscreen(hwnd);
+            if (inRect(mx, my, g_btn1stPersonRect)) {
+                if (!g_movieOnly) {
+                    SelectViewSource(ViewSource::FirstPerson);
+                }
                 return 0;
             }
-            if (inRect(mx, my, g_btnPinOnTopRect)) {
-                ToggleAlwaysOnTop(hwnd);
+            if (inRect(mx, my, g_btnProjectScreenRect)) {
+                if (g_projectedHwnd) ReleaseProjectedAppResources();
+                ToggleDesktopMenu();
+                return 0;
+            }
+            if (inRect(mx, my, g_btnProjectAppRect)) {
+                if (g_projectedHwnd) {
+                    ReleaseProjectedAppResources();
+                } else {
+                    ShowProjectAppMenu(hwnd, g_btnProjectAppRect.left, g_btnProjectAppRect.bottom);
+                }
+                return 0;
+            }
+            if (inRect(mx, my, g_btnFullscreenRect)) {
+                ToggleFullscreen(hwnd);
                 return 0;
             }
             if (inRect(mx, my, g_btnRecenterRect)) {
@@ -1447,7 +1776,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
         // Remote panel interaction: dragging the header bar moves the window
         if (g_showRemote && inRect(cx, cy, g_remoteRect)) {
-            if (cy <= g_remoteRect.top + 42.0f && !inRect(cx, cy, g_closeRect)) {
+            if (cy <= g_remoteRect.top + 42.0f && !inRect(cx, cy, g_closeRect) && !inRect(cx, cy, g_powerHeaderRect)) {
                 return HTCAPTION;
             }
             return HTCLIENT;
@@ -1502,29 +1831,46 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         CheckFeedStatus();
         ID3D11ShaderResourceView* source = nullptr;
         bool flipVertical = false;
-        if (g_viewSource == ViewSource::ThirdPerson) {
-            const bool copied = CopyThirdPersonFrame();
-            if (copied && g_thirdSrv && (!g_thirdLastFrame || GetTickCount64() - g_thirdLastFrame <= 1500)) {
-                source = g_thirdSrv;
-                flipVertical = true;
+
+        if (g_projectedHwnd) {
+            if (!IsWindow(g_projectedHwnd)) {
+                ReleaseProjectedAppResources();
             } else {
-                // Native driver-level 3rd person camera (OpenVR Compositor eye texture with HMD back/up offset)
+                CaptureProjectedWindowFrame();
+                source = g_projectedSrv;
+                flipVertical = false;
+            }
+        }
+
+        if (!source) {
+            if (g_viewSource == ViewSource::ThirdPerson) {
+                const bool copied = CopyThirdPersonFrame();
+                if (copied && g_thirdSrv && (!g_thirdLastFrame || GetTickCount64() - g_thirdLastFrame <= 1500)) {
+                    source = g_thirdSrv;
+                    flipVertical = true;
+                } else {
+                    OpenLiveMapping();
+                    if (g_state) CopyNewFrame();
+                    source = g_localSrv;
+                    flipVertical = false;
+                }
+            } else {
                 OpenLiveMapping();
                 if (g_state) CopyNewFrame();
                 source = g_localSrv;
                 flipVertical = false;
             }
         }
-        if (g_viewSource == ViewSource::FirstPerson) {
-            OpenLiveMapping();
-            if (g_state) CopyNewFrame();
-            source = g_localSrv;
-            flipVertical = false;
-        }
+
         char title[256]{};
-        const char* view = g_viewSource == ViewSource::ThirdPerson ? "3RD PERSON" : "1ST PERSON";
-        const char* mode = g_movieOnly ? " | Mode: MOVIE ONLY" : " | Mode: WHOLE THEATER";
-        sprintf_s(title, "Bigscreen Desktop Live Viewer | View: %s%s | Tab/M=REMOTE  Click=Trigger  RMB=Look", view, mode);
+        if (g_projectedHwnd) {
+            std::wstring shortTitle = g_projectedTitle;
+            if (shortTitle.length() > 28) shortTitle = shortTitle.substr(0, 25) + L"...";
+            sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING: %ls | Tab/M=REMOTE  Click=Trigger", shortTitle.c_str());
+        } else {
+            const char* mode = g_movieOnly ? " | Mode: MOVIE ONLY" : " | Mode: WHOLE THEATER";
+            sprintf_s(title, "Bigscreen Desktop Live Viewer | 1ST PERSON%s | Tab/M=REMOTE  Click=Trigger  RMB=Look", mode);
+        }
         SetWindowTextA(g_hwnd, title);
         Render(source, flipVertical);
         UpdateMetrics();
