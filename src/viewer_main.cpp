@@ -16,6 +16,7 @@
 #include "third_person_gpu_ipc.h"
 #include "controller_control_ipc.h"
 #include "projected_video_ipc.h"
+#include "peer_movie_ipc.h"
 
 #include <filesystem>
 namespace fs = std::filesystem;
@@ -40,6 +41,7 @@ namespace {
 
 void Log(const char* fmt, ...);
 void SyncPointerAndLook();
+void ReleasePeerMovieResources();
 
 HWND g_hwnd = nullptr;
 IDXGIAdapter1* g_adapter = nullptr;
@@ -88,6 +90,20 @@ uint64_t g_thirdHandle = 0;
 uint64_t g_thirdSequence = 0;
 ULONGLONG g_thirdLastFrame = 0;
 bool g_thirdUnavailable = false;
+
+// Isolated Remote Peer / MediaPlayer Movie State
+HANDLE g_peerMapping = nullptr;
+bigscreen_peer_movie::State* g_peerState = nullptr;
+ID3D11Texture2D* g_peerShared = nullptr;
+IDXGIKeyedMutex* g_peerMutex = nullptr;
+ID3D11Texture2D* g_peerLocal = nullptr;
+ID3D11ShaderResourceView* g_peerSrv = nullptr;
+uint64_t g_peerGeneration = 0;
+uint64_t g_peerHandle = 0;
+uint64_t g_peerSequence = 0;
+uint32_t g_peerWidth = 0;
+uint32_t g_peerHeight = 0;
+ULONGLONG g_peerLastActive = 0;
 
 // Remote Control & Presentation State (Segment 1)
 bool g_showRemote = true;
@@ -1625,6 +1641,7 @@ void ReleaseAll() {
     ReleaseSharedDesktopTexture();
     ReleaseSharedResources();
     ReleaseThirdPersonResources();
+    ReleasePeerMovieResources();
     ReleaseD2DDeviceResources();
 
     if (g_textFormatFooter) g_textFormatFooter->Release();
@@ -1651,6 +1668,11 @@ void ReleaseAll() {
     if (g_projectedVideoMapping) CloseHandle(g_projectedVideoMapping);
     g_projectedVideoState = nullptr;
     g_projectedVideoMapping = nullptr;
+
+    if (g_peerState) UnmapViewOfFile(g_peerState);
+    if (g_peerMapping) CloseHandle(g_peerMapping);
+    g_peerState = nullptr;
+    g_peerMapping = nullptr;
 
     if (g_state) UnmapViewOfFile(g_state);
     if (g_mapping) CloseHandle(g_mapping);
@@ -1694,6 +1716,94 @@ bool OpenThirdPersonMapping() {
     if (!g_thirdState) { CloseHandle(g_thirdMapping); g_thirdMapping = nullptr; return false; }
     Log("Third-person GPU metadata mapping opened");
     return true;
+}
+
+void ReleasePeerMovieResources() {
+    if (g_peerSrv) { g_peerSrv->Release(); g_peerSrv = nullptr; }
+    if (g_peerLocal) { g_peerLocal->Release(); g_peerLocal = nullptr; }
+    if (g_peerMutex) { g_peerMutex->Release(); g_peerMutex = nullptr; }
+    if (g_peerShared) { g_peerShared->Release(); g_peerShared = nullptr; }
+    g_peerGeneration = 0;
+    g_peerHandle = 0;
+    g_peerSequence = 0;
+    g_peerWidth = 0;
+    g_peerHeight = 0;
+}
+
+bool OpenPeerMovieMapping() {
+    if (g_peerState) return true;
+    g_peerMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, bigscreen_peer_movie::kMappingName);
+    if (!g_peerMapping) return false;
+    g_peerState = static_cast<bigscreen_peer_movie::State*>(
+        MapViewOfFile(g_peerMapping, FILE_MAP_READ, 0, 0, sizeof(*g_peerState)));
+    if (!g_peerState) { CloseHandle(g_peerMapping); g_peerMapping = nullptr; return false; }
+    Log("Isolated peer movie GPU metadata mapping opened");
+    return true;
+}
+
+bool OpenPeerMovieShared(const bigscreen_peer_movie::State& state) {
+    ReleasePeerMovieResources();
+    if (!g_device || !state.sharedHandle) return false;
+    HRESULT hr = g_device->OpenSharedResource(
+        reinterpret_cast<HANDLE>(static_cast<uintptr_t>(state.sharedHandle)),
+        IID_PPV_ARGS(&g_peerShared));
+    if (FAILED(hr) || !g_peerShared) return false;
+    if (FAILED(g_peerShared->QueryInterface(IID_PPV_ARGS(&g_peerMutex)))) {
+        ReleasePeerMovieResources();
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    g_peerShared->GetDesc(&desc);
+    D3D11_TEXTURE2D_DESC localDesc = desc;
+    localDesc.MiscFlags = 0;
+    localDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    localDesc.CPUAccessFlags = 0;
+    if (FAILED(g_device->CreateTexture2D(&localDesc, nullptr, &g_peerLocal)) ||
+        FAILED(g_device->CreateShaderResourceView(g_peerLocal, nullptr, &g_peerSrv))) {
+        ReleasePeerMovieResources();
+        return false;
+    }
+    g_peerGeneration = state.generation;
+    g_peerHandle = state.sharedHandle;
+    g_peerWidth = desc.Width;
+    g_peerHeight = desc.Height;
+    Log("Isolated peer movie shared texture opened (%ux%u, source=%u)", desc.Width, desc.Height, state.sourceKind);
+    return true;
+}
+
+bool CopyPeerMovieFrame() {
+    if (!OpenPeerMovieMapping() || !g_peerState) return false;
+    const auto snapshot = *g_peerState;
+    if (snapshot.magic != bigscreen_peer_movie::kMagic ||
+        snapshot.version != bigscreen_peer_movie::kVersion ||
+        snapshot.active == 0 ||
+        snapshot.sharedHandle == 0 ||
+        snapshot.frameSequence == 0 ||
+        snapshot.width < 64 ||
+        snapshot.height < 64) {
+        if (g_peerSrv) ReleasePeerMovieResources();
+        return false;
+    }
+    const ULONGLONG nowUs = GetTickCount64() * 1000ull;
+    if (nowUs > snapshot.lastFrameMicros && (nowUs - snapshot.lastFrameMicros) > 4000000ull) {
+        return false;
+    }
+    if (!g_peerLocal || g_peerGeneration != snapshot.generation || g_peerHandle != snapshot.sharedHandle ||
+        g_peerWidth != snapshot.width || g_peerHeight != snapshot.height) {
+        if (!OpenPeerMovieShared(snapshot)) return false;
+    }
+    if (snapshot.frameSequence != g_peerSequence) {
+        if (g_peerMutex && SUCCEEDED(g_peerMutex->AcquireSync(1, 0))) {
+            g_context->CopyResource(g_peerLocal, g_peerShared);
+            g_context->Flush();
+            g_peerMutex->ReleaseSync(0);
+            g_peerSequence = snapshot.frameSequence;
+            g_peerLastActive = GetTickCount64();
+        }
+    } else {
+        g_peerLastActive = GetTickCount64();
+    }
+    return g_peerSrv != nullptr;
 }
 
 bool OpenThirdPersonShared(const bigscreen_third_person_gpu::State& state) {
@@ -1983,9 +2093,21 @@ void Render(ID3D11ShaderResourceView* source, bool flipVertical) {
     const float windowHeight = static_cast<float>(std::max<LONG>(1, rect.bottom));
     const float windowAspect = windowWidth / windowHeight;
 
-    const float sourceAspect = (g_projectionMode == ProjectionMode::App && g_projectedWidth && g_projectedHeight)
-        ? (static_cast<float>(g_projectedWidth) / static_cast<float>(g_projectedHeight))
-        : (g_sourceHeight ? static_cast<float>(g_sourceWidth) / g_sourceHeight : 16.0f / 9.0f);
+    ID3D11ShaderResourceView* activeSource = source;
+    if (g_projectionMode == ProjectionMode::App) {
+        if (g_movieOnly) {
+            activeSource = g_projectedSrv;
+        } else {
+            activeSource = g_localSrv ? g_localSrv : g_projectedSrv;
+        }
+    }
+
+    float sourceAspect = (g_sourceHeight ? static_cast<float>(g_sourceWidth) / g_sourceHeight : 16.0f / 9.0f);
+    if (activeSource == g_projectedSrv && g_projectedWidth && g_projectedHeight) {
+        sourceAspect = static_cast<float>(g_projectedWidth) / static_cast<float>(g_projectedHeight);
+    } else if (activeSource == g_peerSrv && g_peerWidth && g_peerHeight) {
+        sourceAspect = static_cast<float>(g_peerWidth) / static_cast<float>(g_peerHeight);
+    }
 
     D3D11_VIEWPORT viewport{};
     if (windowAspect > sourceAspect) {
@@ -2005,21 +2127,13 @@ void Render(ID3D11ShaderResourceView* source, bool flipVertical) {
     g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
     g_context->ClearRenderTargetView(g_rtv, clear);
 
-    ID3D11ShaderResourceView* activeSource = source;
-    if (g_projectionMode == ProjectionMode::App) {
-        if (g_movieOnly) {
-            activeSource = g_projectedSrv;
-        } else {
-            activeSource = g_localSrv ? g_localSrv : g_projectedSrv;
-        }
-    }
-
     if (activeSource) {
         g_context->RSSetViewports(1, &viewport);
         g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_context->VSSetShader(g_vs, nullptr, 0);
+        const bool isIsolatedVideoFeed = (activeSource == g_projectedSrv) || (activeSource == g_peerSrv);
         ID3D11PixelShader* selectedPs = nullptr;
-        if (g_movieOnly) {
+        if (g_movieOnly && !isIsolatedVideoFeed) {
             selectedPs = flipVertical ? g_psMovieFlip : g_psMovie;
         } else {
             selectedPs = flipVertical ? g_psFlip : g_ps;
@@ -2462,7 +2576,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             // Normal Bigscreen Room / Movie theater viewing (or Project Screen mode)
             OpenLiveMapping();
             if (g_state) CopyNewFrame();
-            source = g_localSrv;
+            if (g_movieOnly && CopyPeerMovieFrame()) {
+                source = g_peerSrv;
+            } else {
+                source = g_localSrv;
+            }
             flipVertical = false;
         }
 

@@ -5,9 +5,11 @@
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
+#include <d3dcompiler.h>
 
 #include "../src/third_person_gpu_ipc.h"
 #include "../src/projected_video_ipc.h"
+#include "../src/peer_movie_ipc.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -16,7 +18,9 @@
 #include <algorithm>
 
 namespace {
+// --------------------------------------------------------------------------
 // Third-person camera export state (existing)
+// --------------------------------------------------------------------------
 ID3D11Texture2D* g_source = nullptr;
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
@@ -42,23 +46,627 @@ void Cleanup() {
 }
 
 // --------------------------------------------------------------------------
-// BigSoup Desktop Texture Routing Hook
+// Shared Hook Types
 // --------------------------------------------------------------------------
 typedef void (*UnityRenderEvent)(int eventId);
 typedef UnityRenderEvent (*pfnBigSoupProcessLocalDesktops)();
+typedef UnityRenderEvent (*pfnBigSoupProcessPeerDesktops)();
 typedef ID3D11Texture2D* (*pfnBigSoupGetNativeDesktopTexturePointer)(int index);
+typedef int (*pfnBigSoupGetNumberOfIncomingVideoStreams)();
+
+typedef UnityRenderEvent (*pfnBigMediaRenderNextFrameFunc)();
+typedef void* (*pfnBigMediaGetVideoTextureId)(int playerId, int eyeIndex);
+typedef int (*pfnBigMediaGetVideoTextureWidth)(int playerId);
+typedef int (*pfnBigMediaGetVideoTextureHeight)(int playerId);
 
 pfnBigSoupGetNativeDesktopTexturePointer g_pfnGetNativeDesktop = nullptr;
+pfnBigSoupGetNumberOfIncomingVideoStreams g_pfnGetIncomingStreamCount = nullptr;
 UnityRenderEvent g_originalProcessLocalDesktops = nullptr;
-uint8_t* g_pTrampoline = nullptr;
-bool g_hookInstalled = false;
+UnityRenderEvent g_originalProcessPeerDesktops = nullptr;
+uint8_t* g_pTrampolineLocal = nullptr;
+uint8_t* g_pTrampolinePeer = nullptr;
+bool g_localHookInstalled = false;
+bool g_peerHookInstalled = false;
 
+pfnBigMediaGetVideoTextureId g_pfnMediaGetTexId = nullptr;
+pfnBigMediaGetVideoTextureWidth g_pfnMediaGetWidth = nullptr;
+pfnBigMediaGetVideoTextureHeight g_pfnMediaGetHeight = nullptr;
+UnityRenderEvent g_originalMediaRenderNextFrame = nullptr;
+uint8_t* g_pTrampolineMedia = nullptr;
+bool g_mediaHookInstalled = false;
+
+// --------------------------------------------------------------------------
+// Local Desktop Projection Routing State
+// --------------------------------------------------------------------------
 HANDLE g_projectedMapping = nullptr;
 const bigscreen_projected_video::State* g_projectedState = nullptr;
 ID3D11Texture2D* g_sharedVideoTex = nullptr;
 uint64_t g_currentSharedHandle = 0;
 ID3D11Texture2D* g_blackTex = nullptr;
 
+// --------------------------------------------------------------------------
+// Remote Peer / MediaPlayer Movie Isolation State
+// --------------------------------------------------------------------------
+CRITICAL_SECTION g_peerCs;
+bool g_peerCsInit = false;
+
+uintptr_t* g_ppDesktopManager = nullptr;
+uint32_t g_peerVecBeginOff = 0;
+uint32_t g_peerVecEndOff = 0;
+
+HANDLE g_peerMapping = nullptr;
+bigscreen_peer_movie::State* g_peerState = nullptr;
+
+ID3D11Device* g_peerDev = nullptr;
+ID3D11Texture2D* g_peerExportTex = nullptr;
+ID3D11RenderTargetView* g_peerExportRtv = nullptr;
+IDXGIKeyedMutex* g_peerExportMutex = nullptr;
+HANDLE g_peerSharedHandle = nullptr;
+uint32_t g_peerExportW = 0;
+uint32_t g_peerExportH = 0;
+uint64_t g_peerGeneration = 0;
+uint64_t g_peerSequence = 0;
+
+ID3D11VertexShader* g_peerVs = nullptr;
+ID3D11PixelShader* g_peerPsNv12 = nullptr;
+ID3D11PixelShader* g_peerPsRgba = nullptr;
+ID3D11Buffer* g_peerCb = nullptr;
+ID3D11SamplerState* g_peerSampler = nullptr;
+ID3D11BlendState* g_peerBlend = nullptr;
+ID3D11DepthStencilState* g_peerDepth = nullptr;
+ID3D11RasterizerState* g_peerRaster = nullptr;
+bool g_peerGpuFailed = false;
+
+ULONGLONG g_lastBigSoupPeerMs = 0;
+ULONGLONG g_lastMediaPlayerMs = 0;
+
+struct alignas(16) PeerNv12Cb {
+    float yUseAlpha;
+    float uvUseAlpha;
+    float pad0;
+    float pad1;
+};
+
+struct ActivePeerStream {
+    ID3D11ShaderResourceView* ySrv;
+    ID3D11ShaderResourceView* uvSrv;
+    uint32_t width;
+    uint32_t height;
+};
+
+void ReleasePeerPipeline() {
+    if (g_peerRaster) { g_peerRaster->Release(); g_peerRaster = nullptr; }
+    if (g_peerDepth) { g_peerDepth->Release(); g_peerDepth = nullptr; }
+    if (g_peerBlend) { g_peerBlend->Release(); g_peerBlend = nullptr; }
+    if (g_peerSampler) { g_peerSampler->Release(); g_peerSampler = nullptr; }
+    if (g_peerCb) { g_peerCb->Release(); g_peerCb = nullptr; }
+    if (g_peerPsRgba) { g_peerPsRgba->Release(); g_peerPsRgba = nullptr; }
+    if (g_peerPsNv12) { g_peerPsNv12->Release(); g_peerPsNv12 = nullptr; }
+    if (g_peerVs) { g_peerVs->Release(); g_peerVs = nullptr; }
+}
+
+void ReleasePeerExportTarget() {
+    if (g_peerExportMutex) { g_peerExportMutex->Release(); g_peerExportMutex = nullptr; }
+    if (g_peerExportRtv) { g_peerExportRtv->Release(); g_peerExportRtv = nullptr; }
+    if (g_peerExportTex) { g_peerExportTex->Release(); g_peerExportTex = nullptr; }
+    g_peerSharedHandle = nullptr;
+    g_peerExportW = 0;
+    g_peerExportH = 0;
+}
+
+void EnsurePeerMovieIpc() {
+    if (!g_peerMapping) {
+        g_peerMapping = CreateFileMappingW(
+            INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+            sizeof(bigscreen_peer_movie::State), bigscreen_peer_movie::kMappingName);
+    }
+    if (g_peerMapping && !g_peerState) {
+        g_peerState = static_cast<bigscreen_peer_movie::State*>(
+            MapViewOfFile(g_peerMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(bigscreen_peer_movie::State)));
+        if (g_peerState) {
+            *g_peerState = {};
+            g_peerState->magic = bigscreen_peer_movie::kMagic;
+            g_peerState->version = bigscreen_peer_movie::kVersion;
+        }
+    }
+}
+
+void ClearPeerMovieActive() {
+    EnsurePeerMovieIpc();
+    if (g_peerState) {
+        g_peerState->active = 0;
+        g_peerState->sourceKind = static_cast<uint32_t>(bigscreen_peer_movie::SourceKind::None);
+    }
+}
+
+bool EnsurePeerPipeline(ID3D11Device* pDevice) {
+    if (g_peerGpuFailed) return false;
+    if (g_peerDev != pDevice) {
+        ReleasePeerExportTarget();
+        ReleasePeerPipeline();
+        if (g_peerDev) { g_peerDev->Release(); g_peerDev = nullptr; }
+        g_peerDev = pDevice;
+        g_peerDev->AddRef();
+    }
+    if (g_peerVs && g_peerPsNv12 && g_peerPsRgba && g_peerCb) return true;
+
+    HMODULE hComp = GetModuleHandleW(L"d3dcompiler_47.dll");
+    if (!hComp) hComp = LoadLibraryW(L"d3dcompiler_47.dll");
+    if (!hComp) { g_peerGpuFailed = true; return false; }
+
+    auto pD3DCompile = reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(hComp, "D3DCompile"));
+    if (!pD3DCompile) { g_peerGpuFailed = true; return false; }
+
+    const char* vsCode =
+        "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "VSOut main(uint id : SV_VertexID) {"
+        "  VSOut o;"
+        "  float2 uv = float2((id << 1) & 2, id & 2);"
+        "  o.pos = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);"
+        "  o.uv = uv;"
+        "  return o;"
+        "}";
+
+    const char* psNv12Code =
+        "Texture2D<float4> texY : register(t0);"
+        "Texture2D<float4> texUV : register(t1);"
+        "cbuffer Params : register(b0) { float yUseAlpha; float uvUseAlpha; float pad0; float pad1; };"
+        "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {"
+        "  uint yw = 0, yh = 0, uw = 0, uh = 0;"
+        "  texY.GetDimensions(yw, yh);"
+        "  texUV.GetDimensions(uw, uh);"
+        "  int px = clamp(int(uv.x * yw), 0, max(0, int(yw) - 1));"
+        "  int py = clamp(int(uv.y * yh), 0, max(0, int(yh) - 1));"
+        "  float4 ys = texY.Load(int3(px, py, 0));"
+        "  float y = (yUseAlpha > 0.5) ? ys.a : ys.r;"
+        "  int uy = clamp(py >> 1, 0, max(0, int(uh) - 1));"
+        "  float u = 0.5, v = 0.5;"
+        "  if (uw * 2 <= yw + 1 && uvUseAlpha < 0.5) {"
+        "    int hx = clamp(px >> 1, 0, max(0, int(uw) - 1));"
+        "    float4 rg = texUV.Load(int3(hx, uy, 0));"
+        "    u = rg.r; v = rg.g;"
+        "  } else {"
+        "    int ux = clamp(px & ~1, 0, max(0, int(uw) - 2));"
+        "    float4 uvs0 = texUV.Load(int3(ux, uy, 0));"
+        "    float4 uvs1 = texUV.Load(int3(ux + 1, uy, 0));"
+        "    u = (uvUseAlpha > 0.5) ? uvs0.a : uvs0.r;"
+        "    v = (uvUseAlpha > 0.5) ? uvs1.a : uvs1.r;"
+        "  }"
+        "  float yv = (y - 16.0 / 255.0) * (255.0 / 219.0);"
+        "  float uu = (u - 128.0 / 255.0) * (255.0 / 224.0);"
+        "  float vv = (v - 128.0 / 255.0) * (255.0 / 224.0);"
+        "  float3 rgb = float3("
+        "    yv + 1.5748 * vv,"
+        "    yv - 0.187324 * uu - 0.468124 * vv,"
+        "    yv + 1.8556 * uu);"
+        "  return float4(saturate(rgb), 1.0);"
+        "}";
+
+    const char* psRgbaCode =
+        "Texture2D<float4> texSrc : register(t0);"
+        "SamplerState samp : register(s0);"
+        "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {"
+        "  float4 c = texSrc.Sample(samp, uv);"
+        "  return float4(c.rgb, 1.0);"
+        "}";
+
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* err = nullptr;
+
+    if (FAILED(pD3DCompile(vsCode, std::strlen(vsCode), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &blob, &err))) {
+        if (err) err->Release();
+        g_peerGpuFailed = true;
+        return false;
+    }
+    HRESULT hr = pDevice->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &g_peerVs);
+    blob->Release();
+    if (FAILED(hr)) { g_peerGpuFailed = true; return false; }
+
+    if (FAILED(pD3DCompile(psNv12Code, std::strlen(psNv12Code), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &blob, &err))) {
+        if (err) err->Release();
+        g_peerGpuFailed = true;
+        return false;
+    }
+    hr = pDevice->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &g_peerPsNv12);
+    blob->Release();
+    if (FAILED(hr)) { g_peerGpuFailed = true; return false; }
+
+    if (FAILED(pD3DCompile(psRgbaCode, std::strlen(psRgbaCode), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &blob, &err))) {
+        if (err) err->Release();
+        g_peerGpuFailed = true;
+        return false;
+    }
+    hr = pDevice->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &g_peerPsRgba);
+    blob->Release();
+    if (FAILED(hr)) { g_peerGpuFailed = true; return false; }
+
+    D3D11_BUFFER_DESC cbDesc{};
+    cbDesc.ByteWidth = sizeof(PeerNv12Cb);
+    cbDesc.Usage = D3D11_USAGE_DEFAULT;
+    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    if (FAILED(pDevice->CreateBuffer(&cbDesc, nullptr, &g_peerCb))) { g_peerGpuFailed = true; return false; }
+
+    D3D11_SAMPLER_DESC sd{};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(pDevice->CreateSamplerState(&sd, &g_peerSampler))) { g_peerGpuFailed = true; return false; }
+
+    D3D11_BLEND_DESC bd{};
+    bd.RenderTarget[0].BlendEnable = FALSE;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    pDevice->CreateBlendState(&bd, &g_peerBlend);
+
+    D3D11_DEPTH_STENCIL_DESC dsd{};
+    dsd.DepthEnable = FALSE;
+    dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    pDevice->CreateDepthStencilState(&dsd, &g_peerDepth);
+
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    pDevice->CreateRasterizerState(&rd, &g_peerRaster);
+
+    return true;
+}
+
+bool EnsurePeerExportTarget(ID3D11Device* pDevice, uint32_t w, uint32_t h) {
+    if (w == 0 || h == 0) return false;
+    if (!EnsurePeerPipeline(pDevice)) return false;
+    if (g_peerExportTex && g_peerExportW == w && g_peerExportH == h) return true;
+
+    ReleasePeerExportTarget();
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = w;
+    desc.Height = h;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+    if (FAILED(pDevice->CreateTexture2D(&desc, nullptr, &g_peerExportTex))) return false;
+    if (FAILED(pDevice->CreateRenderTargetView(g_peerExportTex, nullptr, &g_peerExportRtv))) {
+        ReleasePeerExportTarget(); return false;
+    }
+    if (FAILED(g_peerExportTex->QueryInterface(IID_PPV_ARGS(&g_peerExportMutex)))) {
+        ReleasePeerExportTarget(); return false;
+    }
+    IDXGIResource* res = nullptr;
+    if (FAILED(g_peerExportTex->QueryInterface(IID_PPV_ARGS(&res)))) {
+        ReleasePeerExportTarget(); return false;
+    }
+    HRESULT hrHandle = res->GetSharedHandle(&g_peerSharedHandle);
+    res->Release();
+    if (FAILED(hrHandle) || !g_peerSharedHandle) {
+        ReleasePeerExportTarget(); return false;
+    }
+
+    g_peerExportW = w;
+    g_peerExportH = h;
+    g_peerGeneration = GetTickCount64();
+    return true;
+}
+
+bool AcquirePeerMutexForWrite() {
+    if (!g_peerExportMutex) return false;
+    if (SUCCEEDED(g_peerExportMutex->AcquireSync(0, 0))) return true;
+    // If consumer wasn't reading (e.g. Theater Mode or restarted), key 1 is sitting idle; overwrite cleanly.
+    if (SUCCEEDED(g_peerExportMutex->AcquireSync(1, 0))) return true;
+    return false;
+}
+
+struct SavedD3D11State {
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11DepthStencilView* dsv = nullptr;
+    UINT numVp = 1;
+    D3D11_VIEWPORT vp{};
+    D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ID3D11InputLayout* il = nullptr;
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11PixelShader* ps = nullptr;
+    ID3D11ShaderResourceView* srvs[2]{};
+    ID3D11SamplerState* samp = nullptr;
+    ID3D11Buffer* cb = nullptr;
+    ID3D11BlendState* blend = nullptr;
+    FLOAT blendFactor[4]{};
+    UINT sampleMask = 0xFFFFFFFF;
+    ID3D11DepthStencilState* depth = nullptr;
+    UINT stencilRef = 0;
+    ID3D11RasterizerState* raster = nullptr;
+
+    void Save(ID3D11DeviceContext* ctx) {
+        ctx->OMGetRenderTargets(1, &rtv, &dsv);
+        ctx->RSGetViewports(&numVp, &vp);
+        ctx->IAGetPrimitiveTopology(&topo);
+        ctx->IAGetInputLayout(&il);
+        ctx->VSGetShader(&vs, nullptr, nullptr);
+        ctx->PSGetShader(&ps, nullptr, nullptr);
+        ctx->PSGetShaderResources(0, 2, srvs);
+        ctx->PSGetSamplers(0, 1, &samp);
+        ctx->PSGetConstantBuffers(0, 1, &cb);
+        ctx->OMGetBlendState(&blend, blendFactor, &sampleMask);
+        ctx->OMGetDepthStencilState(&depth, &stencilRef);
+        ctx->RSGetState(&raster);
+    }
+
+    void Restore(ID3D11DeviceContext* ctx) {
+        ctx->OMSetRenderTargets(1, &rtv, dsv);
+        if (numVp > 0) ctx->RSSetViewports(1, &vp);
+        ctx->IASetPrimitiveTopology(topo);
+        ctx->IASetInputLayout(il);
+        ctx->VSSetShader(vs, nullptr, 0);
+        ctx->PSSetShader(ps, nullptr, 0);
+        ctx->PSSetShaderResources(0, 2, srvs);
+        ctx->PSSetSamplers(0, 1, &samp);
+        ctx->PSSetConstantBuffers(0, 1, &cb);
+        ctx->OMSetBlendState(blend, blendFactor, sampleMask);
+        ctx->OMSetDepthStencilState(depth, stencilRef);
+        ctx->RSSetState(raster);
+
+        if (rtv) rtv->Release();
+        if (dsv) dsv->Release();
+        if (il) il->Release();
+        if (vs) vs->Release();
+        if (ps) ps->Release();
+        if (srvs[0]) srvs[0]->Release();
+        if (srvs[1]) srvs[1]->Release();
+        if (samp) samp->Release();
+        if (cb) cb->Release();
+        if (blend) blend->Release();
+        if (depth) depth->Release();
+        if (raster) raster->Release();
+    }
+};
+
+void PublishPeerFrameMetadata(bigscreen_peer_movie::SourceKind kind, uint32_t w, uint32_t h) {
+    EnsurePeerMovieIpc();
+    if (g_peerState) {
+        g_peerState->magic = bigscreen_peer_movie::kMagic;
+        g_peerState->version = bigscreen_peer_movie::kVersion;
+        g_peerState->sourceKind = static_cast<uint32_t>(kind);
+        g_peerState->sharedHandle = reinterpret_cast<uint64_t>(g_peerSharedHandle);
+        g_peerState->width = w;
+        g_peerState->height = h;
+        g_peerState->format = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+        g_peerState->generation = g_peerGeneration;
+        g_peerState->frameSequence = ++g_peerSequence;
+        g_peerState->lastFrameMicros = GetTickCount64() * 1000ull;
+        g_peerState->active = 1;
+    }
+}
+
+bool TryFindActivePeerDesktop(ActivePeerStream* out) {
+    if (!out || !g_ppDesktopManager || !g_peerVecBeginOff || !g_peerVecEndOff) return false;
+    *out = {};
+    __try {
+        uint8_t* mgr = reinterpret_cast<uint8_t*>(*g_ppDesktopManager);
+        if (!mgr) return false;
+        uintptr_t vecBegin = *reinterpret_cast<uintptr_t*>(mgr + g_peerVecBeginOff);
+        uintptr_t vecEnd = *reinterpret_cast<uintptr_t*>(mgr + g_peerVecEndOff);
+        if (!vecBegin || vecEnd <= vecBegin) return false;
+        size_t count = (vecEnd - vecBegin) / sizeof(void*);
+        if (count > 64) count = 64;
+
+        uint8_t** peers = reinterpret_cast<uint8_t**>(vecBegin);
+        uint64_t bestArea = 0;
+        for (size_t i = 0; i < count; ++i) {
+            uint8_t* pPeer = peers[i];
+            if (!pPeer) continue;
+            uint8_t active = *pPeer;
+            if (!active) continue;
+            uint32_t w = *reinterpret_cast<uint32_t*>(pPeer + 0xE4);
+            uint32_t h = *reinterpret_cast<uint32_t*>(pPeer + 0xE8);
+            if (w < 64 || h < 64 || w > 8192 || h > 8192) continue;
+            ID3D11ShaderResourceView* ySrv = *reinterpret_cast<ID3D11ShaderResourceView**>(pPeer + 0x140);
+            ID3D11ShaderResourceView* uvSrv = *reinterpret_cast<ID3D11ShaderResourceView**>(pPeer + 0x148);
+            if (!ySrv || !uvSrv) continue;
+            uint64_t area = static_cast<uint64_t>(w) * static_cast<uint64_t>(h);
+            if (area > bestArea) {
+                bestArea = area;
+                out->ySrv = ySrv;
+                out->uvSrv = uvSrv;
+                out->width = w;
+                out->height = h;
+            }
+        }
+        return bestArea > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *out = {};
+        return false;
+    }
+}
+
+void ExportBigSoupPeerMovie() {
+    ActivePeerStream stream{};
+    if (!TryFindActivePeerDesktop(&stream)) {
+        if (GetTickCount64() - g_lastMediaPlayerMs > 500) {
+            ClearPeerMovieActive();
+        }
+        return;
+    }
+
+    ID3D11Resource* yRes = nullptr;
+    ID3D11Resource* uvRes = nullptr;
+    ID3D11Texture2D* yTex = nullptr;
+    ID3D11Texture2D* uvTex = nullptr;
+    stream.ySrv->GetResource(&yRes);
+    stream.uvSrv->GetResource(&uvRes);
+    if (yRes) { yRes->QueryInterface(IID_PPV_ARGS(&yTex)); yRes->Release(); }
+    if (uvRes) { uvRes->QueryInterface(IID_PPV_ARGS(&uvTex)); uvRes->Release(); }
+    if (!yTex || !uvTex) {
+        if (yTex) yTex->Release();
+        if (uvTex) uvTex->Release();
+        return;
+    }
+
+    D3D11_TEXTURE2D_DESC yDesc{};
+    D3D11_TEXTURE2D_DESC uvDesc{};
+    yTex->GetDesc(&yDesc);
+    uvTex->GetDesc(&uvDesc);
+
+    ID3D11Device* pDevice = nullptr;
+    yTex->GetDevice(&pDevice);
+    if (!pDevice) { yTex->Release(); uvTex->Release(); return; }
+
+    ID3D11DeviceContext* pContext = nullptr;
+    pDevice->GetImmediateContext(&pContext);
+    if (!pContext) { pDevice->Release(); yTex->Release(); uvTex->Release(); return; }
+
+    if (EnsurePeerExportTarget(pDevice, yDesc.Width, yDesc.Height) && AcquirePeerMutexForWrite()) {
+        SavedD3D11State saved;
+        saved.Save(pContext);
+
+        PeerNv12Cb cbData{};
+        cbData.yUseAlpha = (yDesc.Format == DXGI_FORMAT_A8_UNORM) ? 1.0f : 0.0f;
+        cbData.uvUseAlpha = (uvDesc.Format == DXGI_FORMAT_A8_UNORM) ? 1.0f : 0.0f;
+        pContext->UpdateSubresource(g_peerCb, 0, nullptr, &cbData, 0, 0);
+
+        D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(yDesc.Width), static_cast<float>(yDesc.Height), 0.0f, 1.0f };
+        pContext->OMSetRenderTargets(1, &g_peerExportRtv, nullptr);
+        pContext->RSSetViewports(1, &vp);
+        pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        pContext->IASetInputLayout(nullptr);
+        pContext->VSSetShader(g_peerVs, nullptr, 0);
+        pContext->PSSetShader(g_peerPsNv12, nullptr, 0);
+        ID3D11ShaderResourceView* srvs[2] = { stream.ySrv, stream.uvSrv };
+        pContext->PSSetShaderResources(0, 2, srvs);
+        pContext->PSSetConstantBuffers(0, 1, &g_peerCb);
+        pContext->OMSetBlendState(g_peerBlend, nullptr, 0xFFFFFFFF);
+        pContext->OMSetDepthStencilState(g_peerDepth, 0);
+        pContext->RSSetState(g_peerRaster);
+
+        pContext->Draw(3, 0);
+        pContext->Flush();
+
+        saved.Restore(pContext);
+        g_peerExportMutex->ReleaseSync(1);
+
+        g_lastBigSoupPeerMs = GetTickCount64();
+        PublishPeerFrameMetadata(bigscreen_peer_movie::SourceKind::BigSoupPeer, yDesc.Width, yDesc.Height);
+    }
+
+    pContext->Release();
+    pDevice->Release();
+    yTex->Release();
+    uvTex->Release();
+}
+
+void ExportBigMediaPlayerMovie() {
+    if (!g_pfnMediaGetTexId || !g_pfnMediaGetWidth || !g_pfnMediaGetHeight) return;
+    if (GetTickCount64() - g_lastBigSoupPeerMs < 350) return; // Prioritize active BigSoup peer broadcast
+
+    void* nativePtr = nullptr;
+    int bestW = 0, bestH = 0;
+    for (int id = 0; id < 16; ++id) {
+        int w = g_pfnMediaGetWidth(id);
+        int h = g_pfnMediaGetHeight(id);
+        if (w >= 64 && h >= 64 && w <= 8192 && h <= 8192) {
+            void* p = g_pfnMediaGetTexId(id, 0);
+            if (p && static_cast<int64_t>(w) * h > static_cast<int64_t>(bestW) * bestH) {
+                bestW = w; bestH = h; nativePtr = p;
+            }
+        }
+    }
+    if (!nativePtr) {
+        if (GetTickCount64() - g_lastBigSoupPeerMs > 500) {
+            ClearPeerMovieActive();
+        }
+        return;
+    }
+
+    ID3D11Texture2D* srcTex = nullptr;
+    ID3D11ShaderResourceView* srcSrv = nullptr;
+    IUnknown* unk = reinterpret_cast<IUnknown*>(nativePtr);
+    if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(&srcTex))) && srcTex) {
+        D3D11_TEXTURE2D_DESC d{}; srcTex->GetDesc(&d);
+        if (d.MiscFlags & D3D11_RESOURCE_MISC_HW_PROTECTED) {
+            srcTex->Release();
+            ClearPeerMovieActive();
+            return;
+        }
+    } else if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(&srcSrv))) && srcSrv) {
+        ID3D11Resource* res = nullptr;
+        srcSrv->GetResource(&res);
+        if (res) {
+            res->QueryInterface(IID_PPV_ARGS(&srcTex));
+            res->Release();
+        }
+    }
+    if (!srcTex) {
+        if (srcSrv) srcSrv->Release();
+        return;
+    }
+
+    D3D11_TEXTURE2D_DESC srcDesc{};
+    srcTex->GetDesc(&srcDesc);
+    if ((srcDesc.MiscFlags & D3D11_RESOURCE_MISC_HW_PROTECTED) || srcDesc.Width < 64 || srcDesc.Height < 64) {
+        srcTex->Release();
+        if (srcSrv) srcSrv->Release();
+        return;
+    }
+
+    ID3D11Device* pDevice = nullptr;
+    srcTex->GetDevice(&pDevice);
+    if (!pDevice) { srcTex->Release(); if (srcSrv) srcSrv->Release(); return; }
+
+    ID3D11DeviceContext* pContext = nullptr;
+    pDevice->GetImmediateContext(&pContext);
+    if (!pContext) { pDevice->Release(); srcTex->Release(); if (srcSrv) srcSrv->Release(); return; }
+
+    if (EnsurePeerExportTarget(pDevice, srcDesc.Width, srcDesc.Height) && AcquirePeerMutexForWrite()) {
+        bool copied = false;
+        if (srcDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || srcDesc.Format == DXGI_FORMAT_B8G8R8X8_UNORM) {
+            pContext->CopySubresourceRegion(g_peerExportTex, 0, 0, 0, 0, srcTex, 0, nullptr);
+            pContext->Flush();
+            copied = true;
+        } else if (srcDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE) {
+            if (!srcSrv) {
+                pDevice->CreateShaderResourceView(srcTex, nullptr, &srcSrv);
+            }
+            if (srcSrv) {
+                SavedD3D11State saved;
+                saved.Save(pContext);
+
+                D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(srcDesc.Width), static_cast<float>(srcDesc.Height), 0.0f, 1.0f };
+                pContext->OMSetRenderTargets(1, &g_peerExportRtv, nullptr);
+                pContext->RSSetViewports(1, &vp);
+                pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                pContext->IASetInputLayout(nullptr);
+                pContext->VSSetShader(g_peerVs, nullptr, 0);
+                pContext->PSSetShader(g_peerPsRgba, nullptr, 0);
+                pContext->PSSetShaderResources(0, 1, &srcSrv);
+                pContext->PSSetSamplers(0, 1, &g_peerSampler);
+                pContext->OMSetBlendState(g_peerBlend, nullptr, 0xFFFFFFFF);
+                pContext->OMSetDepthStencilState(g_peerDepth, 0);
+                pContext->RSSetState(g_peerRaster);
+                pContext->Draw(3, 0);
+                pContext->Flush();
+
+                saved.Restore(pContext);
+                copied = true;
+            }
+        }
+        g_peerExportMutex->ReleaseSync(1);
+        if (copied) {
+            g_lastMediaPlayerMs = GetTickCount64();
+            PublishPeerFrameMetadata(bigscreen_peer_movie::SourceKind::BigMediaPlayer, srcDesc.Width, srcDesc.Height);
+        }
+    }
+
+    pContext->Release();
+    pDevice->Release();
+    if (srcSrv) srcSrv->Release();
+    srcTex->Release();
+}
+
+// --------------------------------------------------------------------------
+// Local Desktop Projection Routing
+// --------------------------------------------------------------------------
 void EnsureBlackTexture(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC& deskDesc) {
     if (g_blackTex) {
         D3D11_TEXTURE2D_DESC curDesc{};
@@ -74,7 +682,7 @@ void EnsureBlackTexture(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC& deskD
     bDesc.MiscFlags = 0;
     bDesc.CPUAccessFlags = 0;
     bDesc.Usage = D3D11_USAGE_DEFAULT;
-    std::vector<uint32_t> blackData(bDesc.Width * bDesc.Height, 0xFF000000); // opaque black
+    std::vector<uint32_t> blackData(bDesc.Width * bDesc.Height, 0xFF000000);
     D3D11_SUBRESOURCE_DATA initData{};
     initData.pSysMem = blackData.data();
     initData.SysMemPitch = bDesc.Width * sizeof(uint32_t);
@@ -158,76 +766,205 @@ void RouteDesktopTexture() {
     pDevice->Release();
 }
 
+// --------------------------------------------------------------------------
+// Render-Thread Hooks
+// --------------------------------------------------------------------------
 void Hooked_ProcessLocalDesktops(int eventId) {
     if (g_originalProcessLocalDesktops) {
         g_originalProcessLocalDesktops(eventId);
     }
     RouteDesktopTexture();
+    if (!g_mediaHookInstalled && g_pfnMediaGetTexId && g_peerCsInit) {
+        if (TryEnterCriticalSection(&g_peerCs)) {
+            ExportBigMediaPlayerMovie();
+            LeaveCriticalSection(&g_peerCs);
+        }
+    }
+}
+
+void Hooked_ProcessPeerDesktops(int eventId) {
+    if (g_originalProcessPeerDesktops) {
+        g_originalProcessPeerDesktops(eventId);
+    }
+    if (g_peerCsInit) {
+        EnterCriticalSection(&g_peerCs);
+        ExportBigSoupPeerMovie();
+        LeaveCriticalSection(&g_peerCs);
+    }
+}
+
+void Hooked_MediaRenderNextFrame(int eventId) {
+    if (g_originalMediaRenderNextFrame) {
+        g_originalMediaRenderNextFrame(eventId);
+    }
+    if (g_peerCsInit) {
+        EnterCriticalSection(&g_peerCs);
+        ExportBigMediaPlayerMovie();
+        LeaveCriticalSection(&g_peerCs);
+    }
+}
+
+// Expected 14-byte non-RIP-relative prologue in BigSoup callbacks (0x77E50 & 0x77EB0):
+// 40 53 48 83 EC 30 0F 57 C0 0F 11 44 24 20
+bool InstallSimple14Hook(uint8_t* pTarget, void* pDetour, uint8_t** ppTrampoline, UnityRenderEvent* ppOriginal) {
+    if (!pTarget) return false;
+    if (pTarget[0] == 0xFF && pTarget[1] == 0x25) return true;
+
+    static const uint8_t expected[14] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x0F, 0x57, 0xC0, 0x0F, 0x11, 0x44, 0x24, 0x20 };
+    if (std::memcmp(pTarget, expected, sizeof(expected)) != 0) {
+        return false;
+    }
+
+    uint8_t* pTramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!pTramp) return false;
+
+    std::memcpy(pTramp, pTarget, 14);
+    pTramp[14] = 0xFF;
+    pTramp[15] = 0x25;
+    *reinterpret_cast<uint32_t*>(pTramp + 16) = 0;
+    *reinterpret_cast<uint64_t*>(pTramp + 20) = reinterpret_cast<uint64_t>(pTarget + 14);
+    FlushInstructionCache(GetCurrentProcess(), pTramp, 32);
+
+    *ppTrampoline = pTramp;
+    *ppOriginal = reinterpret_cast<UnityRenderEvent>(pTramp);
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(pTarget, 14, PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
+    pTarget[0] = 0xFF;
+    pTarget[1] = 0x25;
+    *reinterpret_cast<uint32_t*>(pTarget + 2) = 0;
+    *reinterpret_cast<uint64_t*>(pTarget + 6) = reinterpret_cast<uint64_t>(pDetour);
+    DWORD tmp = 0;
+    VirtualProtect(pTarget, 14, oldProtect, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), pTarget, 14);
+    return true;
+}
+
+void ResolveBigSoupPeerOffsets(HMODULE hBigSoup) {
+    if (g_ppDesktopManager) return;
+    g_pfnGetIncomingStreamCount = reinterpret_cast<pfnBigSoupGetNumberOfIncomingVideoStreams>(
+        GetProcAddress(hBigSoup, "BigSoupGetNumberOfIncomingVideoStreams"));
+    if (!g_pfnGetIncomingStreamCount) return;
+
+    const uint8_t* fn = reinterpret_cast<const uint8_t*>(g_pfnGetIncomingStreamCount);
+    // Scan first 64 bytes for: 48 8B 05 <disp32> ... 48 8B 98 <endOff32> 48 2B 98 <beginOff32>
+    for (int i = 0; i < 48; ++i) {
+        if (fn[i] == 0x48 && fn[i + 1] == 0x8B && fn[i + 2] == 0x05) {
+            int32_t disp = *reinterpret_cast<const int32_t*>(fn + i + 3);
+            g_ppDesktopManager = reinterpret_cast<uintptr_t*>(const_cast<uint8_t*>(fn) + i + 7 + disp);
+        }
+        if (fn[i] == 0x48 && fn[i + 1] == 0x8B && fn[i + 2] == 0x98 &&
+            fn[i + 7] == 0x48 && fn[i + 8] == 0x2B && fn[i + 9] == 0x98) {
+            g_peerVecEndOff = *reinterpret_cast<const uint32_t*>(fn + i + 3);
+            g_peerVecBeginOff = *reinterpret_cast<const uint32_t*>(fn + i + 10);
+        }
+    }
+}
+
+void TryInstallMediaHook() {
+    HMODULE hMedia = GetModuleHandleW(L"BigMediaPlayer.dll");
+    if (!hMedia) return;
+
+    if (!g_pfnMediaGetTexId) {
+        g_pfnMediaGetTexId = reinterpret_cast<pfnBigMediaGetVideoTextureId>(GetProcAddress(hMedia, "BigMediaPlayerAPI_GetVideoTextureId"));
+        g_pfnMediaGetWidth = reinterpret_cast<pfnBigMediaGetVideoTextureWidth>(GetProcAddress(hMedia, "BigMediaPlayerAPI_GetVideoTextureWidth"));
+        g_pfnMediaGetHeight = reinterpret_cast<pfnBigMediaGetVideoTextureHeight>(GetProcAddress(hMedia, "BigMediaPlayerAPI_GetVideoTextureHeight"));
+    }
+
+    if (g_mediaHookInstalled) return;
+    auto fnRenderFunc = reinterpret_cast<pfnBigMediaRenderNextFrameFunc>(
+        GetProcAddress(hMedia, "BigMediaPlayerAPI_RenderNextFrameFunc"));
+    if (!fnRenderFunc) return;
+
+    uint8_t* pTarget = reinterpret_cast<uint8_t*>(fnRenderFunc());
+    if (!pTarget) return;
+    if (pTarget[0] == 0xFF && pTarget[1] == 0x25) { g_mediaHookInstalled = true; return; }
+
+    // Expected 17-byte prologue:
+    // 48 89 5C 24 10 57 48 83 EC 20 48 8B 3D <disp32>
+    static const uint8_t expected[13] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x3D };
+    if (std::memcmp(pTarget, expected, sizeof(expected)) != 0) return;
+
+    int32_t disp = *reinterpret_cast<int32_t*>(pTarget + 13);
+    uint64_t absPtrAddr = reinterpret_cast<uint64_t>(pTarget + 17 + disp);
+
+    uint8_t* pTramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!pTramp) return;
+
+    std::memcpy(pTramp, pTarget, 10);
+    pTramp[10] = 0x48; pTramp[11] = 0xBF; // movabs rdi, absPtrAddr
+    *reinterpret_cast<uint64_t*>(pTramp + 12) = absPtrAddr;
+    pTramp[20] = 0x48; pTramp[21] = 0x8B; pTramp[22] = 0x3F; // mov rdi, [rdi]
+    pTramp[23] = 0xFF; pTramp[24] = 0x25;
+    *reinterpret_cast<uint32_t*>(pTramp + 25) = 0;
+    *reinterpret_cast<uint64_t*>(pTramp + 29) = reinterpret_cast<uint64_t>(pTarget + 17);
+    FlushInstructionCache(GetCurrentProcess(), pTramp, 48);
+
+    g_pTrampolineMedia = pTramp;
+    g_originalMediaRenderNextFrame = reinterpret_cast<UnityRenderEvent>(pTramp);
+
+    DWORD oldProtect = 0;
+    if (VirtualProtect(pTarget, 17, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        pTarget[0] = 0xFF; pTarget[1] = 0x25;
+        *reinterpret_cast<uint32_t*>(pTarget + 2) = 0;
+        *reinterpret_cast<uint64_t*>(pTarget + 6) = reinterpret_cast<uint64_t>(Hooked_MediaRenderNextFrame);
+        pTarget[14] = 0x90; pTarget[15] = 0x90; pTarget[16] = 0x90;
+        DWORD tmp = 0;
+        VirtualProtect(pTarget, 17, oldProtect, &tmp);
+        FlushInstructionCache(GetCurrentProcess(), pTarget, 17);
+        g_mediaHookInstalled = true;
+    }
 }
 
 bool InstallHookInternal(HMODULE hBigSoup) {
-    if (g_hookInstalled || !hBigSoup) return g_hookInstalled;
+    if (!hBigSoup) return false;
 
-    auto fnProcessLocal = reinterpret_cast<pfnBigSoupProcessLocalDesktops>(
-        GetProcAddress(hBigSoup, "BigSoupProcessLocalDesktops"));
-    g_pfnGetNativeDesktop = reinterpret_cast<pfnBigSoupGetNativeDesktopTexturePointer>(
-        GetProcAddress(hBigSoup, "BigSoupGetNativeDesktopTexturePointer"));
+    if (!g_pfnGetNativeDesktop) {
+        g_pfnGetNativeDesktop = reinterpret_cast<pfnBigSoupGetNativeDesktopTexturePointer>(
+            GetProcAddress(hBigSoup, "BigSoupGetNativeDesktopTexturePointer"));
+    }
+    ResolveBigSoupPeerOffsets(hBigSoup);
 
-    if (!fnProcessLocal || !g_pfnGetNativeDesktop) return false;
-
-    UnityRenderEvent targetCallback = fnProcessLocal();
-    if (!targetCallback) return false;
-
-    uint8_t* pTarget = reinterpret_cast<uint8_t*>(targetCallback);
-
-    // If already hooked (starts with 0xFF 0x25), skip
-    if (pTarget[0] == 0xFF && pTarget[1] == 0x25) {
-        g_hookInstalled = true;
-        return true;
+    if (!g_localHookInstalled) {
+        auto fnProcessLocal = reinterpret_cast<pfnBigSoupProcessLocalDesktops>(
+            GetProcAddress(hBigSoup, "BigSoupProcessLocalDesktops"));
+        if (fnProcessLocal) {
+            UnityRenderEvent targetLocal = fnProcessLocal();
+            g_localHookInstalled = InstallSimple14Hook(
+                reinterpret_cast<uint8_t*>(targetLocal),
+                Hooked_ProcessLocalDesktops,
+                &g_pTrampolineLocal,
+                &g_originalProcessLocalDesktops);
+        }
     }
 
-    // Allocate 64 bytes executable memory for trampoline
-    g_pTrampoline = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!g_pTrampoline) return false;
-
-    // First 14 bytes of target:
-    // push rbx (2), sub rsp, 30h (4), xorps xmm0, xmm0 (3), movups [rsp+20h], xmm0 (5) = 14 bytes
-    std::memcpy(g_pTrampoline, pTarget, 14);
-
-    // Add 14-byte 64-bit absolute jump back to target + 14:
-    // FF 25 00 00 00 00 <8-byte address>
-    g_pTrampoline[14] = 0xFF;
-    g_pTrampoline[15] = 0x25;
-    *reinterpret_cast<uint32_t*>(g_pTrampoline + 16) = 0; // RIP + 0
-    *reinterpret_cast<uint64_t*>(g_pTrampoline + 20) = reinterpret_cast<uint64_t>(pTarget + 14);
-    FlushInstructionCache(GetCurrentProcess(), g_pTrampoline, 32);
-
-    g_originalProcessLocalDesktops = reinterpret_cast<UnityRenderEvent>(g_pTrampoline);
-
-    // Patch target callback with 14-byte jump to Hooked_ProcessLocalDesktops
-    DWORD oldProtect = 0;
-    if (VirtualProtect(pTarget, 14, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        pTarget[0] = 0xFF;
-        pTarget[1] = 0x25;
-        *reinterpret_cast<uint32_t*>(pTarget + 2) = 0; // RIP + 0
-        *reinterpret_cast<uint64_t*>(pTarget + 6) = reinterpret_cast<uint64_t>(Hooked_ProcessLocalDesktops);
-        DWORD tmp = 0;
-        VirtualProtect(pTarget, 14, oldProtect, &tmp);
-        FlushInstructionCache(GetCurrentProcess(), pTarget, 14);
-        g_hookInstalled = true;
+    if (!g_peerHookInstalled) {
+        auto fnProcessPeer = reinterpret_cast<pfnBigSoupProcessPeerDesktops>(
+            GetProcAddress(hBigSoup, "BigSoupProcessPeerDesktops"));
+        if (fnProcessPeer) {
+            UnityRenderEvent targetPeer = fnProcessPeer();
+            g_peerHookInstalled = InstallSimple14Hook(
+                reinterpret_cast<uint8_t*>(targetPeer),
+                Hooked_ProcessPeerDesktops,
+                &g_pTrampolinePeer,
+                &g_originalProcessPeerDesktops);
+        }
     }
 
-    return g_hookInstalled;
+    TryInstallMediaHook();
+    return g_localHookInstalled;
 }
 
 DWORD WINAPI HookInitThread(LPVOID) {
     HMODULE hBigSoup = nullptr;
-    for (int i = 0; i < 200 && !hBigSoup; ++i) {
-        hBigSoup = GetModuleHandleW(L"BigSoup.dll");
-        if (!hBigSoup) Sleep(200);
-    }
-    if (hBigSoup) {
-        InstallHookInternal(hBigSoup);
+    for (int i = 0; ; ++i) {
+        if (!hBigSoup) hBigSoup = GetModuleHandleW(L"BigSoup.dll");
+        if (hBigSoup) {
+            InstallHookInternal(hBigSoup);
+        }
+        TryInstallMediaHook();
+        if (g_localHookInstalled && g_peerHookInstalled && g_mediaHookInstalled) break;
+        Sleep(i < 120 ? 250 : 2000);
     }
     return 0;
 }
@@ -284,17 +1021,29 @@ extern "C" __declspec(dllexport) int __cdecl CopyThirdPersonGpu(void* nativePtr)
 
 extern "C" __declspec(dllexport) int __cdecl ShutdownThirdPersonGpu() { Cleanup(); return 0; }
 
-// DLL Entry Point: automatically start hook thread when loaded into Bigscreen.exe
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
+        if (!g_peerCsInit) {
+            InitializeCriticalSectionAndSpinCount(&g_peerCs, 4000);
+            g_peerCsInit = true;
+        }
         CreateThread(nullptr, 0, HookInitThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
+        if (g_peerState) { g_peerState->active = 0; UnmapViewOfFile(g_peerState); g_peerState = nullptr; }
+        if (g_peerMapping) { CloseHandle(g_peerMapping); g_peerMapping = nullptr; }
+        ReleasePeerExportTarget();
+        ReleasePeerPipeline();
+        if (g_peerDev) { g_peerDev->Release(); g_peerDev = nullptr; }
+
         if (g_projectedState) { UnmapViewOfFile(g_projectedState); g_projectedState = nullptr; }
         if (g_projectedMapping) { CloseHandle(g_projectedMapping); g_projectedMapping = nullptr; }
         if (g_sharedVideoTex) { g_sharedVideoTex->Release(); g_sharedVideoTex = nullptr; }
         if (g_blackTex) { g_blackTex->Release(); g_blackTex = nullptr; }
-        if (g_pTrampoline) { VirtualFree(g_pTrampoline, 0, MEM_RELEASE); g_pTrampoline = nullptr; }
+        if (g_pTrampolineLocal) { VirtualFree(g_pTrampolineLocal, 0, MEM_RELEASE); g_pTrampolineLocal = nullptr; }
+        if (g_pTrampolinePeer) { VirtualFree(g_pTrampolinePeer, 0, MEM_RELEASE); g_pTrampolinePeer = nullptr; }
+        if (g_pTrampolineMedia) { VirtualFree(g_pTrampolineMedia, 0, MEM_RELEASE); g_pTrampolineMedia = nullptr; }
+        if (g_peerCsInit) { DeleteCriticalSection(&g_peerCs); g_peerCsInit = false; }
     }
     return TRUE;
 }
