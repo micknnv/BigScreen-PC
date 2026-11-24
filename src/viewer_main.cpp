@@ -102,7 +102,6 @@ POINT g_lastRightPt{};
 D2D1_RECT_F g_remoteRect{};
 D2D1_RECT_F g_closeRect{};
 D2D1_RECT_F g_powerHeaderRect{};
-D2D1_RECT_F g_btn1stPersonRect{};
 D2D1_RECT_F g_btnWholeTheaterRect{};
 D2D1_RECT_F g_btnMovieOnlyRect{};
 D2D1_RECT_F g_btnProjectScreenRect{};
@@ -116,7 +115,6 @@ D2D1_RECT_F g_pillRect{};
 
 bool g_closeHovered = false;
 bool g_powerHeaderHovered = false;
-bool g_btn1stHovered = false;
 bool g_btnWholeHovered = false;
 bool g_btnMovieHovered = false;
 bool g_btnProjectScreenHovered = false;
@@ -182,6 +180,48 @@ void* g_fullWinBitmapBits = nullptr;
 uint32_t g_fullWinWidth = 0;
 uint32_t g_fullWinHeight = 0;
 std::vector<uint32_t> g_croppedBits;
+
+int g_lastKnownWinW = 0;
+int g_lastKnownWinH = 0;
+int g_lastKnownCropX = 0;
+int g_lastKnownCropY = 0;
+int g_lastKnownCropW = 0;
+int g_lastKnownCropH = 0;
+float g_lastAdjustedAspect = 0.0f;
+
+void AdjustWindowToVideoAspect(HWND hwnd, float aspect) {
+    if (!hwnd || g_isFullscreen || aspect <= 0.2f || aspect > 4.0f) return;
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    int curH = client.bottom - client.top;
+    if (curH < 360) curH = 720;
+    int newW = static_cast<int>(std::round(curH * aspect));
+    int maxW = GetSystemMetrics(SM_CXSCREEN) - 80;
+    if (newW > maxW) {
+        newW = maxW;
+        curH = static_cast<int>(std::round(newW / aspect));
+    }
+    RECT wr = { 0, 0, newW, curH };
+    DWORD style = GetWindowLong(hwnd, GWL_STYLE);
+    AdjustWindowRect(&wr, style, FALSE);
+    
+    RECT curWin{};
+    GetWindowRect(hwnd, &curWin);
+    int winW = wr.right - wr.left;
+    int winH = wr.bottom - wr.top;
+    int winX = curWin.left;
+    int winY = curWin.top;
+    if (winX + winW > GetSystemMetrics(SM_CXSCREEN)) {
+        winX = GetSystemMetrics(SM_CXSCREEN) - winW - 20;
+    }
+    if (winY + winH > GetSystemMetrics(SM_CYSCREEN)) {
+        winY = GetSystemMetrics(SM_CYSCREEN) - winH - 40;
+    }
+    if (winX < 0) winX = 20;
+    if (winY < 0) winY = 20;
+
+    SetWindowPos(hwnd, nullptr, winX, winY, winW, winH, SWP_NOZORDER | SWP_NOACTIVATE);
+}
 
 // Controller Control IPC
 HANDLE g_controlMapping = nullptr;
@@ -433,6 +473,13 @@ void ReleaseProjectedAppResources() {
     g_projectedHwnd = nullptr;
     g_projectedTitle.clear();
     g_croppedBits.clear();
+    g_lastKnownWinW = 0;
+    g_lastKnownWinH = 0;
+    g_lastKnownCropX = 0;
+    g_lastKnownCropY = 0;
+    g_lastKnownCropW = 0;
+    g_lastKnownCropH = 0;
+    g_lastAdjustedAspect = 0.0f;
 }
 
 bool EnsureFullWinBuffers(uint32_t width, uint32_t height) {
@@ -545,42 +592,84 @@ bool CaptureProjectedWindowFrame() {
         return false;
     }
 
+    const bool isIconic = IsIconic(g_projectedHwnd) != FALSE;
     RECT winRect{};
-    GetWindowRect(g_projectedHwnd, &winRect);
+    if (isIconic) {
+        WINDOWPLACEMENT wp{ sizeof(wp) };
+        if (GetWindowPlacement(g_projectedHwnd, &wp)) {
+            winRect = wp.rcNormalPosition;
+        }
+    }
+    if (winRect.right <= winRect.left) {
+        GetWindowRect(g_projectedHwnd, &winRect);
+    }
     int winW = winRect.right - winRect.left;
     int winH = winRect.bottom - winRect.top;
-    if (winW <= 32 || winH <= 32) return false;
+    if (winW <= 32 || winH <= 32) {
+        if (g_lastKnownWinW > 32 && g_lastKnownWinH > 32) {
+            winW = g_lastKnownWinW;
+            winH = g_lastKnownWinH;
+        } else {
+            return false;
+        }
+    }
 
     if (!EnsureFullWinBuffers(static_cast<uint32_t>(winW), static_cast<uint32_t>(winH))) return false;
 
     BOOL ok = PrintWindow(g_projectedHwnd, g_fullWinMemDc, 0x00000002 /* PW_RENDERFULLCONTENT */);
+    if (!ok && isIconic) {
+        // If DWM discarded the minimized surface, restore without activation to keep rendering active in background
+        WINDOWPLACEMENT wp{ sizeof(wp) };
+        GetWindowPlacement(g_projectedHwnd, &wp);
+        ShowWindow(g_projectedHwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(g_projectedHwnd, HWND_BOTTOM, wp.rcNormalPosition.left, wp.rcNormalPosition.top,
+                     winW, winH, SWP_NOACTIVATE | SWP_NOZORDER);
+        ok = PrintWindow(g_projectedHwnd, g_fullWinMemDc, 0x00000002);
+    }
     if (!ok) {
         ok = PrintWindow(g_projectedHwnd, g_fullWinMemDc, 0);
     }
     if (!ok || !g_fullWinBitmapBits) return false;
 
-    // Determine exact video content sub-rectangle to crop out all title bars, captions, and borders
-    RECT targetRect{};
-    HWND childVid = FindVideoChildWindow(g_projectedHwnd);
-    if (childVid && IsWindow(childVid) && IsWindowVisible(childVid)) {
-        GetWindowRect(childVid, &targetRect);
+    int cropX = 0, cropY = 0, cropW = 0, cropH = 0;
+
+    if (!isIconic) {
+        RECT targetRect{};
+        HWND childVid = FindVideoChildWindow(g_projectedHwnd);
+        if (childVid && IsWindow(childVid) && IsWindowVisible(childVid)) {
+            GetWindowRect(childVid, &targetRect);
+        } else {
+            POINT pt{ 0, 0 };
+            ClientToScreen(g_projectedHwnd, &pt);
+            RECT cr{};
+            GetClientRect(g_projectedHwnd, &cr);
+            targetRect = { pt.x, pt.y, pt.x + cr.right, pt.y + cr.bottom };
+        }
+
+        cropX = targetRect.left - winRect.left;
+        cropY = targetRect.top - winRect.top;
+        cropW = targetRect.right - targetRect.left;
+        cropH = targetRect.bottom - targetRect.top;
+
+        if (cropX < 0) { cropW += cropX; cropX = 0; }
+        if (cropY < 0) { cropH += cropY; cropY = 0; }
+        if (cropX + cropW > winW) cropW = winW - cropX;
+        if (cropY + cropH > winH) cropH = winH - cropY;
+
+        if (cropW >= 32 && cropH >= 32) {
+            g_lastKnownWinW = winW;
+            g_lastKnownWinH = winH;
+            g_lastKnownCropX = cropX;
+            g_lastKnownCropY = cropY;
+            g_lastKnownCropW = cropW;
+            g_lastKnownCropH = cropH;
+        }
     } else {
-        POINT pt{ 0, 0 };
-        ClientToScreen(g_projectedHwnd, &pt);
-        RECT cr{};
-        GetClientRect(g_projectedHwnd, &cr);
-        targetRect = { pt.x, pt.y, pt.x + cr.right, pt.y + cr.bottom };
+        cropX = g_lastKnownCropX;
+        cropY = g_lastKnownCropY;
+        cropW = g_lastKnownCropW;
+        cropH = g_lastKnownCropH;
     }
-
-    int cropX = targetRect.left - winRect.left;
-    int cropY = targetRect.top - winRect.top;
-    int cropW = targetRect.right - targetRect.left;
-    int cropH = targetRect.bottom - targetRect.top;
-
-    if (cropX < 0) { cropW += cropX; cropX = 0; }
-    if (cropY < 0) { cropH += cropY; cropY = 0; }
-    if (cropX + cropW > winW) cropW = winW - cropX;
-    if (cropY + cropH > winH) cropH = winH - cropY;
 
     if (cropW < 32 || cropH < 32) return false;
 
@@ -595,6 +684,15 @@ bool CaptureProjectedWindowFrame() {
 
     if (g_context && g_projectedTexture) {
         g_context->UpdateSubresource(g_projectedTexture, 0, nullptr, g_croppedBits.data(), cropW * sizeof(uint32_t), 0);
+
+        // In Movie Only mode, automatically adapt the window to match the video's exact aspect ratio
+        if (g_movieOnly) {
+            float aspect = static_cast<float>(cropW) / static_cast<float>(cropH);
+            if (std::abs(aspect - g_lastAdjustedAspect) > 0.02f) {
+                g_lastAdjustedAspect = aspect;
+                AdjustWindowToVideoAspect(g_hwnd, aspect);
+            }
+        }
         return true;
     }
     return false;
@@ -1006,7 +1104,7 @@ void DrawPointerReticle(float x, float y, bool active) {
 
 void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
     const float panelWidth = 310.0f;
-    const float panelHeight = 560.0f;
+    const float panelHeight = 520.0f;
     const float left = windowWidth - panelWidth - 20.0f;
     const float top = 20.0f;
     const float right = left + panelWidth;
@@ -1065,25 +1163,18 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
     g_btnWholeTheaterRect = D2D1::RectF(left + 18.0f, top + 66.0f, left + 148.0f, top + 98.0f);
     g_btnMovieOnlyRect = D2D1::RectF(left + 156.0f, top + 66.0f, right - 18.0f, top + 98.0f);
-    DrawButton(g_btnWholeTheaterRect, L"Whole Theater", !g_movieOnly, g_btnWholeHovered);
+    DrawButton(g_btnWholeTheaterRect, L"Theater Mode", !g_movieOnly, g_btnWholeHovered);
     DrawButton(g_btnMovieOnlyRect, L"Movie Only", g_movieOnly, g_btnMovieHovered);
-
-    g_btn1stPersonRect = D2D1::RectF(left + 18.0f, top + 104.0f, right - 18.0f, top + 134.0f);
-    if (g_movieOnly) {
-        DrawButton(g_btn1stPersonRect, L"1st Person (Disabled in Movie Only)", false, false, 6.0f, true);
-    } else {
-        DrawButton(g_btn1stPersonRect, L"1st Person View (Active)", true, g_btn1stHovered, 6.0f, false);
-    }
 
     // SECTION 2: PROJECTION & PRIVACY
     const wchar_t* s2Text = L"PROJECTION & PRIVACY";
-    D2D1_RECT_F s2Rect = D2D1::RectF(left + 18.0f, top + 144.0f, right - 18.0f, top + 160.0f);
+    D2D1_RECT_F s2Rect = D2D1::RectF(left + 18.0f, top + 108.0f, right - 18.0f, top + 124.0f);
     g_d2dRenderTarget->DrawText(
         s2Text, static_cast<UINT32>(wcslen(s2Text)),
         g_textFormatSection, &s2Rect, g_brushTextSection);
 
-    g_btnProjectScreenRect = D2D1::RectF(left + 18.0f, top + 162.0f, left + 148.0f, top + 194.0f);
-    g_btnProjectAppRect = D2D1::RectF(left + 156.0f, top + 162.0f, right - 18.0f, top + 194.0f);
+    g_btnProjectScreenRect = D2D1::RectF(left + 18.0f, top + 126.0f, left + 148.0f, top + 158.0f);
+    g_btnProjectAppRect = D2D1::RectF(left + 156.0f, top + 126.0f, right - 18.0f, top + 158.0f);
     const bool isScreenProj = (g_projectionMode == ProjectionMode::Screen);
     const bool isAppProj = (g_projectionMode == ProjectionMode::App);
     DrawButton(g_btnProjectScreenRect, isScreenProj ? L"Stop Projecting" : L"Project Screen", isScreenProj, g_btnProjectScreenHovered);
@@ -1091,37 +1182,37 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
     // SECTION 3: WINDOW & DISPLAY
     const wchar_t* s3Text = L"WINDOW & DISPLAY";
-    D2D1_RECT_F s3Rect = D2D1::RectF(left + 18.0f, top + 204.0f, right - 18.0f, top + 220.0f);
+    D2D1_RECT_F s3Rect = D2D1::RectF(left + 18.0f, top + 168.0f, right - 18.0f, top + 184.0f);
     g_d2dRenderTarget->DrawText(
         s3Text, static_cast<UINT32>(wcslen(s3Text)),
         g_textFormatSection, &s3Rect, g_brushTextSection);
 
-    g_btnFullscreenRect = D2D1::RectF(left + 18.0f, top + 222.0f, right - 18.0f, top + 254.0f);
+    g_btnFullscreenRect = D2D1::RectF(left + 18.0f, top + 186.0f, right - 18.0f, top + 218.0f);
     DrawButton(g_btnFullscreenRect, g_isFullscreen ? L"Exit Fullscreen (Windowed)" : L"Toggle Fullscreen", g_isFullscreen, g_btnFsHovered);
 
     // SECTION 4: QUICK ACTIONS
     const wchar_t* s4Text = L"QUICK ACTIONS";
-    D2D1_RECT_F s4Rect = D2D1::RectF(left + 18.0f, top + 264.0f, right - 18.0f, top + 280.0f);
+    D2D1_RECT_F s4Rect = D2D1::RectF(left + 18.0f, top + 228.0f, right - 18.0f, top + 244.0f);
     g_d2dRenderTarget->DrawText(
         s4Text, static_cast<UINT32>(wcslen(s4Text)),
         g_textFormatSection, &s4Rect, g_brushTextSection);
 
-    g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 282.0f, left + 148.0f, top + 314.0f);
-    g_btnMenuRect = D2D1::RectF(left + 156.0f, top + 282.0f, right - 18.0f, top + 314.0f);
+    g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 246.0f, left + 148.0f, top + 278.0f);
+    g_btnMenuRect = D2D1::RectF(left + 156.0f, top + 246.0f, right - 18.0f, top + 278.0f);
     DrawButton(g_btnRecenterRect, L"Recenter", false, g_btnRecenterHovered);
     DrawButton(g_btnMenuRect, L"BigScreen Menu", false, g_btnMenuHovered);
 
-    g_btnSystemRect = D2D1::RectF(left + 18.0f, top + 320.0f, right - 18.0f, top + 350.0f);
+    g_btnSystemRect = D2D1::RectF(left + 18.0f, top + 284.0f, right - 18.0f, top + 314.0f);
     DrawButton(g_btnSystemRect, L"SteamVR Dashboard", false, g_btnSystemHovered);
 
     // SECTION 5: VR SYSTEM POWER
     const wchar_t* s5Text = L"VR SYSTEM POWER";
-    D2D1_RECT_F s5Rect = D2D1::RectF(left + 18.0f, top + 360.0f, right - 18.0f, top + 376.0f);
+    D2D1_RECT_F s5Rect = D2D1::RectF(left + 18.0f, top + 324.0f, right - 18.0f, top + 340.0f);
     g_d2dRenderTarget->DrawText(
         s5Text, static_cast<UINT32>(wcslen(s5Text)),
         g_textFormatSection, &s5Rect, g_brushTextSection);
 
-    g_btnPowerRect = D2D1::RectF(left + 18.0f, top + 378.0f, right - 18.0f, top + 410.0f);
+    g_btnPowerRect = D2D1::RectF(left + 18.0f, top + 342.0f, right - 18.0f, top + 374.0f);
     const wchar_t* pwrBtnText = nullptr;
     if (g_btnPowerHovered) {
         pwrBtnText = vrRunning ? L"\x23FB Turn off BigScreen" : L"\x23FB Turn on BigScreen";
@@ -1132,12 +1223,12 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
     // SECTION 6: MEDIA FEED STATUS
     const wchar_t* s6Text = L"MEDIA FEED STATUS";
-    D2D1_RECT_F s6Rect = D2D1::RectF(left + 18.0f, top + 420.0f, right - 18.0f, top + 436.0f);
+    D2D1_RECT_F s6Rect = D2D1::RectF(left + 18.0f, top + 384.0f, right - 18.0f, top + 400.0f);
     g_d2dRenderTarget->DrawText(
         s6Text, static_cast<UINT32>(wcslen(s6Text)),
         g_textFormatSection, &s6Rect, g_brushTextSection);
 
-    D2D1_RECT_F feedBoxRect = D2D1::RectF(left + 18.0f, top + 438.0f, right - 18.0f, top + 468.0f);
+    D2D1_RECT_F feedBoxRect = D2D1::RectF(left + 18.0f, top + 402.0f, right - 18.0f, top + 432.0f);
     D2D1_ROUNDED_RECT feedBox = D2D1::RoundedRect(feedBoxRect, 6.0f, 6.0f);
     g_d2dRenderTarget->FillRoundedRectangle(&feedBox, g_brushBtnInactiveBg);
     
@@ -1166,13 +1257,13 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
     // Footer separator line
     g_d2dRenderTarget->DrawLine(
-        D2D1::Point2F(left + 18.0f, top + 478.0f),
-        D2D1::Point2F(right - 18.0f, top + 478.0f),
+        D2D1::Point2F(left + 18.0f, top + 442.0f),
+        D2D1::Point2F(right - 18.0f, top + 442.0f),
         g_brushSeparator, 1.0f);
 
     // Footer Hotkey Hints
     const wchar_t* footerText = L"Mouse Move: Laser Pointer  |  Left-Click: Trigger\nRight-Click Drag: Look  |  Esc: SteamVR Dashboard\nR: Recenter  |  Alt+Drag or Header: Move Window";
-    D2D1_RECT_F footerRect = D2D1::RectF(left + 8.0f, top + 482.0f, right - 8.0f, bottom - 6.0f);
+    D2D1_RECT_F footerRect = D2D1::RectF(left + 8.0f, top + 446.0f, right - 8.0f, bottom - 6.0f);
     g_d2dRenderTarget->DrawText(
         footerText, static_cast<UINT32>(wcslen(footerText)),
         g_textFormatFooter, &footerRect, g_brushTextMuted);
@@ -1489,49 +1580,79 @@ void Render(ID3D11ShaderResourceView* source, bool flipVertical) {
     GetClientRect(g_hwnd, &rect);
     const float windowWidth = static_cast<float>(std::max<LONG>(1, rect.right));
     const float windowHeight = static_cast<float>(std::max<LONG>(1, rect.bottom));
-    const float sourceAspect = g_sourceHeight ? static_cast<float>(g_sourceWidth) / g_sourceHeight : 16.0f / 9.0f;
     const float windowAspect = windowWidth / windowHeight;
+
+    const float sourceAspect = (g_projectionMode == ProjectionMode::App && g_projectedWidth && g_projectedHeight)
+        ? (static_cast<float>(g_projectedWidth) / static_cast<float>(g_projectedHeight))
+        : (g_sourceHeight ? static_cast<float>(g_sourceWidth) / g_sourceHeight : 16.0f / 9.0f);
+
     D3D11_VIEWPORT viewport{};
-    if (g_movieOnly) {
-        // Dedicated Movie Player mode: clean 16:9 presentation, centered, black letterbox/pillarbox borders
-        constexpr float movieAspect = 16.0f / 9.0f;
-        if (windowAspect > movieAspect) {
-            viewport.Height = windowHeight;
-            viewport.Width = windowHeight * movieAspect;
-            viewport.TopLeftX = (windowWidth - viewport.Width) * 0.5f;
-            viewport.TopLeftY = 0.0f;
-        } else {
-            viewport.Width = windowWidth;
-            viewport.Height = windowWidth / movieAspect;
-            viewport.TopLeftX = 0.0f;
-            viewport.TopLeftY = (windowHeight - viewport.Height) * 0.5f;
-        }
+    if (windowAspect > sourceAspect) {
+        viewport.Height = windowHeight;
+        viewport.Width = windowHeight * sourceAspect;
+        viewport.TopLeftX = (windowWidth - viewport.Width) * 0.5f;
+        viewport.TopLeftY = 0.0f;
     } else {
-        if (windowAspect > sourceAspect) {
-            viewport.Height = windowHeight;
-            viewport.Width = windowHeight * sourceAspect;
-            viewport.TopLeftX = (windowWidth - viewport.Width) * 0.5f;
-            viewport.TopLeftY = 0.0f;
-        } else {
-            viewport.Width = windowWidth;
-            viewport.Height = windowWidth / sourceAspect;
-            viewport.TopLeftX = 0.0f;
-            viewport.TopLeftY = (windowHeight - viewport.Height) * 0.5f;
-        }
+        viewport.Width = windowWidth;
+        viewport.Height = windowWidth / sourceAspect;
+        viewport.TopLeftX = 0.0f;
+        viewport.TopLeftY = (windowHeight - viewport.Height) * 0.5f;
     }
     g_activeViewport = viewport;
 
     const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
     g_context->ClearRenderTargetView(g_rtv, clear);
-    if (source) {
+
+    if (g_projectionMode == ProjectionMode::App && g_projectedSrv) {
+        if (!g_movieOnly && g_localSrv) {
+            // Theater Mode with Bigscreen 3D theater active:
+            // Pass 1: Render the Bigscreen 3D theater auditorium and seats
+            g_context->RSSetViewports(1, &viewport);
+            g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_context->VSSetShader(g_vs, nullptr, 0);
+            g_context->PSSetShader(flipVertical ? g_psFlip : g_ps, nullptr, 0);
+            g_context->PSSetSamplers(0, 1, &g_sampler);
+            g_context->PSSetShaderResources(0, 1, &g_localSrv);
+            g_context->Draw(3, 0);
+
+            // Pass 2: Render the projected video onto the Bigscreen cinema screen in the center
+            D3D11_VIEWPORT screenVp{};
+            float screenW = viewport.Width * 0.470f;
+            float screenH = screenW / sourceAspect;
+            if (screenH > viewport.Height * 0.280f) {
+                screenH = viewport.Height * 0.280f;
+                screenW = screenH * sourceAspect;
+            }
+            screenVp.Width = screenW;
+            screenVp.Height = screenH;
+            screenVp.TopLeftX = viewport.TopLeftX + (viewport.Width - screenW) * 0.5f;
+            screenVp.TopLeftY = viewport.TopLeftY + viewport.Height * 0.490f - screenH * 0.5f;
+
+            g_context->RSSetViewports(1, &screenVp);
+            g_context->PSSetShader(g_ps, nullptr, 0);
+            g_context->PSSetShaderResources(0, 1, &g_projectedSrv);
+            g_context->Draw(3, 0);
+            ID3D11ShaderResourceView* nullSrv = nullptr;
+            g_context->PSSetShaderResources(0, 1, &nullSrv);
+        } else {
+            // Theater Mode without VR or Movie Only mode: render projected video with correct aspect ratio
+            g_context->RSSetViewports(1, &viewport);
+            g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_context->VSSetShader(g_vs, nullptr, 0);
+            g_context->PSSetShader(flipVertical ? g_psFlip : g_ps, nullptr, 0);
+            g_context->PSSetSamplers(0, 1, &g_sampler);
+            g_context->PSSetShaderResources(0, 1, &g_projectedSrv);
+            g_context->Draw(3, 0);
+            ID3D11ShaderResourceView* nullSrv = nullptr;
+            g_context->PSSetShaderResources(0, 1, &nullSrv);
+        }
+    } else if (source) {
         g_context->RSSetViewports(1, &viewport);
         g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_context->VSSetShader(g_vs, nullptr, 0);
         ID3D11PixelShader* selectedPs = nullptr;
-        if (g_projectedHwnd) {
-            selectedPs = flipVertical ? g_psFlip : g_ps;
-        } else if (g_movieOnly) {
+        if (g_movieOnly) {
             selectedPs = flipVertical ? g_psMovieFlip : g_psMovie;
         } else {
             selectedPs = flipVertical ? g_psFlip : g_ps;
@@ -1585,10 +1706,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         if (wParam == VK_F11) {
             ToggleFullscreen(hwnd);
-            return 0;
-        }
-        if (wParam == '1' || wParam == '3') {
-            SelectViewSource(wParam == '3' ? ViewSource::ThirdPerson : ViewSource::FirstPerson);
             return 0;
         }
         if (wParam == VK_LEFT) {
@@ -1659,7 +1776,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_pointerActive = false;
             g_closeHovered = inRect(mx, my, g_closeRect);
             g_powerHeaderHovered = inRect(mx, my, g_powerHeaderRect);
-            g_btn1stHovered = !g_movieOnly && inRect(mx, my, g_btn1stPersonRect);
             g_btnWholeHovered = inRect(mx, my, g_btnWholeTheaterRect);
             g_btnMovieHovered = inRect(mx, my, g_btnMovieOnlyRect);
             g_btnProjectScreenHovered = inRect(mx, my, g_btnProjectScreenRect);
@@ -1677,7 +1793,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_pillHovered = false;
             g_closeHovered = false;
             g_powerHeaderHovered = false;
-            g_btn1stHovered = false;
             g_btnWholeHovered = false;
             g_btnMovieHovered = false;
             g_btnProjectScreenHovered = false;
@@ -1730,7 +1845,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         g_pillHovered = false;
         g_closeHovered = false;
         g_powerHeaderHovered = false;
-        g_btn1stHovered = false;
         g_btnWholeHovered = false;
         g_btnMovieHovered = false;
         g_btnProjectScreenHovered = false;
@@ -1769,10 +1883,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             if (inRect(mx, my, g_btnWholeTheaterRect)) {
                 g_movieOnly = false;
-                if (g_projectionMode == ProjectionMode::App) {
-                    ReleaseProjectedAppResources();
-                    g_projectionMode = ProjectionMode::None;
-                }
                 return 0;
             }
             if (inRect(mx, my, g_btnMovieOnlyRect)) {
@@ -1780,11 +1890,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_lookYaw = 0.0f;
                 g_lookPitch = 0.0f;
                 SyncPointerAndLook();
-                return 0;
-            }
-            if (inRect(mx, my, g_btn1stPersonRect)) {
-                if (!g_movieOnly) {
-                    SelectViewSource(ViewSource::FirstPerson);
+                if (g_projectionMode == ProjectionMode::App && g_projectedWidth && g_projectedHeight) {
+                    float aspect = static_cast<float>(g_projectedWidth) / static_cast<float>(g_projectedHeight);
+                    AdjustWindowToVideoAspect(hwnd, aspect);
                 }
                 return 0;
             }
@@ -1976,6 +2084,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 CaptureProjectedWindowFrame();
                 source = g_projectedSrv;
                 flipVertical = false;
+                if (!g_movieOnly) {
+                    OpenLiveMapping();
+                    if (g_state) CopyNewFrame();
+                }
             }
         } else if (g_projectionMode == ProjectionMode::Screen) {
             OpenLiveMapping();
@@ -1989,15 +2101,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         }
 
         char title[256]{};
+        const char* mode = g_movieOnly ? " | Mode: MOVIE ONLY" : " | Mode: THEATER MODE";
         if (g_projectionMode == ProjectionMode::App && !g_projectedTitle.empty()) {
             std::wstring shortTitle = g_projectedTitle;
             if (shortTitle.length() > 28) shortTitle = shortTitle.substr(0, 25) + L"...";
-            sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING APP: %ls | Tab/M=REMOTE  Click=Trigger", shortTitle.c_str());
+            sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING APP: %ls%s | Tab/M=REMOTE", shortTitle.c_str(), mode);
         } else if (g_projectionMode == ProjectionMode::Screen) {
-            const char* mode = g_movieOnly ? " | Mode: MOVIE ONLY" : " | Mode: WHOLE THEATER";
-            sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING SCREEN%s | Tab/M=REMOTE  Click=Trigger  RMB=Look", mode);
+            sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING SCREEN%s | Tab/M=REMOTE", mode);
         } else {
-            sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTION OFF (Screen Black) | Tab/M=REMOTE  Click=Trigger");
+            sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTION OFF (Screen Black)%s | Tab/M=REMOTE", mode);
         }
         SetWindowTextA(g_hwnd, title);
         Render(source, flipVertical);
