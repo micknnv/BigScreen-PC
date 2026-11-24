@@ -15,6 +15,10 @@
 #include "live_frame_ipc.h"
 #include "third_person_gpu_ipc.h"
 #include "controller_control_ipc.h"
+#include "projected_video_ipc.h"
+
+#include <filesystem>
+namespace fs = std::filesystem;
 
 #include <algorithm>
 #include <cmath>
@@ -199,6 +203,272 @@ struct alignas(16) CbTheaterLayout {
     float screenBounds[4]; // minU, minV, maxU, maxV
     float videoBounds[4];  // minU, minV, maxU, maxV
 };
+
+// Direct3D 11 Shared Desktop Texture & Projected Video IPC
+ID3D11Texture2D* g_sharedDesktopTex = nullptr;
+ID3D11RenderTargetView* g_sharedDesktopRtv = nullptr;
+ID3D11ShaderResourceView* g_sharedDesktopSrv = nullptr;
+HANDLE g_sharedDesktopHandle = nullptr;
+uint32_t g_sharedDesktopW = 0;
+uint32_t g_sharedDesktopH = 0;
+
+HANDLE g_projectedVideoMapping = nullptr;
+bigscreen_projected_video::State* g_projectedVideoState = nullptr;
+DWORD g_lastInjectedBigscreenPid = 0;
+ULONGLONG g_lastInjectionCheck = 0;
+
+void EnsureProjectedVideoIpc() {
+    if (!g_projectedVideoMapping) {
+        g_projectedVideoMapping = CreateFileMappingW(
+            INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+            sizeof(bigscreen_projected_video::State),
+            bigscreen_projected_video::kMappingName);
+    }
+    if (g_projectedVideoMapping && !g_projectedVideoState) {
+        g_projectedVideoState = static_cast<bigscreen_projected_video::State*>(
+            MapViewOfFile(g_projectedVideoMapping, FILE_MAP_ALL_ACCESS, 0, 0,
+                          sizeof(bigscreen_projected_video::State)));
+        if (g_projectedVideoState && GetLastError() != ERROR_ALREADY_EXISTS) {
+            *g_projectedVideoState = {};
+            g_projectedVideoState->magic = bigscreen_projected_video::kMagic;
+            g_projectedVideoState->version = bigscreen_projected_video::kVersion;
+            g_projectedVideoState->privacyMode = 1;
+        }
+    }
+}
+
+void PublishProjectedVideoState(bool active, bool privacyMode, uint64_t sharedHandle,
+                                uint32_t width, uint32_t height, uint32_t vidW, uint32_t vidH) {
+    EnsureProjectedVideoIpc();
+    if (g_projectedVideoState) {
+        g_projectedVideoState->magic = bigscreen_projected_video::kMagic;
+        g_projectedVideoState->version = bigscreen_projected_video::kVersion;
+        g_projectedVideoState->active = active ? 1 : 0;
+        g_projectedVideoState->privacyMode = privacyMode ? 1 : 0;
+        g_projectedVideoState->sharedHandle = sharedHandle;
+        g_projectedVideoState->width = width;
+        g_projectedVideoState->height = height;
+        g_projectedVideoState->videoWidth = vidW;
+        g_projectedVideoState->videoHeight = vidH;
+        ++g_projectedVideoState->frameSequence;
+        g_projectedVideoState->lastFrameMicros = GetTickCount64() * 1000ull;
+    }
+}
+
+void ReleaseSharedDesktopTexture() {
+    if (g_sharedDesktopRtv) { g_sharedDesktopRtv->Release(); g_sharedDesktopRtv = nullptr; }
+    if (g_sharedDesktopSrv) { g_sharedDesktopSrv->Release(); g_sharedDesktopSrv = nullptr; }
+    if (g_sharedDesktopTex) { g_sharedDesktopTex->Release(); g_sharedDesktopTex = nullptr; }
+    g_sharedDesktopHandle = nullptr;
+    g_sharedDesktopW = 0;
+    g_sharedDesktopH = 0;
+}
+
+bool EnsureSharedDesktopTexture(uint32_t w, uint32_t h) {
+    if (w == 0 || h == 0 || !g_device) return false;
+    if (g_sharedDesktopTex && g_sharedDesktopW == w && g_sharedDesktopH == h) return true;
+    ReleaseSharedDesktopTexture();
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = w;
+    desc.Height = h;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+    if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &g_sharedDesktopTex))) return false;
+    if (FAILED(g_device->CreateRenderTargetView(g_sharedDesktopTex, nullptr, &g_sharedDesktopRtv))) {
+        ReleaseSharedDesktopTexture(); return false;
+    }
+    if (FAILED(g_device->CreateShaderResourceView(g_sharedDesktopTex, nullptr, &g_sharedDesktopSrv))) {
+        ReleaseSharedDesktopTexture(); return false;
+    }
+
+    IDXGIResource* res = nullptr;
+    if (SUCCEEDED(g_sharedDesktopTex->QueryInterface(IID_PPV_ARGS(&res)))) {
+        res->GetSharedHandle(&g_sharedDesktopHandle);
+        res->Release();
+    }
+
+    g_sharedDesktopW = w;
+    g_sharedDesktopH = h;
+    return true;
+}
+
+void RenderVideoToSharedDesktop() {
+    uint32_t deskW = static_cast<uint32_t>(GetSystemMetrics(SM_CXSCREEN));
+    uint32_t deskH = static_cast<uint32_t>(GetSystemMetrics(SM_CYSCREEN));
+    if (deskW == 0 || deskH == 0 || !g_context) return;
+    if (!EnsureSharedDesktopTexture(deskW, deskH)) return;
+
+    ID3D11RenderTargetView* prevRtv = nullptr;
+    ID3D11DepthStencilView* prevDsv = nullptr;
+    g_context->OMGetRenderTargets(1, &prevRtv, &prevDsv);
+    UINT numVp = 1;
+    D3D11_VIEWPORT prevVp{};
+    g_context->RSGetViewports(&numVp, &prevVp);
+
+    g_context->OMSetRenderTargets(1, &g_sharedDesktopRtv, nullptr);
+    const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    g_context->ClearRenderTargetView(g_sharedDesktopRtv, black);
+
+    if (g_projectionMode == ProjectionMode::App && g_projectedSrv && g_projectedWidth > 0 && g_projectedHeight > 0) {
+        float videoAspect = static_cast<float>(g_projectedWidth) / static_cast<float>(g_projectedHeight);
+        float canvasAspect = static_cast<float>(deskW) / static_cast<float>(deskH);
+
+        float boxW = 0.0f, boxH = 0.0f, boxX = 0.0f, boxY = 0.0f;
+        if (canvasAspect > videoAspect) {
+            boxH = static_cast<float>(deskH);
+            boxW = boxH * videoAspect;
+            boxX = (static_cast<float>(deskW) - boxW) * 0.5f;
+            boxY = 0.0f;
+        } else {
+            boxW = static_cast<float>(deskW);
+            boxH = boxW / videoAspect;
+            boxX = 0.0f;
+            boxY = (static_cast<float>(deskH) - boxH) * 0.5f;
+        }
+
+        D3D11_VIEWPORT vp{};
+        vp.TopLeftX = boxX;
+        vp.TopLeftY = boxY;
+        vp.Width = boxW;
+        vp.Height = boxH;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        g_context->RSSetViewports(1, &vp);
+
+        g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_context->VSSetShader(g_vs, nullptr, 0);
+        g_context->PSSetShader(g_ps, nullptr, 0);
+        g_context->PSSetSamplers(0, 1, &g_sampler);
+        g_context->PSSetShaderResources(0, 1, &g_projectedSrv);
+        g_context->Draw(3, 0);
+
+        ID3D11ShaderResourceView* nullSrv = nullptr;
+        g_context->PSSetShaderResources(0, 1, &nullSrv);
+    }
+
+    g_context->Flush();
+
+    g_context->OMSetRenderTargets(1, &prevRtv, prevDsv);
+    if (prevRtv) prevRtv->Release();
+    if (prevDsv) prevDsv->Release();
+    if (numVp > 0) g_context->RSSetViewports(1, &prevVp);
+
+    PublishProjectedVideoState(
+        g_projectionMode == ProjectionMode::App,
+        true,
+        reinterpret_cast<uint64_t>(g_sharedDesktopHandle),
+        deskW, deskH,
+        g_projectedWidth, g_projectedHeight
+    );
+}
+
+void ClearSharedDesktopToBlack() {
+    uint32_t deskW = static_cast<uint32_t>(GetSystemMetrics(SM_CXSCREEN));
+    uint32_t deskH = static_cast<uint32_t>(GetSystemMetrics(SM_CYSCREEN));
+    if (EnsureSharedDesktopTexture(deskW, deskH) && g_sharedDesktopRtv && g_context) {
+        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        g_context->ClearRenderTargetView(g_sharedDesktopRtv, black);
+        g_context->Flush();
+    }
+    PublishProjectedVideoState(false, true, reinterpret_cast<uint64_t>(g_sharedDesktopHandle),
+                              deskW, deskH, 0, 0);
+}
+
+bool InjectDllIntoBigscreen(DWORD pid) {
+    if (!pid) return false;
+    HANDLE hProcess = OpenProcess(
+        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+        FALSE, pid);
+    if (!hProcess) return false;
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32W me{}; me.dwSize = sizeof(me);
+        if (Module32FirstW(snap, &me)) {
+            do {
+                if (_wcsicmp(me.szModule, L"BigscreenThirdPersonGpuExport.dll") == 0) {
+                    CloseHandle(snap);
+                    CloseHandle(hProcess);
+                    return true;
+                }
+            } while (Module32NextW(snap, &me));
+        }
+        CloseHandle(snap);
+    }
+
+    wchar_t myPath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, myPath, MAX_PATH);
+    fs::path dir = fs::path(myPath).parent_path();
+    fs::path dllPath = dir / L"BigscreenThirdPersonGpuExport.dll";
+    if (!fs::exists(dllPath)) dllPath = dir / L"runtime" / L"BigscreenThirdPersonGpuExport.dll";
+    if (!fs::exists(dllPath)) dllPath = dir / L".." / L"runtime" / L"BigscreenThirdPersonGpuExport.dll";
+    if (!fs::exists(dllPath)) dllPath = dir / L"build" / L"runtime" / L"BigscreenThirdPersonGpuExport.dll";
+    if (!fs::exists(dllPath)) {
+        CloseHandle(hProcess);
+        return false;
+    }
+
+    std::wstring ws = dllPath.wstring();
+    size_t bytes = (ws.length() + 1) * sizeof(wchar_t);
+    LPVOID pRemoteBuf = VirtualAllocEx(hProcess, nullptr, bytes, MEM_COMMIT, PAGE_READWRITE);
+    if (!pRemoteBuf) { CloseHandle(hProcess); return false; }
+
+    if (!WriteProcessMemory(hProcess, pRemoteBuf, ws.c_str(), bytes, nullptr)) {
+        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return false;
+    }
+
+    HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
+    auto pfnLoadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(GetProcAddress(hK32, "LoadLibraryW"));
+    HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, pfnLoadLibrary, pRemoteBuf, 0, nullptr);
+    if (!hThread) {
+        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return false;
+    }
+
+    WaitForSingleObject(hThread, 5000);
+    CloseHandle(hThread);
+    VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+    CloseHandle(hProcess);
+    Log("Successfully injected desktop routing hook into Bigscreen.exe (PID %u)", pid);
+    return true;
+}
+
+void EnsureBigscreenHookInjected() {
+    ULONGLONG now = GetTickCount64();
+    if (now - g_lastInjectionCheck < 1500) return;
+    g_lastInjectionCheck = now;
+
+    DWORD pid = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, L"Bigscreen.exe") == 0) {
+                    pid = pe.th32ProcessID;
+                    break;
+                }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+
+    if (pid && pid != g_lastInjectedBigscreenPid) {
+        if (InjectDllIntoBigscreen(pid)) {
+            g_lastInjectedBigscreenPid = pid;
+        }
+    }
+}
 
 RECT g_origAppRect{};
 LONG g_origAppExStyle = 0;
@@ -527,6 +797,7 @@ void ReleaseProjectedAppResources() {
     if (g_projectedHwnd && IsWindow(g_projectedHwnd) && g_appIsHidden) {
         RestoreAppWindow(g_projectedHwnd);
     }
+    ClearSharedDesktopToBlack();
     if (g_projectedSrv) { g_projectedSrv->Release(); g_projectedSrv = nullptr; }
     if (g_projectedTexture) { g_projectedTexture->Release(); g_projectedTexture = nullptr; }
     if (g_fullWinBitmap) { DeleteObject(g_fullWinBitmap); g_fullWinBitmap = nullptr; }
@@ -751,6 +1022,7 @@ bool CaptureProjectedWindowFrame() {
 
     if (g_context && g_projectedTexture) {
         g_context->UpdateSubresource(g_projectedTexture, 0, nullptr, g_croppedBits.data(), cropW * sizeof(uint32_t), 0);
+        RenderVideoToSharedDesktop();
 
         // In Movie Only mode, automatically adapt the window to match the video's exact aspect ratio
         if (g_movieOnly) {
@@ -1350,6 +1622,7 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
 void ReleaseAll() {
     ReleaseProjectedAppResources();
+    ReleaseSharedDesktopTexture();
     ReleaseSharedResources();
     ReleaseThirdPersonResources();
     ReleaseD2DDeviceResources();
@@ -1373,6 +1646,11 @@ void ReleaseAll() {
     if (g_controlMapping) CloseHandle(g_controlMapping);
     g_controlState = nullptr;
     g_controlMapping = nullptr;
+
+    if (g_projectedVideoState) UnmapViewOfFile(g_projectedVideoState);
+    if (g_projectedVideoMapping) CloseHandle(g_projectedVideoMapping);
+    g_projectedVideoState = nullptr;
+    g_projectedVideoMapping = nullptr;
 
     if (g_state) UnmapViewOfFile(g_state);
     if (g_mapping) CloseHandle(g_mapping);
@@ -1727,86 +2005,16 @@ void Render(ID3D11ShaderResourceView* source, bool flipVertical) {
     g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
     g_context->ClearRenderTargetView(g_rtv, clear);
 
-    if (g_projectionMode == ProjectionMode::App && g_projectedSrv) {
-        if (!g_movieOnly && g_localSrv) {
-            // Theater Mode with Bigscreen 3D theater active:
-            // Single-pass composite: replace Bigscreen cinema screen with isolated video app
-            // and pure black letterboxing/pillarboxing. The user's desktop is NEVER visible!
-            const float screenW = 0.485f;
-            const float screenH = 0.285f;
-            const float screenAspect = screenW / screenH; // ~1.7018f
-
-            const float shiftU = -std::tan(g_lookYaw) / (2.0f * 1.30f);
-            const float shiftV = std::tan(g_lookPitch) / (2.0f * 1.30f);
-
-            const float screenMinU = (0.500f - screenW * 0.5f) + shiftU;
-            const float screenMaxU = (0.500f + screenW * 0.5f) + shiftU;
-            const float screenMinV = (0.4975f - screenH * 0.5f) + shiftV;
-            const float screenMaxV = (0.4975f + screenH * 0.5f) + shiftV;
-
-            float videoMinU = screenMinU;
-            float videoMaxU = screenMaxU;
-            float videoMinV = screenMinV;
-            float videoMaxV = screenMaxV;
-
-            const float videoAspect = (g_projectedHeight > 0)
-                ? (static_cast<float>(g_projectedWidth) / static_cast<float>(g_projectedHeight))
-                : 16.0f / 9.0f;
-
-            if (videoAspect >= screenAspect) {
-                // Video is wider than the screen: fit horizontally, black letterbox top & bottom
-                const float vH = screenW / videoAspect;
-                const float centerV = (screenMinV + screenMaxV) * 0.5f;
-                videoMinV = centerV - vH * 0.5f;
-                videoMaxV = centerV + vH * 0.5f;
-            } else {
-                // Video is taller than the screen: fit vertically, black pillarbox left & right
-                const float vW = screenH * videoAspect;
-                const float centerU = (screenMinU + screenMaxU) * 0.5f;
-                videoMinU = centerU - vW * 0.5f;
-                videoMaxU = centerU + vW * 0.5f;
-            }
-
-            CbTheaterLayout cbData{};
-            cbData.screenBounds[0] = screenMinU;
-            cbData.screenBounds[1] = screenMinV;
-            cbData.screenBounds[2] = screenMaxU;
-            cbData.screenBounds[3] = screenMaxV;
-            cbData.videoBounds[0] = videoMinU;
-            cbData.videoBounds[1] = videoMinV;
-            cbData.videoBounds[2] = videoMaxU;
-            cbData.videoBounds[3] = videoMaxV;
-
-            g_context->UpdateSubresource(g_cbTheater, 0, nullptr, &cbData, 0, 0);
-
-            g_context->RSSetViewports(1, &viewport);
-            g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            g_context->VSSetShader(g_vs, nullptr, 0);
-            g_context->PSSetShader(flipVertical ? g_psTheaterCompositeFlip : g_psTheaterComposite, nullptr, 0);
-            g_context->PSSetSamplers(0, 1, &g_sampler);
-            g_context->PSSetConstantBuffers(0, 1, &g_cbTheater);
-
-            ID3D11ShaderResourceView* srvs[2] = { g_localSrv, g_projectedSrv };
-            g_context->PSSetShaderResources(0, 2, srvs);
-            g_context->Draw(3, 0);
-
-            ID3D11ShaderResourceView* nullSrvs[2] = { nullptr, nullptr };
-            g_context->PSSetShaderResources(0, 2, nullSrvs);
-            ID3D11Buffer* nullCb = nullptr;
-            g_context->PSSetConstantBuffers(0, 1, &nullCb);
+    ID3D11ShaderResourceView* activeSource = source;
+    if (g_projectionMode == ProjectionMode::App) {
+        if (g_movieOnly) {
+            activeSource = g_projectedSrv;
         } else {
-            // Theater Mode without VR or Movie Only mode: render projected video with correct aspect ratio
-            g_context->RSSetViewports(1, &viewport);
-            g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            g_context->VSSetShader(g_vs, nullptr, 0);
-            g_context->PSSetShader(flipVertical ? g_psFlip : g_ps, nullptr, 0);
-            g_context->PSSetSamplers(0, 1, &g_sampler);
-            g_context->PSSetShaderResources(0, 1, &g_projectedSrv);
-            g_context->Draw(3, 0);
-            ID3D11ShaderResourceView* nullSrv = nullptr;
-            g_context->PSSetShaderResources(0, 1, &nullSrv);
+            activeSource = g_localSrv ? g_localSrv : g_projectedSrv;
         }
-    } else if (source) {
+    }
+
+    if (activeSource) {
         g_context->RSSetViewports(1, &viewport);
         g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_context->VSSetShader(g_vs, nullptr, 0);
@@ -1818,7 +2026,7 @@ void Render(ID3D11ShaderResourceView* source, bool flipVertical) {
         }
         g_context->PSSetShader(selectedPs, nullptr, 0);
         g_context->PSSetSamplers(0, 1, &g_sampler);
-        g_context->PSSetShaderResources(0, 1, &source);
+        g_context->PSSetShaderResources(0, 1, &activeSource);
         g_context->Draw(3, 0);
         ID3D11ShaderResourceView* nullSrv = nullptr;
         g_context->PSSetShaderResources(0, 1, &nullSrv);
@@ -2060,8 +2268,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     ToggleAppWindowVisibility();
                 } else if (g_projectionMode == ProjectionMode::Screen) {
                     g_projectionMode = ProjectionMode::None;
+                    ClearSharedDesktopToBlack();
                 } else {
                     g_projectionMode = ProjectionMode::Screen;
+                    PublishProjectedVideoState(false, false, 0, 0, 0, 0, 0);
                     ToggleDesktopMenu();
                 }
                 return 0;
@@ -2229,6 +2439,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             TranslateMessage(&message);
             DispatchMessage(&message);
         }
+        EnsureBigscreenHookInjected();
         CheckFeedStatus();
         ID3D11ShaderResourceView* source = nullptr;
         bool flipVertical = false;
@@ -2240,7 +2451,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 source = g_localSrv;
             } else {
                 CaptureProjectedWindowFrame();
-                source = g_projectedSrv;
+                source = g_movieOnly ? g_projectedSrv : (g_localSrv ? g_localSrv : g_projectedSrv);
                 flipVertical = false;
                 if (!g_movieOnly) {
                     OpenLiveMapping();

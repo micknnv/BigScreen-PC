@@ -69,6 +69,13 @@ Il2Cpp.perform(() => {
     };
 
     const module = Module.load(exportDllPath);
+    const hookExport = module.findExportByName("InstallBigSoupDesktopHook");
+    if (hookExport) {
+        try {
+            const installHook = new NativeFunction(hookExport, "int", []);
+            installHook();
+        } catch (_) {}
+    }
     const initExport = new NativeFunction(module.getExportByName("InitThirdPersonGpu"), "int", ["pointer", "pointer"]);
     const copyExport = new NativeFunction(module.getExportByName("CopyThirdPersonGpu"), "int", ["pointer"]);
     const shutdownExport = new NativeFunction(module.getExportByName("ShutdownThirdPersonGpu"), "int", []);
