@@ -373,7 +373,7 @@ public:
         vr::VRProperties()->SetBoolProperty(props_, vr::Prop_HasDriverDirectModeComponent_Bool, true);
         vr::VRProperties()->SetBoolProperty(props_, vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, false);
         vr::VRProperties()->SetBoolProperty(props_, vr::Prop_ContainsProximitySensor_Bool, true);
-        vr::VRProperties()->SetBoolProperty(props_, vr::Prop_IgnoreMotionForStandby_Bool, false);
+        vr::VRProperties()->SetBoolProperty(props_, vr::Prop_IgnoreMotionForStandby_Bool, true);
         if (!directMode_.InitializeGraphicsIdentity()) {
             vr::VRDriverLog()->Log("Direct Mode graphics adapter initialization failed");
             return vr::VRInitError_Driver_Failed;
