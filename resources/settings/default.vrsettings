@@ -6,5 +6,9 @@
     "right_stick_sensitivity": 2.2,
     "pitch_limit_degrees": 80.0,
     "log_interval_seconds": 1.0
+  },
+  "power": {
+    "turnOffScreensTimeout": 0.0,
+    "pauseCompositorOnStandby": false
   }
 }

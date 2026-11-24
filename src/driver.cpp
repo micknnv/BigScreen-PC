@@ -361,6 +361,7 @@ public:
         vr::VRProperties()->SetStringProperty(props_, vr::Prop_TrackingSystemName_String, "BigscreenDesktopBridge");
         vr::VRProperties()->SetStringProperty(props_, vr::Prop_ModelNumber_String, "Bigscreen Desktop HMD");
         vr::VRProperties()->SetStringProperty(props_, vr::Prop_ManufacturerName_String, "BigscreenDesktopBridge");
+        vr::VRProperties()->SetStringProperty(props_, vr::Prop_SerialNumber_String, "BigscreenDesktopHMD");
         vr::VRProperties()->SetStringProperty(props_, vr::Prop_ResourceRoot_String, "");
         vr::VRProperties()->SetBoolProperty(props_, vr::Prop_DeviceIsWireless_Bool, false);
         vr::VRProperties()->SetBoolProperty(props_, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
@@ -373,27 +374,41 @@ public:
         vr::VRProperties()->SetBoolProperty(props_, vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, false);
         vr::VRProperties()->SetBoolProperty(props_, vr::Prop_ContainsProximitySensor_Bool, true);
         vr::VRProperties()->SetBoolProperty(props_, vr::Prop_IgnoreMotionForStandby_Bool, false);
-        auto* input = vr::VRDriverInput();
-        if (input) {
-            input->CreateBooleanComponent(props_, "/input/proximity", &proximity_);
-            if (proximity_ != vr::k_ulInvalidInputComponentHandle) {
-                input->UpdateBooleanComponent(proximity_, true, 0.0);
-                vr::VRDriverLog()->Log("Virtual HMD proximity sensor activated (user present)");
-            }
-        }
         if (!directMode_.InitializeGraphicsIdentity()) {
             vr::VRDriverLog()->Log("Direct Mode graphics adapter initialization failed");
             return vr::VRInitError_Driver_Failed;
         }
         vr::VRProperties()->SetUint64Property(props_, vr::Prop_GraphicsAdapterLuid_Uint64,
                                               directMode_.AdapterLuid());
+
+        if (auto* input = vr::VRDriverInput()) {
+            input->CreateBooleanComponent(props_, "/proximity", &proximity_);
+            input->CreateBooleanComponent(props_, "/input/proximity", &proximityInput_);
+            if (proximity_ != vr::k_ulInvalidInputComponentHandle) {
+                input->UpdateBooleanComponent(proximity_, true, 0.0);
+            }
+            if (proximityInput_ != vr::k_ulInvalidInputComponentHandle) {
+                input->UpdateBooleanComponent(proximityInput_, true, 0.0);
+            }
+        }
+
         active_ = true;
-        vr::VRDriverLog()->Log("Direct Mode HMD activated");
+        vr::VRDriverLog()->Log("Direct Mode HMD activated (Proximity sensor armed: active/worn)");
         return vr::VRInitError_None;
     }
 
     void Deactivate() override { active_ = false; index_ = vr::k_unTrackedDeviceIndexInvalid; }
-    void EnterStandby() override {}
+    void EnterStandby() override {
+        vr::VRDriverLog()->Log("Virtual HMD EnterStandby called - refreshing active proximity state");
+        if (auto* input = vr::VRDriverInput()) {
+            if (proximity_ != vr::k_ulInvalidInputComponentHandle) {
+                input->UpdateBooleanComponent(proximity_, true, 0.0);
+            }
+            if (proximityInput_ != vr::k_ulInvalidInputComponentHandle) {
+                input->UpdateBooleanComponent(proximityInput_, true, 0.0);
+            }
+        }
+    }
     void* GetComponent(const char* componentNameAndVersion) override {
         if (componentNameAndVersion &&
             std::strcmp(componentNameAndVersion, vr::IVRDisplayComponent_Version) == 0) {
@@ -417,8 +432,13 @@ public:
     void RunFrame(double dt) {
         if (!active_) return;
         (void)dt;
-        if (proximity_ != vr::k_ulInvalidInputComponentHandle && vr::VRDriverInput()) {
-            vr::VRDriverInput()->UpdateBooleanComponent(proximity_, true, 0.0);
+        if (auto* input = vr::VRDriverInput()) {
+            if (proximity_ != vr::k_ulInvalidInputComponentHandle) {
+                input->UpdateBooleanComponent(proximity_, true, 0.0);
+            }
+            if (proximityInput_ != vr::k_ulInvalidInputComponentHandle) {
+                input->UpdateBooleanComponent(proximityInput_, true, 0.0);
+            }
         }
         bool ipcActive = false;
         double ipcPositionX = positionX_;
@@ -472,11 +492,17 @@ public:
         double cameraZ = positionZ_ + hmdJitterZ;
         totalYaw += hmdSwayYaw;
 
-        if (viewMode == bigscreen_desktop_ipc::ViewMode::LegacyHmdOffset)
+        const bool isThird = (controlReady && control.viewRequest == static_cast<uint32_t>(bigscreen_controller_control_ipc::ViewRequest::Third)) ||
+                             (viewMode == bigscreen_desktop_ipc::ViewMode::LegacyHmdOffset);
+        if (isThird)
             ApplyLegacyHmdOffset(totalYaw, cameraX, cameraY, cameraZ);
         next.vecPosition[0] = cameraX;
         next.vecPosition[1] = cameraY;
         next.vecPosition[2] = cameraZ;
+        next.vecVelocity[0] = (12.0 * std::cos(hmdTimeAccum_ * 12.0) * 0.0003 + 1.5 * std::cos(hmdTimeAccum_ * 1.5) * 0.002);
+        next.vecVelocity[1] = (-15.0 * std::sin(hmdTimeAccum_ * 15.0) * 0.0003 - 1.2 * std::sin(hmdTimeAccum_ * 1.2) * 0.002);
+        next.vecVelocity[2] = (18.0 * std::cos(hmdTimeAccum_ * 18.0) * 0.0003);
+        next.vecAngularVelocity[1] = 1.0 * std::cos(hmdTimeAccum_ * 1.0) * 0.001;
         next.qRotation = QuaternionFromYawPitch(totalYaw, totalPitch);
         next.poseIsValid = true;
         next.willDriftInYaw = false;
@@ -537,11 +563,13 @@ private:
     double positionX_ = 0.0, positionZ_ = 0.0;
     double yaw_ = 0.0, pitch_ = 0.0, logAccumulator_ = 0.0;
     double hmdTimeAccum_ = 0.0;
+    double standbyPulseAccum_ = 0.0;
     HANDLE mapping_ = nullptr;
     const bigscreen_desktop_ipc::PoseState* sharedState_ = nullptr;
     DirectMode directMode_;
     DisplayComponent display_;
     vr::VRInputComponentHandle_t proximity_ = vr::k_ulInvalidInputComponentHandle;
+    vr::VRInputComponentHandle_t proximityInput_ = vr::k_ulInvalidInputComponentHandle;
 };
 
 class SyntheticRightController final : public vr::ITrackedDeviceServerDriver {
@@ -676,7 +704,9 @@ public:
         double cameraX = positionX;
         double cameraY = 1.6;
         double cameraZ = positionZ;
-        if (viewMode == bigscreen_desktop_ipc::ViewMode::LegacyHmdOffset)
+        const bool isThird = (controlReady && control.viewRequest == static_cast<uint32_t>(bigscreen_controller_control_ipc::ViewRequest::Third)) ||
+                             (viewMode == bigscreen_desktop_ipc::ViewMode::LegacyHmdOffset);
+        if (isThird)
             ApplyLegacyHmdOffset(yaw, cameraX, cameraY, cameraZ);
         next.vecPosition[0] = static_cast<float>(cameraX) + rotatedX;
         next.vecPosition[1] = static_cast<float>(cameraY) + rotatedY;

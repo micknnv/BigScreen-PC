@@ -14,6 +14,7 @@
 #include "controller_control_ipc.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -36,6 +37,8 @@ ID3D11RenderTargetView* g_rtv = nullptr;
 ID3D11VertexShader* g_vs = nullptr;
 ID3D11PixelShader* g_ps = nullptr;
 ID3D11PixelShader* g_psFlip = nullptr;
+ID3D11PixelShader* g_psMovie = nullptr;
+ID3D11PixelShader* g_psMovieFlip = nullptr;
 ID3D11SamplerState* g_sampler = nullptr;
 ID3D11Texture2D* g_sharedTexture = nullptr;
 IDXGIKeyedMutex* g_sharedMutex = nullptr;
@@ -54,6 +57,7 @@ ULONGLONG g_started = 0;
 ULONGLONG g_lastMetrics = 0;
 uint32_t g_sourceWidth = 0;
 uint32_t g_sourceHeight = 0;
+D3D11_VIEWPORT g_activeViewport{};
 
 enum class ViewSource { FirstPerson, ThirdPerson };
 ViewSource g_viewSource = ViewSource::FirstPerson;
@@ -264,19 +268,21 @@ void ToggleDesktopMenu() {
         Log("Bigscreen desktop window not found.");
         return;
     }
-    if (IsIconic(hwnd) || GetForegroundWindow() != hwnd) {
+    if (IsIconic(hwnd)) {
+        // Currently minimized -> Restore and bring to front
         ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
         g_waitingForNewFeed = true;
         g_menuOpenedTime = GetTickCount64();
         g_feedActiveWhenMenuOpened = g_feedActive;
         g_feedSawDropAfterMenuOpen = false;
-        Log("Restored Bigscreen desktop menu (feedActiveAtOpen=%d). Waiting for user selection / new feed...", g_feedActive);
+        Log("Restored Bigscreen desktop menu. Waiting for feed to auto-minimize...");
     } else {
+        // Currently visible/open -> Minimize it!
         ShowWindow(hwnd, SW_MINIMIZE);
         SetForegroundWindow(g_hwnd);
         g_waitingForNewFeed = false;
-        Log("User manually minimized Bigscreen desktop menu.");
+        Log("User minimized Bigscreen desktop menu.");
     }
 }
 
@@ -696,11 +702,11 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
     g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 268.0f, left + 140.0f, top + 300.0f);
     g_btnMenuRect = D2D1::RectF(left + 148.0f, top + 268.0f, right - 18.0f, top + 300.0f);
-    DrawButton(g_btnRecenterRect, L"🎯 Recenter", false, g_btnRecenterHovered);
-    DrawButton(g_btnMenuRect, L"📋 Desktop Menu", false, g_btnMenuHovered);
+    DrawButton(g_btnRecenterRect, L"Recenter", false, g_btnRecenterHovered);
+    DrawButton(g_btnMenuRect, L"BigScreen Menu", false, g_btnMenuHovered);
 
     g_btnSystemRect = D2D1::RectF(left + 18.0f, top + 306.0f, right - 18.0f, top + 338.0f);
-    DrawButton(g_btnSystemRect, L"⊞ SteamVR Dashboard", false, g_btnSystemHovered);
+    DrawButton(g_btnSystemRect, L"SteamVR Dashboard", false, g_btnSystemHovered);
 
     // SECTION 5: MEDIA FEED STATUS
     const wchar_t* s5Text = L"MEDIA FEED STATUS";
@@ -775,6 +781,8 @@ void ReleaseAll() {
     if (g_sampler) g_sampler->Release();
     if (g_ps) g_ps->Release();
     if (g_psFlip) g_psFlip->Release();
+    if (g_psMovie) g_psMovie->Release();
+    if (g_psMovieFlip) g_psMovieFlip->Release();
     if (g_vs) g_vs->Release();
     if (g_swap) g_swap->Release();
     if (g_context) g_context->Release();
@@ -786,6 +794,8 @@ void ReleaseAll() {
     g_sampler = nullptr;
     g_ps = nullptr;
     g_psFlip = nullptr;
+    g_psMovie = nullptr;
+    g_psMovieFlip = nullptr;
     g_vs = nullptr;
     g_swap = nullptr;
     g_context = nullptr;
@@ -929,6 +939,16 @@ bool InitD3D() {
     const char* pixelFlipCode =
         "Texture2D t:register(t0);SamplerState s:register(s0);"
         "float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{return t.Sample(s,float2(uv.x,1.0-uv.y));}";
+    const char* pixelMovieCode =
+        "Texture2D t:register(t0);SamplerState s:register(s0);"
+        "float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{"
+        "float2 muv=float2(lerp(0.265,0.735,uv.x), lerp(0.365,0.630,uv.y));"
+        "return t.Sample(s,muv);}";
+    const char* pixelMovieFlipCode =
+        "Texture2D t:register(t0);SamplerState s:register(s0);"
+        "float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{"
+        "float2 muv=float2(lerp(0.265,0.735,uv.x), lerp(0.365,0.630,1.0-uv.y));"
+        "return t.Sample(s,muv);}";
     ID3DBlob* blob = nullptr;
     ID3DBlob* errors = nullptr;
     hr = D3DCompile(vertexCode, std::strlen(vertexCode), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &blob, &errors);
@@ -944,6 +964,16 @@ bool InitD3D() {
     hr = D3DCompile(pixelFlipCode, std::strlen(pixelFlipCode), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &blob, &errors);
     if (FAILED(hr)) { if (errors) errors->Release(); return false; }
     hr = g_device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &g_psFlip);
+    blob->Release();
+    if (FAILED(hr)) return false;
+    hr = D3DCompile(pixelMovieCode, std::strlen(pixelMovieCode), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &blob, &errors);
+    if (FAILED(hr)) { if (errors) errors->Release(); return false; }
+    hr = g_device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &g_psMovie);
+    blob->Release();
+    if (FAILED(hr)) return false;
+    hr = D3DCompile(pixelMovieFlipCode, std::strlen(pixelMovieFlipCode), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &blob, &errors);
+    if (FAILED(hr)) { if (errors) errors->Release(); return false; }
+    hr = g_device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &g_psMovieFlip);
     blob->Release();
     if (FAILED(hr)) return false;
     D3D11_SAMPLER_DESC samplerDesc{};
@@ -1033,34 +1063,49 @@ void Render(ID3D11ShaderResourceView* source, bool flipVertical) {
     const float sourceAspect = g_sourceHeight ? static_cast<float>(g_sourceWidth) / g_sourceHeight : 16.0f / 9.0f;
     const float windowAspect = windowWidth / windowHeight;
     D3D11_VIEWPORT viewport{};
-    if (windowAspect > sourceAspect) {
-        viewport.Height = windowHeight;
-        viewport.Width = windowHeight * sourceAspect;
-        viewport.TopLeftX = (windowWidth - viewport.Width) * 0.5f;
-    } else {
-        viewport.Width = windowWidth;
-        viewport.Height = windowWidth / sourceAspect;
-        viewport.TopLeftY = (windowHeight - viewport.Height) * 0.5f;
-    }
-
     if (g_movieOnly) {
-        const float zoom = 1.80f;
-        const float newWidth = viewport.Width * zoom;
-        const float newHeight = viewport.Height * zoom;
-        viewport.TopLeftX = (windowWidth - newWidth) * 0.5f;
-        viewport.TopLeftY = (windowHeight - newHeight) * 0.5f;
-        viewport.Width = newWidth;
-        viewport.Height = newHeight;
+        // Dedicated Movie Player mode: clean 16:9 presentation, centered, black letterbox/pillarbox borders
+        constexpr float movieAspect = 16.0f / 9.0f;
+        if (windowAspect > movieAspect) {
+            viewport.Height = windowHeight;
+            viewport.Width = windowHeight * movieAspect;
+            viewport.TopLeftX = (windowWidth - viewport.Width) * 0.5f;
+            viewport.TopLeftY = 0.0f;
+        } else {
+            viewport.Width = windowWidth;
+            viewport.Height = windowWidth / movieAspect;
+            viewport.TopLeftX = 0.0f;
+            viewport.TopLeftY = (windowHeight - viewport.Height) * 0.5f;
+        }
+    } else {
+        if (windowAspect > sourceAspect) {
+            viewport.Height = windowHeight;
+            viewport.Width = windowHeight * sourceAspect;
+            viewport.TopLeftX = (windowWidth - viewport.Width) * 0.5f;
+            viewport.TopLeftY = 0.0f;
+        } else {
+            viewport.Width = windowWidth;
+            viewport.Height = windowWidth / sourceAspect;
+            viewport.TopLeftX = 0.0f;
+            viewport.TopLeftY = (windowHeight - viewport.Height) * 0.5f;
+        }
     }
+    g_activeViewport = viewport;
 
-    const float clear[4] = {0.04f, 0.04f, 0.05f, 1.0f};
+    const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
     g_context->ClearRenderTargetView(g_rtv, clear);
     if (source) {
         g_context->RSSetViewports(1, &viewport);
         g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_context->VSSetShader(g_vs, nullptr, 0);
-        g_context->PSSetShader(flipVertical ? g_psFlip : g_ps, nullptr, 0);
+        ID3D11PixelShader* selectedPs = nullptr;
+        if (g_movieOnly) {
+            selectedPs = flipVertical ? g_psMovieFlip : g_psMovie;
+        } else {
+            selectedPs = flipVertical ? g_psFlip : g_ps;
+        }
+        g_context->PSSetShader(selectedPs, nullptr, 0);
         g_context->PSSetSamplers(0, 1, &g_sampler);
         g_context->PSSetShaderResources(0, 1, &source);
         g_context->Draw(3, 0);
@@ -1212,7 +1257,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_cursorX = mx;
             g_cursorY = my;
 
-            if (g_isRightDragging) {
+            if (g_movieOnly) {
+                // Movie Only mode locks look squarely at the screen
+                g_lookYaw = 0.0f;
+                g_lookPitch = 0.0f;
+            } else if (g_isRightDragging) {
                 const float dx = mx - static_cast<float>(g_lastRightPt.x);
                 const float dy = my - static_cast<float>(g_lastRightPt.y);
                 g_lookYaw += dx * 0.003f;
@@ -1220,14 +1269,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_lastRightPt = { static_cast<LONG>(mx), static_cast<LONG>(my) };
             }
 
-            // Map screen coordinates to ray direction for laser pointer
-            const float nx = (mx - winW * 0.5f) / (winW * 0.5f);
-            const float ny = (my - winH * 0.5f) / (winH * 0.5f);
-            const float zoom = g_movieOnly ? 1.8f : 1.0f;
-            const float halfFovH = (45.0f * 3.14159265f / 180.0f) / zoom;
-            const float halfFovV = (28.0f * 3.14159265f / 180.0f) / zoom;
-            g_pointerYaw = -nx * halfFovH;
-            g_pointerPitch = ny * halfFovV;
+            // Map screen coordinates accurately to ray direction within active VR viewport
+            const float vw = g_activeViewport.Width > 0.0f ? g_activeViewport.Width : winW;
+            const float vh = g_activeViewport.Height > 0.0f ? g_activeViewport.Height : winH;
+            const float vx0 = g_activeViewport.Width > 0.0f ? g_activeViewport.TopLeftX : 0.0f;
+            const float vy0 = g_activeViewport.Height > 0.0f ? g_activeViewport.TopLeftY : 0.0f;
+
+            // Normalized screen coordinates within active VR image frustum [-1.0, +1.0]
+            const float u = std::clamp(((mx - vx0) / vw - 0.5f) * 2.0f, -1.0f, 1.0f);
+            const float v = std::clamp((0.5f - (my - vy0) / vh) * 2.0f, -1.0f, 1.0f);
+
+            // OpenVR driver uses GetProjectionRaw tangents = 1.3f horizontally and vertically
+            // In Movie Only mode, the active screen covers 0.470 x 0.265 of the projection space
+            const float fovScaleX = g_movieOnly ? (1.3f * 0.470f) : 1.3f;
+            const float fovScaleY = g_movieOnly ? (1.3f * 0.265f) : 1.3f;
+            g_pointerYaw = -std::atan2(u * fovScaleX, 1.0f);
+            g_pointerPitch = std::atan2(v * fovScaleY * std::cos(g_pointerYaw), 1.0f);
         }
 
         SyncPointerAndLook();
@@ -1279,6 +1336,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             if (inRect(mx, my, g_btnMovieOnlyRect)) {
                 g_movieOnly = true;
+                g_lookYaw = 0.0f;
+                g_lookPitch = 0.0f;
+                SyncPointerAndLook();
                 return 0;
             }
             if (inRect(mx, my, g_btnFullscreenRect)) {
@@ -1441,26 +1501,32 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         }
         CheckFeedStatus();
         ID3D11ShaderResourceView* source = nullptr;
+        bool flipVertical = false;
         if (g_viewSource == ViewSource::ThirdPerson) {
             const bool copied = CopyThirdPersonFrame();
-            if (!copied || !g_thirdSrv || (g_thirdLastFrame && GetTickCount64() - g_thirdLastFrame > 1500)) {
-                g_thirdUnavailable = true;
-                SelectViewSource(ViewSource::FirstPerson);
-            } else {
+            if (copied && g_thirdSrv && (!g_thirdLastFrame || GetTickCount64() - g_thirdLastFrame <= 1500)) {
                 source = g_thirdSrv;
+                flipVertical = true;
+            } else {
+                // Native driver-level 3rd person camera (OpenVR Compositor eye texture with HMD back/up offset)
+                OpenLiveMapping();
+                if (g_state) CopyNewFrame();
+                source = g_localSrv;
+                flipVertical = false;
             }
         }
         if (g_viewSource == ViewSource::FirstPerson) {
             OpenLiveMapping();
             if (g_state) CopyNewFrame();
             source = g_localSrv;
+            flipVertical = false;
         }
         char title[256]{};
-        const char* view = g_viewSource == ViewSource::ThirdPerson ? "THIRD PERSON" : "FIRST PERSON";
-        const char* status = g_thirdUnavailable ? " | Third-person camera unavailable" : "";
-        sprintf_s(title, "Bigscreen Desktop Live Viewer | View: %s | Tab/M=REMOTE  Click=Trigger  RMB=Look%s", view, status);
+        const char* view = g_viewSource == ViewSource::ThirdPerson ? "3RD PERSON" : "1ST PERSON";
+        const char* mode = g_movieOnly ? " | Mode: MOVIE ONLY" : " | Mode: WHOLE THEATER";
+        sprintf_s(title, "Bigscreen Desktop Live Viewer | View: %s%s | Tab/M=REMOTE  Click=Trigger  RMB=Look", view, mode);
         SetWindowTextA(g_hwnd, title);
-        Render(source, g_viewSource == ViewSource::ThirdPerson);
+        Render(source, flipVertical);
         UpdateMetrics();
     }
     ReleaseAll();
