@@ -1568,15 +1568,53 @@ bool InstallDesktopCaptureMidHook(HMODULE hBigSoup) {
     if (!hBigSoup) return false;
 
     uint8_t* base = reinterpret_cast<uint8_t*>(hBigSoup);
-    uint8_t* pTarget = base + 0x8852B;
     const uint8_t expected[17] = {
         0x2B, 0x5F, 0x04,
         0x44, 0x2B, 0x77, 0x08,
         0x48, 0x83, 0xBF, 0x78, 0x01, 0x00, 0x00, 0x00,
         0x75, 0x1B
     };
-    if (std::memcmp(pTarget, expected, 17) != 0) {
+
+    uint8_t* pTarget = nullptr;
+    const uint32_t candidateRvas[2] = { 0x88531u, 0x8852Bu };
+    for (uint32_t rva : candidateRvas) {
+        uint8_t* cand = base + rva;
+        if (cand[0] == 0xFF && cand[1] == 0x25) {
+            return true;
+        }
+        if (std::memcmp(cand, expected, 17) == 0) {
+            pTarget = cand;
+            break;
+        }
+    }
+
+    // Pattern-scan executable sections of BigSoup.dll if minor updates shift the RVA
+    if (!pTarget) {
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                const auto* sec = IMAGE_FIRST_SECTION(nt);
+                for (WORD s = 0; s < nt->FileHeader.NumberOfSections && !pTarget; ++s) {
+                    if ((sec[s].Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+                    const size_t secSize = (std::max)(sec[s].Misc.VirtualSize, sec[s].SizeOfRawData);
+                    if (secSize <= 17) continue;
+                    uint8_t* secStart = base + sec[s].VirtualAddress;
+                    for (size_t i = 0; i <= secSize - 17; ++i) {
+                        if (std::memcmp(secStart + i, expected, 17) == 0) {
+                            pTarget = secStart + i;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!pTarget) {
         return false;
+    }
+    if (pTarget[0] == 0xFF && pTarget[1] == 0x25) {
+        return true;
     }
 
     uint8_t* stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, 256, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));

@@ -1412,11 +1412,13 @@ bool CaptureProjectedWindowFrame() {
 
     if (!EnsureProjectedTexture(static_cast<uint32_t>(cropW), static_cast<uint32_t>(cropH))) return false;
 
-    // Pack cropped rows into g_croppedBits, completely omitting top title bar and borders
+    // Pack cropped rows into g_croppedBits with opaque alpha, omitting top title bar and borders
     for (int y = 0; y < cropH; ++y) {
         const uint32_t* srcRow = static_cast<const uint32_t*>(g_fullWinBitmapBits) + (cropY + y) * g_fullWinWidth + cropX;
         uint32_t* dstRow = g_croppedBits.data() + y * cropW;
-        memcpy(dstRow, srcRow, cropW * sizeof(uint32_t));
+        for (int x = 0; x < cropW; ++x) {
+            dstRow[x] = srcRow[x] | 0xFF000000u;
+        }
     }
 
     if (g_context && g_projectedTexture) {
