@@ -66,8 +66,10 @@ UnityRenderEvent g_originalProcessLocalDesktops = nullptr;
 UnityRenderEvent g_originalProcessPeerDesktops = nullptr;
 uint8_t* g_pTrampolineLocal = nullptr;
 uint8_t* g_pTrampolinePeer = nullptr;
+uint8_t* g_pTrampCaptureMid = nullptr;
 bool g_localHookInstalled = false;
 bool g_peerHookInstalled = false;
+bool g_captureHookInstalled = false;
 
 pfnBigMediaGetVideoTextureId g_pfnMediaGetTexId = nullptr;
 pfnBigMediaGetVideoTextureWidth g_pfnMediaGetWidth = nullptr;
@@ -81,20 +83,36 @@ bool g_mediaHookInstalled = false;
 // --------------------------------------------------------------------------
 HANDLE g_projectedMapping = nullptr;
 bigscreen_projected_video::State* g_projectedState = nullptr;
-ID3D11Texture2D* g_sharedVideoTex = nullptr;
-ID3D11ShaderResourceView* g_sharedVideoSrv = nullptr;
-uint64_t g_currentSharedHandle = 0;
-ID3D11Texture2D* g_blackTex = nullptr;
-ID3D11RenderTargetView* g_blackRtv = nullptr;
-ID3D11ShaderResourceView* g_blackSrv = nullptr;
-uint32_t g_blackMips = 0;
-ID3D11Texture2D* g_routeStagingTex = nullptr;
-ID3D11RenderTargetView* g_routeStagingRtv = nullptr;
-ID3D11ShaderResourceView* g_routeStagingSrv = nullptr;
-uint32_t g_routeStagingW = 0;
-uint32_t g_routeStagingH = 0;
-uint32_t g_routeStagingMips = 0;
-DXGI_FORMAT g_routeStagingFmt = DXGI_FORMAT_UNKNOWN;
+struct RouteBlitContext {
+    ID3D11Device* dev = nullptr;
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11PixelShader* psRgba = nullptr;
+    ID3D11SamplerState* samp = nullptr;
+    ID3D11BlendState* blend = nullptr;
+    ID3D11DepthStencilState* depth = nullptr;
+    ID3D11RasterizerState* raster = nullptr;
+    bool pipelineFailed = false;
+
+    ID3D11Texture2D* sharedTex = nullptr;
+    ID3D11ShaderResourceView* sharedSrv = nullptr;
+    uint64_t sharedHandle = 0;
+
+    ID3D11Texture2D* blackTex = nullptr;
+    ID3D11RenderTargetView* blackRtv = nullptr;
+    ID3D11ShaderResourceView* blackSrv = nullptr;
+    uint32_t blackMips = 0;
+
+    ID3D11Texture2D* stagingTex = nullptr;
+    ID3D11RenderTargetView* stagingRtv = nullptr;
+    ID3D11ShaderResourceView* stagingSrv = nullptr;
+    uint32_t stagingW = 0;
+    uint32_t stagingH = 0;
+    uint32_t stagingMips = 0;
+    DXGI_FORMAT stagingFmt = DXGI_FORMAT_UNKNOWN;
+};
+
+RouteBlitContext g_unityBlitCtx{};
+RouteBlitContext g_capBlitCtx{};
 
 // --------------------------------------------------------------------------
 // Remote Peer / MediaPlayer Movie Isolation State
@@ -794,25 +812,142 @@ void ExportBigMediaPlayerMovie() {
 }
 
 // --------------------------------------------------------------------------
-// Local Desktop Projection Routing
+// Local Desktop & WebRTC Capture Projection Routing
 // --------------------------------------------------------------------------
-void ReleaseBlackTexture() {
-    if (g_blackSrv) { g_blackSrv->Release(); g_blackSrv = nullptr; }
-    if (g_blackRtv) { g_blackRtv->Release(); g_blackRtv = nullptr; }
-    if (g_blackTex) { g_blackTex->Release(); g_blackTex = nullptr; }
-    g_blackMips = 0;
+DXGI_FORMAT ResolveRtvFormat(DXGI_FORMAT fmt) {
+    switch (fmt) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM;
+        default: return fmt;
+    }
 }
 
-bool EnsureBlackTexture(ID3D11Device* pDevice, ID3D11DeviceContext* pContext, const D3D11_TEXTURE2D_DESC& deskDesc) {
+void ReleaseBlitShared(RouteBlitContext& ctx) {
+    if (ctx.sharedSrv) { ctx.sharedSrv->Release(); ctx.sharedSrv = nullptr; }
+    if (ctx.sharedTex) { ctx.sharedTex->Release(); ctx.sharedTex = nullptr; }
+    ctx.sharedHandle = 0;
+}
+
+void ReleaseBlitBlack(RouteBlitContext& ctx) {
+    if (ctx.blackSrv) { ctx.blackSrv->Release(); ctx.blackSrv = nullptr; }
+    if (ctx.blackRtv) { ctx.blackRtv->Release(); ctx.blackRtv = nullptr; }
+    if (ctx.blackTex) { ctx.blackTex->Release(); ctx.blackTex = nullptr; }
+    ctx.blackMips = 0;
+}
+
+void ReleaseBlitStaging(RouteBlitContext& ctx) {
+    if (ctx.stagingSrv) { ctx.stagingSrv->Release(); ctx.stagingSrv = nullptr; }
+    if (ctx.stagingRtv) { ctx.stagingRtv->Release(); ctx.stagingRtv = nullptr; }
+    if (ctx.stagingTex) { ctx.stagingTex->Release(); ctx.stagingTex = nullptr; }
+    ctx.stagingW = 0;
+    ctx.stagingH = 0;
+    ctx.stagingMips = 0;
+    ctx.stagingFmt = DXGI_FORMAT_UNKNOWN;
+}
+
+void ReleaseBlitContext(RouteBlitContext& ctx) {
+    ReleaseBlitShared(ctx);
+    ReleaseBlitBlack(ctx);
+    ReleaseBlitStaging(ctx);
+    if (ctx.raster) { ctx.raster->Release(); ctx.raster = nullptr; }
+    if (ctx.depth) { ctx.depth->Release(); ctx.depth = nullptr; }
+    if (ctx.blend) { ctx.blend->Release(); ctx.blend = nullptr; }
+    if (ctx.samp) { ctx.samp->Release(); ctx.samp = nullptr; }
+    if (ctx.psRgba) { ctx.psRgba->Release(); ctx.psRgba = nullptr; }
+    if (ctx.vs) { ctx.vs->Release(); ctx.vs = nullptr; }
+    if (ctx.dev) { ctx.dev->Release(); ctx.dev = nullptr; }
+    ctx.pipelineFailed = false;
+}
+
+bool EnsureBlitPipeline(RouteBlitContext& ctx, ID3D11Device* pDevice) {
+    if (!pDevice) return false;
+    if (ctx.dev != pDevice) {
+        ReleaseBlitContext(ctx);
+        ctx.dev = pDevice;
+        ctx.dev->AddRef();
+    }
+    if (ctx.pipelineFailed) return false;
+    if (ctx.vs && ctx.psRgba && ctx.samp && ctx.blend && ctx.depth && ctx.raster) return true;
+
+    HMODULE hComp = GetModuleHandleW(L"d3dcompiler_47.dll");
+    if (!hComp) hComp = LoadLibraryW(L"d3dcompiler_47.dll");
+    if (!hComp) { ctx.pipelineFailed = true; return false; }
+
+    auto pD3DCompile = reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(hComp, "D3DCompile"));
+    if (!pD3DCompile) { ctx.pipelineFailed = true; return false; }
+
+    const char* vsCode =
+        "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "VSOut main(uint id : SV_VertexID) {"
+        "  VSOut o;"
+        "  float2 p = float2((id << 1) & 2, id & 2);"
+        "  o.uv = p;"
+        "  o.pos = float4(p * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);"
+        "  return o;"
+        "}";
+
+    const char* psRgbaCode =
+        "Texture2D<float4> texSrc : register(t0);"
+        "SamplerState samp : register(s0);"
+        "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {"
+        "  float4 c = texSrc.Sample(samp, uv);"
+        "  return float4(c.rgb, 1.0);"
+        "}";
+
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* err = nullptr;
+    if (FAILED(pD3DCompile(vsCode, std::strlen(vsCode), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &blob, &err))) {
+        if (err) err->Release();
+        ctx.pipelineFailed = true;
+        return false;
+    }
+    HRESULT hr = pDevice->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &ctx.vs);
+    blob->Release();
+    if (FAILED(hr)) { ctx.pipelineFailed = true; return false; }
+
+    if (FAILED(pD3DCompile(psRgbaCode, std::strlen(psRgbaCode), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &blob, &err))) {
+        if (err) err->Release();
+        ctx.pipelineFailed = true;
+        return false;
+    }
+    hr = pDevice->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &ctx.psRgba);
+    blob->Release();
+    if (FAILED(hr)) { ctx.pipelineFailed = true; return false; }
+
+    D3D11_SAMPLER_DESC sd{};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(pDevice->CreateSamplerState(&sd, &ctx.samp))) { ctx.pipelineFailed = true; return false; }
+
+    D3D11_BLEND_DESC bd{};
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(pDevice->CreateBlendState(&bd, &ctx.blend))) { ctx.pipelineFailed = true; return false; }
+
+    D3D11_DEPTH_STENCIL_DESC dd{};
+    dd.DepthEnable = FALSE;
+    if (FAILED(pDevice->CreateDepthStencilState(&dd, &ctx.depth))) { ctx.pipelineFailed = true; return false; }
+
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    if (FAILED(pDevice->CreateRasterizerState(&rd, &ctx.raster))) { ctx.pipelineFailed = true; return false; }
+
+    return true;
+}
+
+bool EnsureBlitBlackTexture(RouteBlitContext& ctx, ID3D11Device* pDevice, ID3D11DeviceContext* pContext, const D3D11_TEXTURE2D_DESC& deskDesc) {
     UINT targetMips = (std::max)(1u, deskDesc.MipLevels);
-    if (g_blackTex && g_blackRtv) {
+    if (ctx.blackTex && ctx.blackRtv) {
         D3D11_TEXTURE2D_DESC curDesc{};
-        g_blackTex->GetDesc(&curDesc);
+        ctx.blackTex->GetDesc(&curDesc);
         if (curDesc.Width == deskDesc.Width && curDesc.Height == deskDesc.Height &&
-            curDesc.Format == deskDesc.Format && curDesc.MipLevels == g_blackMips) {
+            curDesc.Format == deskDesc.Format && curDesc.MipLevels == ctx.blackMips) {
             return true;
         }
-        ReleaseBlackTexture();
+        ReleaseBlitBlack(ctx);
     }
 
     D3D11_TEXTURE2D_DESC bDesc{};
@@ -826,37 +961,35 @@ bool EnsureBlackTexture(ID3D11Device* pDevice, ID3D11DeviceContext* pContext, co
     bDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     bDesc.MiscFlags = (targetMips > 1) ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
 
-    if (FAILED(pDevice->CreateTexture2D(&bDesc, nullptr, &g_blackTex)) || !g_blackTex) {
+    if (FAILED(pDevice->CreateTexture2D(&bDesc, nullptr, &ctx.blackTex)) || !ctx.blackTex) {
         bDesc.MipLevels = 1;
         bDesc.MiscFlags = 0;
-        if (FAILED(pDevice->CreateTexture2D(&bDesc, nullptr, &g_blackTex)) || !g_blackTex) {
+        if (FAILED(pDevice->CreateTexture2D(&bDesc, nullptr, &ctx.blackTex)) || !ctx.blackTex) {
             return false;
         }
     }
 
     D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
-    rtvDesc.Format = (bDesc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS) ? DXGI_FORMAT_B8G8R8A8_UNORM
-                   : (bDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) ? DXGI_FORMAT_R8G8B8A8_UNORM
-                   : bDesc.Format;
+    rtvDesc.Format = ResolveRtvFormat(bDesc.Format);
     rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-    if (FAILED(pDevice->CreateRenderTargetView(g_blackTex, &rtvDesc, &g_blackRtv)) || !g_blackRtv) {
-        ReleaseBlackTexture();
+    if (FAILED(pDevice->CreateRenderTargetView(ctx.blackTex, &rtvDesc, &ctx.blackRtv)) || !ctx.blackRtv) {
+        ReleaseBlitBlack(ctx);
         return false;
     }
 
     const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    pContext->ClearRenderTargetView(g_blackRtv, black);
+    pContext->ClearRenderTargetView(ctx.blackRtv, black);
     if (bDesc.MipLevels > 1) {
         D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
         srvDesc.Format = rtvDesc.Format;
         srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srvDesc.Texture2D.MipLevels = bDesc.MipLevels;
-        if (SUCCEEDED(pDevice->CreateShaderResourceView(g_blackTex, &srvDesc, &g_blackSrv)) && g_blackSrv) {
-            pContext->GenerateMips(g_blackSrv);
+        if (SUCCEEDED(pDevice->CreateShaderResourceView(ctx.blackTex, &srvDesc, &ctx.blackSrv)) && ctx.blackSrv) {
+            pContext->GenerateMips(ctx.blackSrv);
         }
     }
     pContext->Flush();
-    g_blackMips = bDesc.MipLevels;
+    ctx.blackMips = bDesc.MipLevels;
     return true;
 }
 
@@ -883,35 +1016,15 @@ const bigscreen_projected_video::State* GetProjectedVideoState() {
     return g_projectedState;
 }
 
-DXGI_FORMAT ResolveRtvFormat(DXGI_FORMAT fmt) {
-    switch (fmt) {
-        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
-        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
-        case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM;
-        default: return fmt;
-    }
-}
-
-void ReleaseRouteStaging() {
-    if (g_routeStagingSrv) { g_routeStagingSrv->Release(); g_routeStagingSrv = nullptr; }
-    if (g_routeStagingRtv) { g_routeStagingRtv->Release(); g_routeStagingRtv = nullptr; }
-    if (g_routeStagingTex) { g_routeStagingTex->Release(); g_routeStagingTex = nullptr; }
-    g_routeStagingW = 0;
-    g_routeStagingH = 0;
-    g_routeStagingMips = 0;
-    g_routeStagingFmt = DXGI_FORMAT_UNKNOWN;
-}
-
-bool EnsureRouteStaging(ID3D11Device* pDevice, uint32_t w, uint32_t h, uint32_t mips, DXGI_FORMAT fmt) {
-    if (!pDevice || w == 0 || h == 0) return false;
-    if (!EnsurePeerPipeline(pDevice)) return false;
+bool EnsureBlitStaging(RouteBlitContext& ctx, ID3D11Device* pDevice, uint32_t w, uint32_t h, uint32_t mips, DXGI_FORMAT fmt) {
+    if (!EnsureBlitPipeline(ctx, pDevice) || w == 0 || h == 0) return false;
     UINT targetMips = (std::max)(1u, mips);
-    if (g_routeStagingTex && g_routeStagingRtv &&
-        g_routeStagingW == w && g_routeStagingH == h &&
-        (g_routeStagingMips == targetMips || g_routeStagingMips == 1) && g_routeStagingFmt == fmt) {
+    if (ctx.stagingTex && ctx.stagingRtv &&
+        ctx.stagingW == w && ctx.stagingH == h &&
+        (ctx.stagingMips == targetMips || ctx.stagingMips == 1) && ctx.stagingFmt == fmt) {
         return true;
     }
-    ReleaseRouteStaging();
+    ReleaseBlitStaging(ctx);
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = w;
@@ -924,18 +1037,18 @@ bool EnsureRouteStaging(ID3D11Device* pDevice, uint32_t w, uint32_t h, uint32_t 
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     td.MiscFlags = (targetMips > 1) ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
 
-    if (FAILED(pDevice->CreateTexture2D(&td, nullptr, &g_routeStagingTex)) || !g_routeStagingTex) {
+    if (FAILED(pDevice->CreateTexture2D(&td, nullptr, &ctx.stagingTex)) || !ctx.stagingTex) {
         td.MipLevels = 1;
         td.MiscFlags = 0;
-        if (FAILED(pDevice->CreateTexture2D(&td, nullptr, &g_routeStagingTex)) || !g_routeStagingTex) {
+        if (FAILED(pDevice->CreateTexture2D(&td, nullptr, &ctx.stagingTex)) || !ctx.stagingTex) {
             return false;
         }
     }
     D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
     rtvDesc.Format = ResolveRtvFormat(fmt);
     rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-    if (FAILED(pDevice->CreateRenderTargetView(g_routeStagingTex, &rtvDesc, &g_routeStagingRtv)) || !g_routeStagingRtv) {
-        ReleaseRouteStaging();
+    if (FAILED(pDevice->CreateRenderTargetView(ctx.stagingTex, &rtvDesc, &ctx.stagingRtv)) || !ctx.stagingRtv) {
+        ReleaseBlitStaging(ctx);
         return false;
     }
     if (td.MipLevels > 1) {
@@ -943,41 +1056,41 @@ bool EnsureRouteStaging(ID3D11Device* pDevice, uint32_t w, uint32_t h, uint32_t 
         srvDesc.Format = rtvDesc.Format;
         srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srvDesc.Texture2D.MipLevels = td.MipLevels;
-        pDevice->CreateShaderResourceView(g_routeStagingTex, &srvDesc, &g_routeStagingSrv);
+        pDevice->CreateShaderResourceView(ctx.stagingTex, &srvDesc, &ctx.stagingSrv);
     }
-    g_routeStagingW = w;
-    g_routeStagingH = h;
-    g_routeStagingMips = td.MipLevels;
-    g_routeStagingFmt = fmt;
+    ctx.stagingW = w;
+    ctx.stagingH = h;
+    ctx.stagingMips = td.MipLevels;
+    ctx.stagingFmt = fmt;
     return true;
 }
 
-bool BlitSharedVideoToDesktop(ID3D11Device* pDevice, ID3D11DeviceContext* pContext,
-                              ID3D11Texture2D* pDesktopTex, const D3D11_TEXTURE2D_DESC& deskDesc,
-                              ID3D11Texture2D* pSharedTex) {
-    if (!pDevice || !pContext || !pDesktopTex || !pSharedTex) return false;
+bool BlitSharedVideoToTex(RouteBlitContext& ctx, ID3D11Device* pDevice, ID3D11DeviceContext* pContext,
+                          ID3D11Texture2D* pDstTex, const D3D11_TEXTURE2D_DESC& dstDesc,
+                          ID3D11Texture2D* pSharedTex) {
+    if (!pDevice || !pContext || !pDstTex || !pSharedTex) return false;
 
     D3D11_TEXTURE2D_DESC vidDesc{};
     pSharedTex->GetDesc(&vidDesc);
 
-    if (vidDesc.Width == deskDesc.Width && vidDesc.Height == deskDesc.Height &&
-        vidDesc.Format == deskDesc.Format && vidDesc.MipLevels == deskDesc.MipLevels &&
-        vidDesc.ArraySize == deskDesc.ArraySize && vidDesc.SampleDesc.Count == deskDesc.SampleDesc.Count) {
-        pContext->CopyResource(pDesktopTex, pSharedTex);
+    if (vidDesc.Width == dstDesc.Width && vidDesc.Height == dstDesc.Height &&
+        vidDesc.Format == dstDesc.Format && vidDesc.MipLevels == dstDesc.MipLevels &&
+        vidDesc.ArraySize == dstDesc.ArraySize && vidDesc.SampleDesc.Count == dstDesc.SampleDesc.Count) {
+        pContext->CopyResource(pDstTex, pSharedTex);
         return true;
     }
 
-    if (!g_sharedVideoSrv) {
+    if (!ctx.sharedSrv) {
         D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
         srvDesc.Format = ResolveRtvFormat(vidDesc.Format);
         srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srvDesc.Texture2D.MipLevels = 1;
-        if (FAILED(pDevice->CreateShaderResourceView(pSharedTex, &srvDesc, &g_sharedVideoSrv)) || !g_sharedVideoSrv) {
+        if (FAILED(pDevice->CreateShaderResourceView(pSharedTex, &srvDesc, &ctx.sharedSrv)) || !ctx.sharedSrv) {
             return false;
         }
     }
 
-    if (!EnsureRouteStaging(pDevice, deskDesc.Width, deskDesc.Height, deskDesc.MipLevels, deskDesc.Format)) {
+    if (!EnsureBlitStaging(ctx, pDevice, dstDesc.Width, dstDesc.Height, dstDesc.MipLevels, dstDesc.Format)) {
         return false;
     }
 
@@ -985,20 +1098,20 @@ bool BlitSharedVideoToDesktop(ID3D11Device* pDevice, ID3D11DeviceContext* pConte
     saved.Save(pContext);
 
     const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    pContext->ClearRenderTargetView(g_routeStagingRtv, black);
+    pContext->ClearRenderTargetView(ctx.stagingRtv, black);
 
-    D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(deskDesc.Width), static_cast<float>(deskDesc.Height), 0.0f, 1.0f };
-    pContext->OMSetRenderTargets(1, &g_routeStagingRtv, nullptr);
+    D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(dstDesc.Width), static_cast<float>(dstDesc.Height), 0.0f, 1.0f };
+    pContext->OMSetRenderTargets(1, &ctx.stagingRtv, nullptr);
     pContext->RSSetViewports(1, &vp);
     pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     pContext->IASetInputLayout(nullptr);
-    pContext->VSSetShader(g_peerVs, nullptr, 0);
-    pContext->PSSetShader(g_peerPsRgba, nullptr, 0);
-    pContext->PSSetShaderResources(0, 1, &g_sharedVideoSrv);
-    pContext->PSSetSamplers(0, 1, &g_peerSampler);
-    pContext->OMSetBlendState(g_peerBlend, nullptr, 0xFFFFFFFF);
-    pContext->OMSetDepthStencilState(g_peerDepth, 0);
-    pContext->RSSetState(g_peerRaster);
+    pContext->VSSetShader(ctx.vs, nullptr, 0);
+    pContext->PSSetShader(ctx.psRgba, nullptr, 0);
+    pContext->PSSetShaderResources(0, 1, &ctx.sharedSrv);
+    pContext->PSSetSamplers(0, 1, &ctx.samp);
+    pContext->OMSetBlendState(ctx.blend, nullptr, 0xFFFFFFFF);
+    pContext->OMSetDepthStencilState(ctx.depth, 0);
+    pContext->RSSetState(ctx.raster);
     pContext->Draw(3, 0);
 
     ID3D11ShaderResourceView* nullSrv = nullptr;
@@ -1006,16 +1119,69 @@ bool BlitSharedVideoToDesktop(ID3D11Device* pDevice, ID3D11DeviceContext* pConte
     ID3D11RenderTargetView* nullRtv = nullptr;
     pContext->OMSetRenderTargets(1, &nullRtv, nullptr);
 
-    if (g_routeStagingMips == deskDesc.MipLevels && g_routeStagingSrv) {
-        pContext->GenerateMips(g_routeStagingSrv);
-        pContext->CopyResource(pDesktopTex, g_routeStagingTex);
+    if (ctx.stagingMips == dstDesc.MipLevels && ctx.stagingSrv) {
+        pContext->GenerateMips(ctx.stagingSrv);
+        pContext->CopyResource(pDstTex, ctx.stagingTex);
     } else {
-        pContext->CopySubresourceRegion(pDesktopTex, 0, 0, 0, 0, g_routeStagingTex, 0, nullptr);
+        pContext->CopySubresourceRegion(pDstTex, 0, 0, 0, 0, ctx.stagingTex, 0, nullptr);
     }
     pContext->Flush();
 
     saved.Restore(pContext);
     return true;
+}
+
+bool RouteIntoTargetTexture(RouteBlitContext& ctx, ID3D11Device* pDevice, ID3D11DeviceContext* pContext,
+                            ID3D11Texture2D* pDstTex, const bigscreen_projected_video::State& state,
+                            bool updateDiag) {
+    if (!pDevice || !pContext || !pDstTex) return false;
+    D3D11_TEXTURE2D_DESC dstDesc{};
+    pDstTex->GetDesc(&dstDesc);
+    if (updateDiag && g_projectedState) {
+        g_projectedState->diagDeskFmt = static_cast<uint32_t>(dstDesc.Format);
+    }
+
+    if (state.active && state.sharedHandle) {
+        if (ctx.dev != pDevice) {
+            ReleaseBlitContext(ctx);
+            ctx.dev = pDevice;
+            ctx.dev->AddRef();
+        }
+        if (!ctx.sharedTex || ctx.sharedHandle != state.sharedHandle) {
+            ReleaseBlitShared(ctx);
+            HRESULT hr = pDevice->OpenSharedResource(reinterpret_cast<HANDLE>(state.sharedHandle), IID_PPV_ARGS(&ctx.sharedTex));
+            if (updateDiag && g_projectedState) {
+                g_projectedState->diagOpenHr = static_cast<int32_t>(hr);
+            }
+            if (SUCCEEDED(hr) && ctx.sharedTex) {
+                ctx.sharedHandle = state.sharedHandle;
+            }
+        }
+        if (ctx.sharedTex) {
+            D3D11_TEXTURE2D_DESC vidDesc{};
+            ctx.sharedTex->GetDesc(&vidDesc);
+            if (updateDiag && g_projectedState) {
+                g_projectedState->diagVidFmt = static_cast<uint32_t>(vidDesc.Format);
+            }
+            if (BlitSharedVideoToTex(ctx, pDevice, pContext, pDstTex, dstDesc, ctx.sharedTex)) {
+                if (updateDiag && g_projectedState) {
+                    ++g_projectedState->diagCopiedCount;
+                }
+                return true;
+            }
+        }
+    } else if (state.privacyMode) {
+        if (!EnsureBlitPipeline(ctx, pDevice)) return false;
+        if (EnsureBlitBlackTexture(ctx, pDevice, pContext, dstDesc) && ctx.blackTex) {
+            if (ctx.blackMips == dstDesc.MipLevels) {
+                pContext->CopyResource(pDstTex, ctx.blackTex);
+            } else {
+                pContext->CopySubresourceRegion(pDstTex, 0, 0, 0, 0, ctx.blackTex, 0, nullptr);
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 ID3D11Texture2D* ResolveDesktopTexture2D(void* nativePtr) {
@@ -1045,14 +1211,12 @@ void RouteDesktopTexture() {
     }
 
     if (g_projectedState) {
-        g_projectedState->diagHookLocal = g_localHookInstalled ? 1u : 0u;
+        g_projectedState->diagHookLocal = (g_localHookInstalled ? 1u : 0u) | (g_captureHookInstalled ? 2u : 0u);
     }
 
     const auto state = *pState;
     if (!state.active && !state.privacyMode) {
-        if (g_sharedVideoSrv) { g_sharedVideoSrv->Release(); g_sharedVideoSrv = nullptr; }
-        if (g_sharedVideoTex) { g_sharedVideoTex->Release(); g_sharedVideoTex = nullptr; }
-        g_currentSharedHandle = 0;
+        ReleaseBlitShared(g_unityBlitCtx);
         return;
     }
 
@@ -1080,52 +1244,37 @@ void RouteDesktopTexture() {
         return;
     }
 
-    D3D11_TEXTURE2D_DESC deskDesc{};
-    pDesktopTex->GetDesc(&deskDesc);
     if (g_projectedState) {
         g_projectedState->diagDesktopCount = 1;
-        g_projectedState->diagDeskFmt = static_cast<uint32_t>(deskDesc.Format);
     }
-
-    if (state.active && state.sharedHandle) {
-        if (!g_sharedVideoTex || g_currentSharedHandle != state.sharedHandle) {
-            if (g_sharedVideoSrv) { g_sharedVideoSrv->Release(); g_sharedVideoSrv = nullptr; }
-            if (g_sharedVideoTex) { g_sharedVideoTex->Release(); g_sharedVideoTex = nullptr; }
-            g_currentSharedHandle = 0;
-            HRESULT hr = pDevice->OpenSharedResource(reinterpret_cast<HANDLE>(state.sharedHandle), IID_PPV_ARGS(&g_sharedVideoTex));
-            if (g_projectedState) {
-                g_projectedState->diagOpenHr = static_cast<int32_t>(hr);
-            }
-            if (SUCCEEDED(hr) && g_sharedVideoTex) {
-                g_currentSharedHandle = state.sharedHandle;
-            }
-        }
-
-        if (g_sharedVideoTex) {
-            D3D11_TEXTURE2D_DESC vidDesc{};
-            g_sharedVideoTex->GetDesc(&vidDesc);
-            if (g_projectedState) {
-                g_projectedState->diagVidFmt = static_cast<uint32_t>(vidDesc.Format);
-            }
-            if (BlitSharedVideoToDesktop(pDevice, pContext, pDesktopTex, deskDesc, g_sharedVideoTex)) {
-                if (g_projectedState) {
-                    ++g_projectedState->diagCopiedCount;
-                }
-            }
-        }
-    } else if (state.privacyMode) {
-        if (EnsureBlackTexture(pDevice, pContext, deskDesc) && g_blackTex) {
-            if (g_blackMips == deskDesc.MipLevels) {
-                pContext->CopyResource(pDesktopTex, g_blackTex);
-            } else {
-                pContext->CopySubresourceRegion(pDesktopTex, 0, 0, 0, 0, g_blackTex, 0, nullptr);
-            }
-        }
-    }
+    RouteIntoTargetTexture(g_unityBlitCtx, pDevice, pContext, pDesktopTex, state, true);
 
     pContext->Release();
     pDevice->Release();
     pDesktopTex->Release();
+}
+
+void __stdcall OnDesktopCaptureHook(void* captureThis) {
+    if (!captureThis) return;
+    const auto* pState = GetProjectedVideoState();
+    if (!pState) return;
+    const auto state = *pState;
+    if (!state.active && !state.privacyMode) {
+        ReleaseBlitShared(g_capBlitCtx);
+        return;
+    }
+
+    const auto* base = reinterpret_cast<const uint8_t*>(captureThis);
+    ID3D11Device* pDevice = *reinterpret_cast<ID3D11Device* const*>(base + 0x58);
+    ID3D11DeviceContext* pContext = *reinterpret_cast<ID3D11DeviceContext* const*>(base + 0x60);
+    void* rawCaptureTex = *reinterpret_cast<void* const*>(base + 0xD8);
+    if (!pDevice || !pContext || !rawCaptureTex) return;
+
+    ID3D11Texture2D* pCaptureTex = ResolveDesktopTexture2D(rawCaptureTex);
+    if (!pCaptureTex) return;
+
+    RouteIntoTargetTexture(g_capBlitCtx, pDevice, pContext, pCaptureTex, state, false);
+    pCaptureTex->Release();
 }
 
 // --------------------------------------------------------------------------
@@ -1278,6 +1427,89 @@ void TryInstallMediaHook() {
     }
 }
 
+bool InstallDesktopCaptureMidHook(HMODULE hBigSoup) {
+    if (g_captureHookInstalled) return true;
+    if (!hBigSoup) return false;
+
+    uint8_t* base = reinterpret_cast<uint8_t*>(hBigSoup);
+    uint8_t* pTarget = base + 0x8852B;
+    const uint8_t expected[17] = {
+        0x2B, 0x5F, 0x04,
+        0x44, 0x2B, 0x77, 0x08,
+        0x48, 0x83, 0xBF, 0x78, 0x01, 0x00, 0x00, 0x00,
+        0x75, 0x1B
+    };
+    if (std::memcmp(pTarget, expected, 17) != 0) {
+        return false;
+    }
+
+    uint8_t* stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, 256, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!stub) return false;
+
+    size_t k = 0;
+    stub[k++] = 0x9C; // pushfq
+    stub[k++] = 0x50; // push rax
+    stub[k++] = 0x51; // push rcx
+    stub[k++] = 0x52; // push rdx
+    stub[k++] = 0x41; stub[k++] = 0x50; // push r8
+    stub[k++] = 0x41; stub[k++] = 0x51; // push r9
+    stub[k++] = 0x41; stub[k++] = 0x52; // push r10
+    stub[k++] = 0x41; stub[k++] = 0x53; // push r11
+    stub[k++] = 0x55; // push rbp
+    stub[k++] = 0x48; stub[k++] = 0x89; stub[k++] = 0xE5; // mov rbp, rsp
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xE4; stub[k++] = 0xF0; // and rsp, -16
+    stub[k++] = 0x48; stub[k++] = 0x81; stub[k++] = 0xEC;
+    *reinterpret_cast<uint32_t*>(stub + k) = 0x80; k += 4; // sub rsp, 0x80
+    for (uint8_t reg = 0; reg < 6; ++reg) {
+        stub[k++] = 0x0F; stub[k++] = 0x11;
+        stub[k++] = static_cast<uint8_t>(0x44 | (reg << 3));
+        stub[k++] = 0x24;
+        stub[k++] = static_cast<uint8_t>(0x20 + reg * 0x10); // movups [rsp+0x20+16*reg], xmm_reg
+    }
+    stub[k++] = 0x48; stub[k++] = 0x89; stub[k++] = 0xF9; // mov rcx, rdi
+    stub[k++] = 0x48; stub[k++] = 0xB8;
+    *reinterpret_cast<uint64_t*>(stub + k) = reinterpret_cast<uint64_t>(OnDesktopCaptureHook); k += 8;
+    stub[k++] = 0xFF; stub[k++] = 0xD0; // call rax
+    for (int reg = 5; reg >= 0; --reg) {
+        stub[k++] = 0x0F; stub[k++] = 0x10;
+        stub[k++] = static_cast<uint8_t>(0x44 | (reg << 3));
+        stub[k++] = 0x24;
+        stub[k++] = static_cast<uint8_t>(0x20 + reg * 0x10); // movups xmm_reg, [rsp+0x20+16*reg]
+    }
+    stub[k++] = 0x48; stub[k++] = 0x89; stub[k++] = 0xEC; // mov rsp, rbp
+    stub[k++] = 0x5D; // pop rbp
+    stub[k++] = 0x41; stub[k++] = 0x5B; // pop r11
+    stub[k++] = 0x41; stub[k++] = 0x5A; // pop r10
+    stub[k++] = 0x41; stub[k++] = 0x59; // pop r9
+    stub[k++] = 0x41; stub[k++] = 0x58; // pop r8
+    stub[k++] = 0x5A; // pop rdx
+    stub[k++] = 0x59; // pop rcx
+    stub[k++] = 0x58; // pop rax
+    stub[k++] = 0x9D; // popfq
+
+    // Execute 15 stolen bytes cleanly before jumping back to pTarget + 15
+    std::memcpy(stub + k, expected, 15);
+    k += 15;
+    stub[k++] = 0xFF; stub[k++] = 0x25;
+    *reinterpret_cast<uint32_t*>(stub + k) = 0; k += 4;
+    *reinterpret_cast<uint64_t*>(stub + k) = reinterpret_cast<uint64_t>(pTarget + 15); k += 8;
+    FlushInstructionCache(GetCurrentProcess(), stub, 256);
+
+    g_pTrampCaptureMid = stub;
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(pTarget, 15, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        return false;
+    }
+    pTarget[0] = 0xFF; pTarget[1] = 0x25;
+    *reinterpret_cast<uint32_t*>(pTarget + 2) = 0;
+    *reinterpret_cast<uint64_t*>(pTarget + 6) = reinterpret_cast<uint64_t>(stub);
+    pTarget[14] = 0x90;
+    DWORD tmp = 0;
+    VirtualProtect(pTarget, 15, oldProtect, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), pTarget, 15);
+    return true;
+}
+
 bool InstallHookInternal(HMODULE hBigSoup) {
     if (!hBigSoup) return false;
 
@@ -1311,6 +1543,10 @@ bool InstallHookInternal(HMODULE hBigSoup) {
                 &g_pTrampolinePeer,
                 &g_originalProcessPeerDesktops);
         }
+    }
+
+    if (!g_captureHookInstalled) {
+        g_captureHookInstalled = InstallDesktopCaptureMidHook(hBigSoup);
     }
 
     TryInstallMediaHook();
@@ -1925,7 +2161,7 @@ DWORD WINAPI HookInitThread(LPVOID) {
         }
         TryInstallMediaHook();
         TryInstallAppTickHook();
-        if (g_localHookInstalled && g_peerHookInstalled && g_mediaHookInstalled && g_appTickHookInstalled) break;
+        if (g_localHookInstalled && g_peerHookInstalled && g_captureHookInstalled && g_mediaHookInstalled && g_appTickHookInstalled) break;
         Sleep(i < 120 ? 250 : 2000);
     }
     return 0;
@@ -2000,12 +2236,11 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
 
         if (g_projectedState) { UnmapViewOfFile(g_projectedState); g_projectedState = nullptr; }
         if (g_projectedMapping) { CloseHandle(g_projectedMapping); g_projectedMapping = nullptr; }
-        if (g_sharedVideoSrv) { g_sharedVideoSrv->Release(); g_sharedVideoSrv = nullptr; }
-        if (g_sharedVideoTex) { g_sharedVideoTex->Release(); g_sharedVideoTex = nullptr; }
-        ReleaseRouteStaging();
-        ReleaseBlackTexture();
+        ReleaseBlitContext(g_unityBlitCtx);
+        ReleaseBlitContext(g_capBlitCtx);
         if (g_pTrampolineLocal) { VirtualFree(g_pTrampolineLocal, 0, MEM_RELEASE); g_pTrampolineLocal = nullptr; }
         if (g_pTrampolinePeer) { VirtualFree(g_pTrampolinePeer, 0, MEM_RELEASE); g_pTrampolinePeer = nullptr; }
+        if (g_pTrampCaptureMid) { VirtualFree(g_pTrampCaptureMid, 0, MEM_RELEASE); g_pTrampCaptureMid = nullptr; }
         if (g_pTrampolineMedia) { VirtualFree(g_pTrampolineMedia, 0, MEM_RELEASE); g_pTrampolineMedia = nullptr; }
         if (g_pTrampolineAppTick) { VirtualFree(g_pTrampolineAppTick, 0, MEM_RELEASE); g_pTrampolineAppTick = nullptr; }
         if (g_pTrampMonitorSet) { VirtualFree(g_pTrampMonitorSet, 0, MEM_RELEASE); g_pTrampMonitorSet = nullptr; }
