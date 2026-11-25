@@ -33,7 +33,7 @@ struct State {
     uint32_t roomHookReady;      // 1 once IL2CPP App.Tick hook is active in Bigscreen.exe
     uint32_t inOwnRoom;          // 1 if user is in solo/own room, 0 if in another user's room or lobby
     uint32_t isLoadingRoom;      // 1 if Bigscreen is currently transitioning rooms/scenes
-    uint32_t pad0;
+    uint32_t roomChangeSeq;      // Incremented whenever Bigscreen switches Room instances
     uint64_t handledOwnRoomSeq;  // Last requestOwnRoomSeq processed by Bigscreen.exe
     uint32_t micMuted;           // 1 if Bigscreen local mic is muted, 0 if unmuted (default)
     uint32_t allMuted;           // 1 if Bigscreen Mute All is active, 0 otherwise

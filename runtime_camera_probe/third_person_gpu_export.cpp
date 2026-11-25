@@ -315,6 +315,8 @@ uint64_t g_handledMicToggleSeq = 0;
 uint64_t g_handledMuteAllToggleSeq = 0;
 ULONGLONG g_lastRoomPollMs = 0;
 ULONGLONG g_lastLeaveRoomMs = 0;
+const void* g_lastRoomPtr = nullptr;
+uint32_t g_roomChangeSeq = 0;
 
 struct alignas(16) PeerNv12Cb {
     float yUseAlpha;
@@ -1764,6 +1766,10 @@ void OnAppTickMainThread(void* pApp) {
         void* exc = nullptr;
         void* pRoom = g_mGetCurrentRoom ? g_il2cppInvoke(g_mGetCurrentRoom, pApp, nullptr, &exc) : nullptr;
         if (!exc && pRoom) {
+            if (g_lastRoomPtr != nullptr && g_lastRoomPtr != pRoom) {
+                ++g_roomChangeSeq;
+            }
+            g_lastRoomPtr = pRoom;
             const bool isSinglePlayer = InvokeBoolGetter(g_mGetIsSinglePlayer, pRoom, false);
             const bool isOwner = InvokeBoolGetter(g_mGetIsLocalUserOwner, pRoom, false);
             const bool inLobby = InvokeBoolGetter(g_mInLobby, pRoom, false);
@@ -1920,6 +1926,7 @@ void OnAppTickMainThread(void* pApp) {
         g_peerState->roomHookReady = 1;
         g_peerState->inOwnRoom = inOwnRoom ? 1 : 0;
         g_peerState->isLoadingRoom = isLoading ? 1 : 0;
+        g_peerState->roomChangeSeq = g_roomChangeSeq;
         g_peerState->handledOwnRoomSeq = g_handledOwnRoomSeq;
         g_peerState->micMuted = micMuted ? 1 : 0;
         g_peerState->allMuted = allMuted ? 1 : 0;

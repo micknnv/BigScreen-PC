@@ -241,8 +241,6 @@ bool g_btnSystemDown = false;
 bool g_zoomMode = false;            // D-Pad mode: false = Panning (default), true = Zoom
 bool g_infoPanelOpen = false;       // Astroslide-style LCD Info slide-out state
 float g_infoSlideProgress = 0.0f;   // 0.0 (retracted) -> 1.0 (extended to left)
-float g_infoScrollY = 0.0f;
-float g_infoMaxScrollY = 0.0f;
 D2D1_RECT_F g_infoPanelRect{};
 
 inline bool PointInRectF(float x, float y, const D2D1_RECT_F& r) {
@@ -1534,7 +1532,6 @@ void ResetLook() {
 void ToggleInfoSlideOut() {
     g_infoPanelOpen = !g_infoPanelOpen;
     if (g_infoPanelOpen) {
-        g_infoScrollY = 0.0f;
         SetLcdNotification(L"INFO SCREEN", L"SLID OUT LEFT", 2500);
     } else {
         SetLcdNotification(L"INFO SCREEN", L"RETRACTED", 2000);
@@ -1542,17 +1539,6 @@ void ToggleInfoSlideOut() {
 }
 
 void ExecuteRemoteDpadStep(RemoteBtn btn, bool updateLcd = true) {
-    if (g_infoPanelOpen) {
-        if (btn == RemoteBtn::DpadUp) {
-            g_infoScrollY = (std::max)(0.0f, g_infoScrollY - 34.0f);
-            if (updateLcd) SetLcdNotification(L"SCROLL INFO UP", L"", 1000);
-        } else if (btn == RemoteBtn::DpadDown) {
-            g_infoScrollY = (std::min)(g_infoMaxScrollY, g_infoScrollY + 34.0f);
-            if (updateLcd) SetLcdNotification(L"SCROLL INFO DOWN", L"", 1000);
-        }
-        return;
-    }
-
     if (g_movieOnly) return;
 
     if (g_zoomMode) {
@@ -3227,8 +3213,8 @@ bool InitD2D() {
     }
 
     g_dwriteFactory->CreateTextFormat(
-        L"Consolas", nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"en-us", &g_textFormatInfoHdr);
+        L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 12.5f, L"en-us", &g_textFormatInfoHdr);
     if (g_textFormatInfoHdr) {
         g_textFormatInfoHdr->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         g_textFormatInfoHdr->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -3236,7 +3222,7 @@ bool InitD2D() {
 
     g_dwriteFactory->CreateTextFormat(
         L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, 10.6f, L"en-us", &g_textFormatInfoBody);
+        DWRITE_FONT_STRETCH_NORMAL, 11.8f, L"en-us", &g_textFormatInfoBody);
     if (g_textFormatInfoBody) {
         g_textFormatInfoBody->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         g_textFormatInfoBody->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
@@ -3247,27 +3233,110 @@ bool InitD2D() {
 }
 
 void DrawTriggerPill(float windowWidth) {
-    const float pillWidth = 120.0f;
-    const float pillHeight = 34.0f;
-    g_pillRect = D2D1::RectF(windowWidth - pillWidth - 18.0f, 16.0f, windowWidth - 18.0f, 16.0f + pillHeight);
-    
-    D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(g_pillRect, 17.0f, 17.0f);
-    ID2D1SolidColorBrush* bgBrush = g_pillHovered ? g_brushBtnHoverBg : g_brushPanelBg;
-    ID2D1SolidColorBrush* borderBrush = g_pillHovered ? g_brushAccent : g_brushPanelBorder;
-    
-    g_d2dRenderTarget->FillRoundedRectangle(&rounded, bgBrush);
-    g_d2dRenderTarget->DrawRoundedRectangle(&rounded, borderBrush, 1.2f);
-    
-    const D2D1_ELLIPSE dot = D2D1::Ellipse(
-        D2D1::Point2F(g_pillRect.left + 22.0f, (g_pillRect.top + g_pillRect.bottom) * 0.5f),
-        4.0f, 4.0f);
-    g_d2dRenderTarget->FillEllipse(&dot, g_brushAccent);
+    const float btnSize = 38.0f;
+    g_pillRect = D2D1::RectF(windowWidth - btnSize - 16.0f, 16.0f, windowWidth - 16.0f, 16.0f + btnSize);
 
-    const wchar_t* pillText = L"REMOTE";
-    D2D1_RECT_F textRect = D2D1::RectF(g_pillRect.left + 28.0f, g_pillRect.top, g_pillRect.right - 10.0f, g_pillRect.bottom);
-    g_d2dRenderTarget->DrawText(
-        pillText, static_cast<UINT32>(wcslen(pillText)),
-        g_textFormatPill, &textRect, g_brushTextWhite);
+    const float cx = (g_pillRect.left + g_pillRect.right) * 0.5f;
+    const float cy = (g_pillRect.top + g_pillRect.bottom) * 0.5f;
+    const float radius = btnSize * 0.5f;
+
+    // Subtle dark circular backdrop so the Cyan remote icon stays clear over bright scenes
+    D2D1_ELLIPSE outerCircle = D2D1::Ellipse(D2D1::Point2F(cx, cy), radius, radius);
+    ID2D1SolidColorBrush* bgBrush = g_pillHovered ? g_brushRemoteBtnHover : g_brushLcdBg;
+    g_d2dRenderTarget->FillEllipse(&outerCircle, bgBrush);
+    g_d2dRenderTarget->DrawEllipse(&outerCircle, g_brushRemoteCyan, g_pillHovered ? 2.1f : 1.5f);
+
+    const float stroke = g_pillHovered ? 1.55f : 1.35f;
+
+    // Two concentric IR signal arcs above remote top nub (matching reference icon)
+    if (g_d2dFactory) {
+        const float waveOriginY = cy - 4.8f;
+        const float arcRadii[2] = { 4.2f, 7.6f };
+        for (float rArc : arcRadii) {
+            ID2D1PathGeometry* waveGeo = nullptr;
+            if (SUCCEEDED(g_d2dFactory->CreatePathGeometry(&waveGeo)) && waveGeo) {
+                ID2D1GeometrySink* sink = nullptr;
+                if (SUCCEEDED(waveGeo->Open(&sink)) && sink) {
+                    const float dx = rArc * 0.64f;
+                    const float dy = rArc * 0.77f;
+                    sink->BeginFigure(D2D1::Point2F(cx - dx, waveOriginY - dy), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(cx + dx, waveOriginY - dy),
+                        D2D1::SizeF(rArc, rArc), 0.0f,
+                        D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                    sink->Close();
+                    sink->Release();
+                    g_d2dRenderTarget->DrawGeometry(waveGeo, g_brushRemoteCyan, stroke);
+                }
+                waveGeo->Release();
+            }
+        }
+
+        // Small IR emitter half-dome nub on top of remote casing
+        ID2D1PathGeometry* nubGeo = nullptr;
+        if (SUCCEEDED(g_d2dFactory->CreatePathGeometry(&nubGeo)) && nubGeo) {
+            ID2D1GeometrySink* sink = nullptr;
+            if (SUCCEEDED(nubGeo->Open(&sink)) && sink) {
+                sink->BeginFigure(D2D1::Point2F(cx - 2.0f, waveOriginY), D2D1_FIGURE_BEGIN_HOLLOW);
+                sink->AddArc(D2D1::ArcSegment(
+                    D2D1::Point2F(cx + 2.0f, waveOriginY),
+                    D2D1::SizeF(2.0f, 2.0f), 0.0f,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                sink->Close();
+                sink->Release();
+                g_d2dRenderTarget->DrawGeometry(nubGeo, g_brushRemoteCyan, stroke);
+            }
+            nubGeo->Release();
+        }
+
+        // Minimalist vertical remote body: slight top corner radius, rounded U-shaped bottom
+        const float rLeft = cx - 6.0f;
+        const float rRight = cx + 6.0f;
+        const float rTop = cy - 4.6f;
+        const float rBot = cy + 12.2f;
+        const float topR = 1.6f;
+        const float botR = 6.0f;
+
+        ID2D1PathGeometry* bodyGeo = nullptr;
+        if (SUCCEEDED(g_d2dFactory->CreatePathGeometry(&bodyGeo)) && bodyGeo) {
+            ID2D1GeometrySink* sink = nullptr;
+            if (SUCCEEDED(bodyGeo->Open(&sink)) && sink) {
+                sink->BeginFigure(D2D1::Point2F(rLeft + topR, rTop), D2D1_FIGURE_BEGIN_HOLLOW);
+                sink->AddLine(D2D1::Point2F(rRight - topR, rTop));
+                sink->AddArc(D2D1::ArcSegment(
+                    D2D1::Point2F(rRight, rTop + topR),
+                    D2D1::SizeF(topR, topR), 0.0f,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                sink->AddLine(D2D1::Point2F(rRight, rBot - botR));
+                sink->AddArc(D2D1::ArcSegment(
+                    D2D1::Point2F(rLeft, rBot - botR),
+                    D2D1::SizeF(botR, botR), 0.0f,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                sink->AddLine(D2D1::Point2F(rLeft, rTop + topR));
+                sink->AddArc(D2D1::ArcSegment(
+                    D2D1::Point2F(rLeft + topR, rTop),
+                    D2D1::SizeF(topR, topR), 0.0f,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+                sink->Release();
+                g_d2dRenderTarget->DrawGeometry(bodyGeo, g_brushRemoteCyan, stroke);
+            }
+            bodyGeo->Release();
+        }
+    }
+
+    // 2x3 grid of 6 small circular button outlines inside remote body
+    const float colX[2] = { cx - 2.35f, cx + 2.35f };
+    const float rowY[3] = { cy - 0.8f, cy + 3.1f, cy + 7.0f };
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 2; ++c) {
+            D2D1_ELLIPSE btnDot = D2D1::Ellipse(D2D1::Point2F(colX[c], rowY[r]), 1.35f, 1.35f);
+            g_d2dRenderTarget->DrawEllipse(&btnDot, g_brushRemoteCyan, 1.15f);
+        }
+    }
 }
 
 void DrawPointerReticle(float x, float y, bool active) {
@@ -3296,12 +3365,12 @@ bool IsRemoteBtnSelectable(RemoteBtn btn) {
             return !g_movieOnly; // fx D-Pad mode toggle (Panning <-> Zoom) in Theater Mode
         case RemoteBtn::DpadUp:
         case RemoteBtn::DpadDown:
-            return g_infoPanelOpen || !g_movieOnly; // Scrolls Info when open; Pans or Zooms in Theater Mode
+            return !g_movieOnly; // Theater Mode only (Panning look or Zoom forward/out)
         case RemoteBtn::DpadLeft:
         case RemoteBtn::DpadRight:
-            return !g_infoPanelOpen && !g_movieOnly && !g_zoomMode; // Panning Mode only (disabled when Info open or Zoom Mode)
+            return !g_movieOnly && !g_zoomMode; // Panning Mode only (disabled in Zoom Mode or Movie Mode)
         case RemoteBtn::DpadSelect:
-            return !g_infoPanelOpen && !g_movieOnly; // Theater Mode (Panning recenter or Zoom reset)
+            return !g_movieOnly; // Theater Mode (Panning recenter or Zoom reset)
         case RemoteBtn::ProjectScreen:
             return (g_projectionMode != ProjectionMode::None) || CanProjectInCurrentRoom();
         case RemoteBtn::Microphone:
@@ -3347,10 +3416,7 @@ void GetRemoteLcdLines(std::wstring& l1, std::wstring& l2) {
             l2 = L"BIGSCREEN";
             return;
         case RemoteBtn::DpadUp:
-            if (g_infoPanelOpen) {
-                l1 = L"SCROLL INFO UP";
-                l2 = L"(INFO SCREEN)";
-            } else if (g_movieOnly) {
+            if (g_movieOnly) {
                 l1 = L"THEATER MODE ONLY";
                 l2 = L"(INACTIVE)";
             } else if (g_zoomMode) {
@@ -3362,10 +3428,7 @@ void GetRemoteLcdLines(std::wstring& l1, std::wstring& l2) {
             }
             return;
         case RemoteBtn::DpadDown:
-            if (g_infoPanelOpen) {
-                l1 = L"SCROLL INFO DOWN";
-                l2 = L"(INFO SCREEN)";
-            } else if (g_movieOnly) {
+            if (g_movieOnly) {
                 l1 = L"THEATER MODE ONLY";
                 l2 = L"(INACTIVE)";
             } else if (g_zoomMode) {
@@ -3377,10 +3440,7 @@ void GetRemoteLcdLines(std::wstring& l1, std::wstring& l2) {
             }
             return;
         case RemoteBtn::DpadLeft:
-            if (g_infoPanelOpen) {
-                l1 = L"DISABLED";
-                l2 = L"(INFO OPEN)";
-            } else if (g_movieOnly) {
+            if (g_movieOnly) {
                 l1 = L"THEATER MODE ONLY";
                 l2 = L"(INACTIVE)";
             } else if (g_zoomMode) {
@@ -3392,10 +3452,7 @@ void GetRemoteLcdLines(std::wstring& l1, std::wstring& l2) {
             }
             return;
         case RemoteBtn::DpadRight:
-            if (g_infoPanelOpen) {
-                l1 = L"DISABLED";
-                l2 = L"(INFO OPEN)";
-            } else if (g_movieOnly) {
+            if (g_movieOnly) {
                 l1 = L"THEATER MODE ONLY";
                 l2 = L"(INACTIVE)";
             } else if (g_zoomMode) {
@@ -3407,10 +3464,7 @@ void GetRemoteLcdLines(std::wstring& l1, std::wstring& l2) {
             }
             return;
         case RemoteBtn::DpadSelect:
-            if (g_infoPanelOpen) {
-                l1 = L"DISABLED";
-                l2 = L"(INFO OPEN)";
-            } else if (g_movieOnly) {
+            if (g_movieOnly) {
                 l1 = L"THEATER MODE ONLY";
                 l2 = L"(INACTIVE)";
             } else if (g_zoomMode) {
@@ -3669,8 +3723,125 @@ void DrawRemoteCirclePad(const D2D1_RECT_F& rect, RemoteBtn btnId, bool enabled)
     g_d2dRenderTarget->DrawEllipse(&faceEl, hovered ? g_brushRemoteCyan : g_brushRemoteBezel, hovered ? 1.1f : 0.7f);
 }
 
+void GetInfoSlideOutContent(RemoteBtn hovered, std::wstring& outTitle, std::wstring& outBody, bool& outIsDefault) {
+    outIsDefault = (hovered == RemoteBtn::None || hovered == RemoteBtn::Info);
+    if (outIsDefault) {
+        outTitle = L"MOUSE & KEYBOARD CONTROLS";
+        outBody =
+            L"Mouse Move\n  VR laser pointer / Virtual Screen cursor\n\n"
+            L"Left-Click\n  VR trigger / Click Virtual Screen\n\n"
+            L"Right-Click Drag\n  Look around in Theater Mode\n\n"
+            L"Esc\n  Virtual Screen <-> VR Laser / Menu\n\n"
+            L"R or Y\n  Recenter VR view\n\n"
+            L"Tab / M / F1\n  Show or hide Remote\n\n"
+            L"F11\n  Toggle Fullscreen / Windowed\n\n"
+            L"Drag Remote Body\n  Move Remote inside viewer\n\n"
+            L"Alt + Drag\n  Move Viewer window";
+        return;
+    }
+
+    switch (hovered) {
+        case RemoteBtn::Hide:
+            outTitle = L"HIDE REMOTE";
+            outBody = L"Hides the floating remote control.\n\nPress Tab, M, F1, or click the Cyan remote icon in the top-right corner to bring it back.";
+            break;
+        case RemoteBtn::Power:
+            outTitle = L"PWR (POWER)";
+            outBody = L"Turns Bigscreen VR and SteamVR on or off.\n\nTurning off also stops active screen projection and unloads any Virtual Screen.";
+            break;
+        case RemoteBtn::Menu:
+            outTitle = L"BIGSCREEN MENU";
+            outBody = L"Shows or minimizes the Bigscreen VR desktop window and main menu.";
+            break;
+        case RemoteBtn::Settings:
+            outTitle = L"fx (D-PAD MODE)";
+            outBody = L"Switches the D-Pad between Panning Mode (default) and Zoom Mode in Theater Mode.\n\n"
+                      L"Glows White in Panning Mode and Cyan when Zoom Mode is active.";
+            break;
+        case RemoteBtn::DpadUp:
+            outTitle = g_zoomMode ? L"D-PAD UP (ZOOM MODE)" : L"D-PAD UP (PANNING)";
+            outBody = g_zoomMode
+                ? L"Moves your camera forward toward the screen in Theater Mode.\n\nDisabled in Movie Mode."
+                : L"Tilts your view upward in Theater Mode (matches Up Arrow key).\n\nDisabled in Movie Mode.";
+            break;
+        case RemoteBtn::DpadDown:
+            outTitle = g_zoomMode ? L"D-PAD DOWN (ZOOM MODE)" : L"D-PAD DOWN (PANNING)";
+            outBody = g_zoomMode
+                ? L"Moves your camera backward away from the screen in Theater Mode.\n\nDisabled in Movie Mode."
+                : L"Tilts your view downward in Theater Mode (matches Down Arrow key).\n\nDisabled in Movie Mode.";
+            break;
+        case RemoteBtn::DpadLeft:
+            outTitle = L"D-PAD LEFT";
+            outBody = g_zoomMode
+                ? L"Disabled while Zoom Mode is active.\n\nPress fx D-Pad to return to Panning Mode to look left."
+                : L"Pans your view to the left in Theater Mode (matches Left Arrow key).\n\nDisabled in Movie Mode.";
+            break;
+        case RemoteBtn::DpadRight:
+            outTitle = L"D-PAD RIGHT";
+            outBody = g_zoomMode
+                ? L"Disabled while Zoom Mode is active.\n\nPress fx D-Pad to return to Panning Mode to look right."
+                : L"Pans your view to the right in Theater Mode (matches Right Arrow key).\n\nDisabled in Movie Mode.";
+            break;
+        case RemoteBtn::DpadSelect:
+            outTitle = L"D-PAD SELECT";
+            outBody = g_zoomMode
+                ? L"Resets your camera zoom back to normal default view.\n\nDisabled in Movie Mode."
+                : L"Recenters your VR view in Theater Mode.\n\nDisabled in Movie Mode.";
+            break;
+        case RemoteBtn::Fullscreen:
+            outTitle = L"FULL SCREEN / WINDOWED";
+            outBody = L"Toggles the viewer window between Fullscreen and normal Windowed mode (shortcut: F11).";
+            break;
+        case RemoteBtn::ProjectScreen:
+            outTitle = L"PROJECT SCREEN";
+            outBody = L"Projects a connected monitor or an isolated 1920x1080 Virtual Screen onto your Bigscreen theater screen.\n\n"
+                      L"Click again while active to stop projecting and unload the Virtual Screen.";
+            break;
+        case RemoteBtn::MovieMode:
+            outTitle = L"MOVIE MODE";
+            outBody = L"Displays only the video full-screen in the viewer window, hiding the surrounding VR theater.";
+            break;
+        case RemoteBtn::TheaterMode:
+            outTitle = L"THEATER MODE";
+            outBody = L"Displays the full VR theater environment around the screen (enabled by default).";
+            break;
+        case RemoteBtn::VolUp:
+            outTitle = L"VOLUME UP (+)";
+            outBody = L"Increases audio volume for the Bigscreen app only, without changing your other Windows apps.";
+            break;
+        case RemoteBtn::VolMute:
+            outTitle = L"MUTE BIGSCREEN AUDIO";
+            outBody = L"Mutes or unmutes audio from the Bigscreen app only.\n\nGlows Cyan while muted.";
+            break;
+        case RemoteBtn::VolDown:
+            outTitle = L"VOLUME DOWN (-)";
+            outBody = L"Decreases audio volume for the Bigscreen app only.";
+            break;
+        case RemoteBtn::Microphone:
+            outTitle = L"MICROPHONE";
+            outBody = L"Turns your VR room microphone on or off.\n\nOn by default (glowing Cyan). Click to mute your mic.";
+            break;
+        case RemoteBtn::MuteOthers:
+            outTitle = L"MUTE OTHERS";
+            outBody = L"Mutes or unmutes all other users in the room when 2 or more users are present.\n\nGlows Cyan while others are muted.";
+            break;
+        case RemoteBtn::No3D:
+            outTitle = L"NO 3D CONVERSION";
+            outBody = L"Converts 3D Side-by-Side (SBS) or Over/Under (O/U) video to normal 2D.\n\nAvailable in Movie Mode only.";
+            break;
+        case RemoteBtn::AspectRatio:
+            outTitle = L"A/R (ASPECT RATIO)";
+            outBody = L"Cycles through video aspect ratio presets (Auto, 2.39:1, 16:9, 4:3, IMAX, etc.).\n\nAutomatically resets to Auto when changing rooms.";
+            break;
+        default:
+            outTitle = L"MOUSE & KEYBOARD CONTROLS";
+            outBody = L"";
+            break;
+    }
+}
+
 void DrawRemoteInfoSlideOut(float remoteLeft, float remoteTop, float remoteBottom) {
-    const float slideW = 246.0f;
+    const float slideW = 264.0f;
     const float overlapW = 24.0f;
     const float visibleW = (slideW - overlapW) * g_infoSlideProgress;
     if (visibleW <= 1.0f) {
@@ -3729,88 +3900,59 @@ void DrawRemoteInfoSlideOut(float remoteLeft, float remoteTop, float remoteBotto
         }
     }
 
-    // Clip all LCD text & controls to the LCD interior while sliding
+    // Clip all LCD text to the LCD interior while sliding
     g_d2dRenderTarget->PushAxisAlignedClip(
         D2D1::RectF(lcdOuterRect.left + 4.0f, lcdOuterRect.top + 4.0f, lcdOuterRect.right - 4.0f, lcdOuterRect.bottom - 4.0f),
         D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-    // Fixed LCD Title Bar & Footer Hint
-    D2D1_RECT_F hdrRect = D2D1::RectF(lcdOuterRect.left + 10.0f, lcdOuterRect.top + 8.0f, lcdOuterRect.right - 10.0f, lcdOuterRect.top + 28.0f);
-    if (g_textFormatInfoHdr) {
-        g_d2dRenderTarget->DrawText(L"REMOTE & CONTROLS GUIDE", 23, g_textFormatInfoHdr, &hdrRect, g_brushRemoteCyan);
-    }
-    D2D1_RECT_F subRect = D2D1::RectF(lcdOuterRect.left + 10.0f, lcdOuterRect.top + 28.0f, lcdOuterRect.right - 10.0f, lcdOuterRect.top + 43.0f);
-    g_d2dRenderTarget->DrawText(L"D-PAD UP/DN: SCROLL | CLICK INFO: CLOSE", 39, g_textFormatRemoteLbl, &subRect, g_brushRemoteLabel);
-    g_d2dRenderTarget->DrawLine(
-        D2D1::Point2F(lcdOuterRect.left + 10.0f, lcdOuterRect.top + 46.0f),
-        D2D1::Point2F(lcdOuterRect.right - 10.0f, lcdOuterRect.top + 46.0f),
-        g_brushLcdBorder, 1.0f);
+    std::wstring infoTitle, infoBody;
+    bool isDefaultView = true;
+    GetInfoSlideOutContent(g_hoveredRemoteBtn, infoTitle, infoBody, isDefaultView);
 
-    static const wchar_t kRemoteInfoGuideText[] =
-        L"REMOTE BUTTONS\n"
-        L"Hide: Hide remote (Tab / M / F1 to show).\n"
-        L"PWR: Turn Bigscreen VR on or off.\n"
-        L"D-Pad Arrows (Panning): Look around Theater.\n"
-        L"D-Pad Select (Panning): Recenter VR view.\n"
-        L"fx D-Pad: Toggle Panning vs Zoom D-Pad Mode.\n"
-        L"D-Pad Up/Dn (Zoom Mode): Zoom forward / out.\n"
-        L"D-Pad Select (Zoom Mode): Reset to normal view.\n"
-        L"Menu: Show or minimize Bigscreen VR menu.\n"
-        L"Full Screen/Windowed: Toggle viewer fullscreen.\n"
-        L"Project Screen: Virtual Screen (1920x1080) or monitor.\n"
-        L"Info (i): Open or retract this Info LCD screen.\n"
-        L"Movie Mode: Full-screen 2D/3D video view.\n"
-        L"Theater Mode: VR theater view (default).\n"
-        L"Volume (+ / Mute / -): Bigscreen app audio only.\n"
-        L"Microphone: Mute or unmute your VR microphone.\n"
-        L"Mute Others: Mute or unmute peers in room.\n"
-        L"No 3D: Convert SBS or O/U 3D to 2D (Movie Mode).\n"
-        L"A/R: Cycle aspect ratio presets.\n\n"
-        L"MOUSE & KEYBOARD CONTROLS\n"
-        L"Mouse Move: VR laser pointer / Virtual Screen cursor.\n"
-        L"Left-Click: VR trigger / Click Virtual Screen.\n"
-        L"Right-Click Drag: Look around in Theater Mode.\n"
-        L"Esc: Virtual Screen <-> VR Laser / Dashboard.\n"
-        L"R or Y: Recenter VR view.\n"
-        L"Tab / M / F1: Show or hide Remote.\n"
-        L"F11: Toggle Fullscreen / Windowed.\n"
-        L"Drag Remote LCD/Body: Move Remote inside viewer.\n"
-        L"Alt + Drag anywhere: Move Viewer window.";
+    const float cLeft = lcdOuterRect.left + 12.0f;
+    const float cRight = lcdOuterRect.right - 12.0f;
+    float yCursor = lcdOuterRect.top + 12.0f;
 
-    D2D1_RECT_F bodyViewport = D2D1::RectF(lcdOuterRect.left + 10.0f, lcdOuterRect.top + 52.0f, lcdOuterRect.right - 14.0f, lcdOuterRect.bottom - 10.0f);
-    const float vpW = (std::max)(20.0f, bodyViewport.right - bodyViewport.left);
-    const float vpH = (std::max)(20.0f, bodyViewport.bottom - bodyViewport.top);
-
-    if (g_dwriteFactory && g_textFormatInfoBody) {
-        IDWriteTextLayout* layout = nullptr;
-        if (SUCCEEDED(g_dwriteFactory->CreateTextLayout(
-                kRemoteInfoGuideText, static_cast<UINT32>(wcslen(kRemoteInfoGuideText)),
-                g_textFormatInfoBody, vpW, 2000.0f, &layout)) && layout) {
-            DWRITE_TEXT_METRICS tm{};
-            if (SUCCEEDED(layout->GetMetrics(&tm))) {
-                g_infoMaxScrollY = (std::max)(0.0f, tm.height - vpH + 8.0f);
-                g_infoScrollY = std::clamp(g_infoScrollY, 0.0f, g_infoMaxScrollY);
-            }
-            g_d2dRenderTarget->PushAxisAlignedClip(bodyViewport, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            g_d2dRenderTarget->DrawTextLayout(
-                D2D1::Point2F(bodyViewport.left, bodyViewport.top - g_infoScrollY),
-                layout, g_brushLcdText);
-            g_d2dRenderTarget->PopAxisAlignedClip();
-            layout->Release();
+    if (isDefaultView) {
+        D2D1_RECT_F promptRect = D2D1::RectF(cLeft, yCursor, cRight, yCursor + 36.0f);
+        if (g_textFormatInfoBody) {
+            g_d2dRenderTarget->DrawText(
+                L"Move mouse over remote buttons for information", 47,
+                g_textFormatInfoBody, &promptRect, g_brushRemoteCyan);
         }
+        yCursor += 40.0f;
+        g_d2dRenderTarget->DrawLine(
+            D2D1::Point2F(cLeft, yCursor),
+            D2D1::Point2F(cRight, yCursor),
+            g_brushLcdBorder, 1.0f);
+        yCursor += 10.0f;
     }
 
-    // Subtle vertical scrollbar track & thumb
-    if (g_infoMaxScrollY > 1.0f) {
-        const float sbX = lcdOuterRect.right - 7.5f;
-        const float sbTop = bodyViewport.top;
-        const float sbBot = bodyViewport.bottom;
-        const float trackH = sbBot - sbTop;
-        g_d2dRenderTarget->DrawLine(D2D1::Point2F(sbX, sbTop), D2D1::Point2F(sbX, sbBot), g_brushLcdBorder, 2.0f);
-        const float thumbH = (std::max)(24.0f, trackH * (vpH / (vpH + g_infoMaxScrollY)));
-        const float thumbY = sbTop + (g_infoScrollY / g_infoMaxScrollY) * (trackH - thumbH);
-        g_d2dRenderTarget->DrawLine(D2D1::Point2F(sbX, thumbY), D2D1::Point2F(sbX, thumbY + thumbH), g_brushRemoteCyan, 2.6f);
+    D2D1_RECT_F hdrRect = D2D1::RectF(cLeft, yCursor, cRight, yCursor + 24.0f);
+    if (g_textFormatInfoHdr) {
+        g_d2dRenderTarget->DrawText(
+            infoTitle.c_str(), static_cast<UINT32>(infoTitle.length()),
+            g_textFormatInfoHdr, &hdrRect, g_brushRemoteCyan);
     }
+    yCursor += 28.0f;
+
+    g_d2dRenderTarget->DrawLine(
+        D2D1::Point2F(cLeft, yCursor),
+        D2D1::Point2F(cRight, yCursor),
+        g_brushLcdBorder, 1.0f);
+    yCursor += 12.0f;
+
+    D2D1_RECT_F bodyRect = D2D1::RectF(cLeft, yCursor, cRight, lcdOuterRect.bottom - 34.0f);
+    if (g_textFormatInfoBody && !infoBody.empty()) {
+        g_d2dRenderTarget->DrawText(
+            infoBody.c_str(), static_cast<UINT32>(infoBody.length()),
+            g_textFormatInfoBody, &bodyRect, g_brushLcdText);
+    }
+
+    D2D1_RECT_F footRect = D2D1::RectF(cLeft, lcdOuterRect.bottom - 26.0f, cRight, lcdOuterRect.bottom - 8.0f);
+    g_d2dRenderTarget->DrawText(
+        L"Click Info button or screen to close", 36,
+        g_textFormatRemoteLbl, &footRect, g_brushRemoteLabel);
 
     g_d2dRenderTarget->PopAxisAlignedClip();
 }
@@ -3832,7 +3974,7 @@ void DrawRemotePanel(float windowWidth, float windowHeight) {
         g_remotePosY = (std::max)(20.0f, (windowHeight - panelHeight) * 0.5f);
         g_remotePosInit = true;
     }
-    const float neededLeftClearance = g_infoPanelOpen ? 228.0f : 6.0f;
+    const float neededLeftClearance = g_infoPanelOpen ? 246.0f : 6.0f;
     if (g_infoPanelOpen && g_remotePosX < neededLeftClearance) {
         g_remotePosX = (std::min)(neededLeftClearance, (std::max)(6.0f, windowWidth - panelWidth - 6.0f));
     }
@@ -3972,9 +4114,9 @@ void DrawRemotePanel(float windowWidth, float windowHeight) {
     g_dpadCenter = D2D1::Point2F(wellMidX, wellMidY);
     g_dpadOuterR = 52.0f;
     g_dpadInnerR = 23.0f;
-    const bool upDnEnabled = g_infoPanelOpen || !g_movieOnly;
-    const bool lrEnabled = !g_infoPanelOpen && !g_movieOnly && !g_zoomMode;
-    const bool selEnabled = !g_infoPanelOpen && !g_movieOnly;
+    const bool upDnEnabled = !g_movieOnly;
+    const bool lrEnabled = !g_movieOnly && !g_zoomMode;
+    const bool selEnabled = !g_movieOnly;
     {
         D2D1_ELLIPSE dpadShadow = D2D1::Ellipse(D2D1::Point2F(g_dpadCenter.x, g_dpadCenter.y + 2.5f), g_dpadOuterR + 2.0f, g_dpadOuterR + 2.0f);
         g_d2dRenderTarget->FillEllipse(&dpadShadow, g_brushRemoteShadow);
@@ -4998,17 +5140,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             ForwardVirtualKey(message, wParam, lParam);
             return 0;
         }
-        // D-pad / Arrow keys mirror Info scroll & Theater Mode navigation
-        if (g_infoPanelOpen) {
-            if (wParam == VK_UP) {
-                ExecuteRemoteDpadStep(RemoteBtn::DpadUp);
-                return 0;
-            }
-            if (wParam == VK_DOWN) {
-                ExecuteRemoteDpadStep(RemoteBtn::DpadDown);
-                return 0;
-            }
-        }
+        // D-pad / Arrow keys mirror Theater Mode navigation (no function in Movie Mode)
         if (!g_movieOnly) {
             if (wParam == VK_LEFT) {
                 ExecuteRemoteDpadStep(RemoteBtn::DpadLeft);
@@ -5459,17 +5591,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
     }
 
     if (message == WM_MOUSEWHEEL) {
-        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        ScreenToClient(hwnd, &pt);
-        const float mx = static_cast<float>(pt.x);
-        const float my = static_cast<float>(pt.y);
-        if (g_infoPanelOpen && IsOverInfoPanel(mx, my)) {
-            const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-            g_infoScrollY = std::clamp(g_infoScrollY - (delta > 0 ? 36.0f : -36.0f), 0.0f, g_infoMaxScrollY);
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
         if (g_projectionMode == ProjectionMode::VirtualScreen && g_controlVirtualScreen) {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ScreenToClient(hwnd, &pt);
+            const float mx = static_cast<float>(pt.x);
+            const float my = static_cast<float>(pt.y);
             if (!IsOverRemoteUi(mx, my)) {
                 LONG tx = 0, ty = 0;
                 if (MapViewerPointToVirtualScreen(mx, my, &tx, &ty)) {
@@ -5529,6 +5655,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
 void UpdateRoomOwnershipState() {
     static ULONGLONG s_lastProcPoll = 0;
     static ULONGLONG s_lastAudioPoll = 0;
+    static bool s_hasRoomSeq = false;
+    static uint32_t s_lastRoomChangeSeq = 0;
+    static bool s_prevLoadingRoom = false;
+    static bool s_prevInOwnRoom = false;
+    static bool s_prevRoomHookReady = false;
+    static bool s_prevBigscreenRunning = false;
     const ULONGLONG now = GetTickCount64();
     if (now - s_lastProcPoll >= 400) {
         s_lastProcPoll = now;
@@ -5539,6 +5671,7 @@ void UpdateRoomOwnershipState() {
         ControlBigscreenSessionAudio(0);
     }
 
+    bool roomChanged = false;
     OpenPeerMovieMapping();
     if (g_bigscreenRunning && g_peerState &&
         g_peerState->magic == bigscreen_peer_movie::kMagic) {
@@ -5547,6 +5680,17 @@ void UpdateRoomOwnershipState() {
             g_roomHookReady = true;
             g_inOwnRoom = (g_peerState->inOwnRoom != 0);
             g_isLoadingRoom = (g_peerState->isLoadingRoom != 0);
+            if (!s_hasRoomSeq) {
+                s_hasRoomSeq = true;
+                s_lastRoomChangeSeq = g_peerState->roomChangeSeq;
+            } else if (g_peerState->roomChangeSeq != s_lastRoomChangeSeq) {
+                s_lastRoomChangeSeq = g_peerState->roomChangeSeq;
+                roomChanged = true;
+            }
+            if ((!s_prevLoadingRoom && g_isLoadingRoom) ||
+                (s_prevRoomHookReady && s_prevInOwnRoom != g_inOwnRoom && !g_isLoadingRoom)) {
+                roomChanged = true;
+            }
         } else {
             g_roomHookReady = false;
             g_inOwnRoom = false;
@@ -5573,7 +5717,24 @@ void UpdateRoomOwnershipState() {
             g_micMuted = false;
             g_allMuted = false;
             g_bigscreenMenuToggled = false;
+            s_hasRoomSeq = false;
+            if (s_prevBigscreenRunning) {
+                roomChanged = true;
+            }
         }
+    }
+
+    s_prevLoadingRoom = g_isLoadingRoom;
+    s_prevInOwnRoom = g_inOwnRoom;
+    s_prevRoomHookReady = g_roomHookReady;
+    s_prevBigscreenRunning = g_bigscreenRunning;
+
+    if (roomChanged && g_aspectPresetIndex != 0) {
+        g_aspectPresetIndex = 0; // Reset Aspect Ratio to Auto when changing rooms
+        g_lastAdjustedAspect = 0.0f;
+        SyncAspectOverrideToIpc();
+        SetLcdNotification(L"ASPECT RATIO", L"RESET TO AUTO", 2500);
+        Log("Reset Aspect Ratio override to Auto after room change");
     }
 
     // Projection is only valid in the user's own room; automatically stop if user leaves or disconnects
