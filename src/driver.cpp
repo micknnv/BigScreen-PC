@@ -496,6 +496,16 @@ public:
                              (viewMode == bigscreen_desktop_ipc::ViewMode::LegacyHmdOffset);
         if (isThird)
             ApplyLegacyHmdOffset(totalYaw, cameraX, cameraY, cameraZ);
+        const vr::HmdQuaternion_t hmdRot = QuaternionFromYawPitch(totalYaw, totalPitch);
+        const double zoomMeters = controlReady ? std::clamp(static_cast<double>(control.lookZoom), -4.0, 10.0) : 0.0;
+        if (std::fabs(zoomMeters) > 1e-4) {
+            const double fwdX = -(2.0 * hmdRot.x * hmdRot.z + 2.0 * hmdRot.y * hmdRot.w);
+            const double fwdY = -(2.0 * hmdRot.y * hmdRot.z - 2.0 * hmdRot.x * hmdRot.w);
+            const double fwdZ = -(1.0 - 2.0 * hmdRot.x * hmdRot.x - 2.0 * hmdRot.y * hmdRot.y);
+            cameraX += fwdX * zoomMeters;
+            cameraY = (std::max)(0.4, cameraY + fwdY * zoomMeters);
+            cameraZ += fwdZ * zoomMeters;
+        }
         next.vecPosition[0] = cameraX;
         next.vecPosition[1] = cameraY;
         next.vecPosition[2] = cameraZ;
@@ -503,7 +513,7 @@ public:
         next.vecVelocity[1] = (-15.0 * std::sin(hmdTimeAccum_ * 15.0) * 0.0003 - 1.2 * std::sin(hmdTimeAccum_ * 1.2) * 0.002);
         next.vecVelocity[2] = (18.0 * std::cos(hmdTimeAccum_ * 18.0) * 0.0003);
         next.vecAngularVelocity[1] = 1.0 * std::cos(hmdTimeAccum_ * 1.0) * 0.001;
-        next.qRotation = QuaternionFromYawPitch(totalYaw, totalPitch);
+        next.qRotation = hmdRot;
         next.poseIsValid = true;
         next.willDriftInYaw = false;
         next.result = vr::TrackingResult_Running_OK;
@@ -708,6 +718,15 @@ public:
                              (viewMode == bigscreen_desktop_ipc::ViewMode::LegacyHmdOffset);
         if (isThird)
             ApplyLegacyHmdOffset(yaw, cameraX, cameraY, cameraZ);
+        const double zoomMeters = controlReady ? std::clamp(static_cast<double>(control.lookZoom), -4.0, 10.0) : 0.0;
+        if (std::fabs(zoomMeters) > 1e-4) {
+            const double fwdX = -(2.0 * hmdRotation.x * hmdRotation.z + 2.0 * hmdRotation.y * hmdRotation.w);
+            const double fwdY = -(2.0 * hmdRotation.y * hmdRotation.z - 2.0 * hmdRotation.x * hmdRotation.w);
+            const double fwdZ = -(1.0 - 2.0 * hmdRotation.x * hmdRotation.x - 2.0 * hmdRotation.y * hmdRotation.y);
+            cameraX += fwdX * zoomMeters;
+            cameraY = (std::max)(0.4, cameraY + fwdY * zoomMeters);
+            cameraZ += fwdZ * zoomMeters;
+        }
         next.vecPosition[0] = static_cast<float>(cameraX) + rotatedX;
         next.vecPosition[1] = static_cast<float>(cameraY) + rotatedY;
         next.vecPosition[2] = static_cast<float>(cameraZ) + rotatedZ;

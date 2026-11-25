@@ -35,17 +35,18 @@ struct State {
     float lookPitch = 0.0f;
     uint32_t menuClick = 0;
     uint32_t systemClick = 0;
+    float lookZoom = 0.0f;
 };
 #pragma pack(pop)
 
-static_assert(sizeof(State) == 72, "Controller control IPC layout changed");
+static_assert(sizeof(State) == 76, "Controller control IPC layout changed");
 
 inline void Publish(State* state, uint32_t viewRequest, uint32_t resetEpoch,
                     bool virtualControllersEnabled, int32_t cameraIndex,
                     float cameraDistance, float cameraHeight, float cameraFov,
                     float pointerYaw, float pointerPitch, bool pointerTrigger,
                     bool pointerActive, float lookYaw, float lookPitch,
-                    bool menuClick, bool systemClick) {
+                    bool menuClick, bool systemClick, float lookZoom = 0.0f) {
     const LONG next = state->sequence + 1;
     InterlockedExchange(&state->sequence, next | 1);
     state->viewRequest = viewRequest;
@@ -63,6 +64,7 @@ inline void Publish(State* state, uint32_t viewRequest, uint32_t resetEpoch,
     state->lookPitch = lookPitch;
     state->menuClick = menuClick ? 1u : 0u;
     state->systemClick = systemClick ? 1u : 0u;
+    state->lookZoom = lookZoom;
     InterlockedExchange(&state->sequence, (next + 1) & ~1L);
 }
 
@@ -79,8 +81,9 @@ inline void Publish(State* state, uint32_t viewRequest, uint32_t resetEpoch,
     const float lp = valid ? state->lookPitch : 0.0f;
     const bool mc = valid ? (state->menuClick != 0) : false;
     const bool sc = valid ? (state->systemClick != 0) : false;
+    const float lz = valid ? state->lookZoom : 0.0f;
     Publish(state, viewRequest, resetEpoch, virtualControllersEnabled, cameraIndex,
-            cameraDistance, cameraHeight, cameraFov, py, pp, pt, pa, ly, lp, mc, sc);
+            cameraDistance, cameraHeight, cameraFov, py, pp, pt, pa, ly, lp, mc, sc, lz);
 }
 
 inline bool Read(const State* state, State& out) {
@@ -104,7 +107,7 @@ inline void SetViewRequest(State* state, ViewRequest req) {
                 current.cameraDistance, current.cameraHeight, current.cameraFov,
                 current.pointerYaw, current.pointerPitch, current.pointerTrigger != 0,
                 current.pointerActive != 0, current.lookYaw, current.lookPitch,
-                current.menuClick != 0, current.systemClick != 0);
+                current.menuClick != 0, current.systemClick != 0, current.lookZoom);
     }
 }
 
@@ -117,7 +120,7 @@ inline void SetPointerState(State* state, float pointerYaw, float pointerPitch, 
                 current.cameraDistance, current.cameraHeight, current.cameraFov,
                 pointerYaw, pointerPitch, pointerTrigger, pointerActive,
                 current.lookYaw, current.lookPitch, current.menuClick != 0,
-                current.systemClick != 0);
+                current.systemClick != 0, current.lookZoom);
     }
 }
 
@@ -130,13 +133,13 @@ inline void SetLookOffset(State* state, float lookYaw, float lookPitch) {
                 current.cameraDistance, current.cameraHeight, current.cameraFov,
                 current.pointerYaw, current.pointerPitch, current.pointerTrigger != 0,
                 current.pointerActive != 0, lookYaw, lookPitch, current.menuClick != 0,
-                current.systemClick != 0);
+                current.systemClick != 0, current.lookZoom);
     }
 }
 
 inline void SetPointerAndLook(State* state, float pointerYaw, float pointerPitch,
                               bool pointerTrigger, bool pointerActive,
-                              float lookYaw, float lookPitch) {
+                              float lookYaw, float lookPitch, float lookZoom = 0.0f) {
     if (!state) return;
     State current{};
     if (Read(state, current)) {
@@ -144,7 +147,7 @@ inline void SetPointerAndLook(State* state, float pointerYaw, float pointerPitch
                 current.virtualControllersEnabled != 0, current.cameraIndex,
                 current.cameraDistance, current.cameraHeight, current.cameraFov,
                 pointerYaw, pointerPitch, pointerTrigger, pointerActive,
-                lookYaw, lookPitch, current.menuClick != 0, current.systemClick != 0);
+                lookYaw, lookPitch, current.menuClick != 0, current.systemClick != 0, lookZoom);
     }
 }
 
@@ -157,7 +160,7 @@ inline void PulseMenuClick(State* state) {
                 current.cameraDistance, current.cameraHeight, current.cameraFov,
                 current.pointerYaw, current.pointerPitch, current.pointerTrigger != 0,
                 current.pointerActive != 0, current.lookYaw, current.lookPitch,
-                true, current.systemClick != 0);
+                true, current.systemClick != 0, current.lookZoom);
     }
 }
 
@@ -170,7 +173,7 @@ inline void ClearMenuClick(State* state) {
                 current.cameraDistance, current.cameraHeight, current.cameraFov,
                 current.pointerYaw, current.pointerPitch, current.pointerTrigger != 0,
                 current.pointerActive != 0, current.lookYaw, current.lookPitch,
-                false, current.systemClick != 0);
+                false, current.systemClick != 0, current.lookZoom);
     }
 }
 
@@ -183,7 +186,7 @@ inline void PulseSystemClick(State* state) {
                 current.cameraDistance, current.cameraHeight, current.cameraFov,
                 current.pointerYaw, current.pointerPitch, current.pointerTrigger != 0,
                 current.pointerActive != 0, current.lookYaw, current.lookPitch,
-                current.menuClick != 0, true);
+                current.menuClick != 0, true, current.lookZoom);
     }
 }
 
@@ -196,7 +199,7 @@ inline void ClearSystemClick(State* state) {
                 current.cameraDistance, current.cameraHeight, current.cameraFov,
                 current.pointerYaw, current.pointerPitch, current.pointerTrigger != 0,
                 current.pointerActive != 0, current.lookYaw, current.lookPitch,
-                current.menuClick != 0, false);
+                current.menuClick != 0, false, current.lookZoom);
     }
 }
 
@@ -207,7 +210,7 @@ inline void TriggerReset(State* state) {
         Publish(state, current.viewRequest, current.resetEpoch + 1,
                 current.virtualControllersEnabled != 0, current.cameraIndex,
                 current.cameraDistance, current.cameraHeight, current.cameraFov,
-                0.0f, 0.0f, false, false, 0.0f, 0.0f, false, false);
+                0.0f, 0.0f, false, false, 0.0f, 0.0f, false, false, 0.0f);
     }
 }
 
@@ -220,7 +223,7 @@ inline void SetVirtualControllers(State* state, bool enabled) {
                 current.cameraDistance, current.cameraHeight, current.cameraFov,
                 current.pointerYaw, current.pointerPitch, current.pointerTrigger != 0,
                 current.pointerActive != 0, current.lookYaw, current.lookPitch,
-                current.menuClick != 0, current.systemClick != 0);
+                current.menuClick != 0, current.systemClick != 0, current.lookZoom);
     }
 }
 
@@ -233,7 +236,7 @@ inline void SetCameraParams(State* state, int32_t cameraIndex, float distance, f
                 distance, height, fov,
                 current.pointerYaw, current.pointerPitch, current.pointerTrigger != 0,
                 current.pointerActive != 0, current.lookYaw, current.lookPitch,
-                current.menuClick != 0, current.systemClick != 0);
+                current.menuClick != 0, current.systemClick != 0, current.lookZoom);
     }
 }
 
