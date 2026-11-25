@@ -85,10 +85,15 @@ ID3D11Texture2D* g_sharedVideoTex = nullptr;
 ID3D11ShaderResourceView* g_sharedVideoSrv = nullptr;
 uint64_t g_currentSharedHandle = 0;
 ID3D11Texture2D* g_blackTex = nullptr;
+ID3D11RenderTargetView* g_blackRtv = nullptr;
+ID3D11ShaderResourceView* g_blackSrv = nullptr;
+uint32_t g_blackMips = 0;
 ID3D11Texture2D* g_routeStagingTex = nullptr;
 ID3D11RenderTargetView* g_routeStagingRtv = nullptr;
+ID3D11ShaderResourceView* g_routeStagingSrv = nullptr;
 uint32_t g_routeStagingW = 0;
 uint32_t g_routeStagingH = 0;
+uint32_t g_routeStagingMips = 0;
 DXGI_FORMAT g_routeStagingFmt = DXGI_FORMAT_UNKNOWN;
 
 // --------------------------------------------------------------------------
@@ -791,26 +796,68 @@ void ExportBigMediaPlayerMovie() {
 // --------------------------------------------------------------------------
 // Local Desktop Projection Routing
 // --------------------------------------------------------------------------
-void EnsureBlackTexture(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC& deskDesc) {
-    if (g_blackTex) {
+void ReleaseBlackTexture() {
+    if (g_blackSrv) { g_blackSrv->Release(); g_blackSrv = nullptr; }
+    if (g_blackRtv) { g_blackRtv->Release(); g_blackRtv = nullptr; }
+    if (g_blackTex) { g_blackTex->Release(); g_blackTex = nullptr; }
+    g_blackMips = 0;
+}
+
+bool EnsureBlackTexture(ID3D11Device* pDevice, ID3D11DeviceContext* pContext, const D3D11_TEXTURE2D_DESC& deskDesc) {
+    UINT targetMips = (std::max)(1u, deskDesc.MipLevels);
+    if (g_blackTex && g_blackRtv) {
         D3D11_TEXTURE2D_DESC curDesc{};
         g_blackTex->GetDesc(&curDesc);
-        if (curDesc.Width == deskDesc.Width && curDesc.Height == deskDesc.Height && curDesc.Format == deskDesc.Format) {
-            return;
+        if (curDesc.Width == deskDesc.Width && curDesc.Height == deskDesc.Height &&
+            curDesc.Format == deskDesc.Format && curDesc.MipLevels == g_blackMips) {
+            return true;
         }
-        g_blackTex->Release();
-        g_blackTex = nullptr;
+        ReleaseBlackTexture();
     }
-    D3D11_TEXTURE2D_DESC bDesc = deskDesc;
-    bDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    bDesc.MiscFlags = 0;
-    bDesc.CPUAccessFlags = 0;
+
+    D3D11_TEXTURE2D_DESC bDesc{};
+    bDesc.Width = deskDesc.Width;
+    bDesc.Height = deskDesc.Height;
+    bDesc.MipLevels = targetMips;
+    bDesc.ArraySize = 1;
+    bDesc.Format = deskDesc.Format;
+    bDesc.SampleDesc.Count = 1;
     bDesc.Usage = D3D11_USAGE_DEFAULT;
-    std::vector<uint32_t> blackData(bDesc.Width * bDesc.Height, 0xFF000000);
-    D3D11_SUBRESOURCE_DATA initData{};
-    initData.pSysMem = blackData.data();
-    initData.SysMemPitch = bDesc.Width * sizeof(uint32_t);
-    pDevice->CreateTexture2D(&bDesc, &initData, &g_blackTex);
+    bDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    bDesc.MiscFlags = (targetMips > 1) ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
+
+    if (FAILED(pDevice->CreateTexture2D(&bDesc, nullptr, &g_blackTex)) || !g_blackTex) {
+        bDesc.MipLevels = 1;
+        bDesc.MiscFlags = 0;
+        if (FAILED(pDevice->CreateTexture2D(&bDesc, nullptr, &g_blackTex)) || !g_blackTex) {
+            return false;
+        }
+    }
+
+    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+    rtvDesc.Format = (bDesc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS) ? DXGI_FORMAT_B8G8R8A8_UNORM
+                   : (bDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) ? DXGI_FORMAT_R8G8B8A8_UNORM
+                   : bDesc.Format;
+    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    if (FAILED(pDevice->CreateRenderTargetView(g_blackTex, &rtvDesc, &g_blackRtv)) || !g_blackRtv) {
+        ReleaseBlackTexture();
+        return false;
+    }
+
+    const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    pContext->ClearRenderTargetView(g_blackRtv, black);
+    if (bDesc.MipLevels > 1) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = rtvDesc.Format;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = bDesc.MipLevels;
+        if (SUCCEEDED(pDevice->CreateShaderResourceView(g_blackTex, &srvDesc, &g_blackSrv)) && g_blackSrv) {
+            pContext->GenerateMips(g_blackSrv);
+        }
+    }
+    pContext->Flush();
+    g_blackMips = bDesc.MipLevels;
+    return true;
 }
 
 const bigscreen_projected_video::State* GetProjectedVideoState() {
@@ -846,18 +893,22 @@ DXGI_FORMAT ResolveRtvFormat(DXGI_FORMAT fmt) {
 }
 
 void ReleaseRouteStaging() {
+    if (g_routeStagingSrv) { g_routeStagingSrv->Release(); g_routeStagingSrv = nullptr; }
     if (g_routeStagingRtv) { g_routeStagingRtv->Release(); g_routeStagingRtv = nullptr; }
     if (g_routeStagingTex) { g_routeStagingTex->Release(); g_routeStagingTex = nullptr; }
     g_routeStagingW = 0;
     g_routeStagingH = 0;
+    g_routeStagingMips = 0;
     g_routeStagingFmt = DXGI_FORMAT_UNKNOWN;
 }
 
-bool EnsureRouteStaging(ID3D11Device* pDevice, uint32_t w, uint32_t h, DXGI_FORMAT fmt) {
+bool EnsureRouteStaging(ID3D11Device* pDevice, uint32_t w, uint32_t h, uint32_t mips, DXGI_FORMAT fmt) {
     if (!pDevice || w == 0 || h == 0) return false;
     if (!EnsurePeerPipeline(pDevice)) return false;
+    UINT targetMips = (std::max)(1u, mips);
     if (g_routeStagingTex && g_routeStagingRtv &&
-        g_routeStagingW == w && g_routeStagingH == h && g_routeStagingFmt == fmt) {
+        g_routeStagingW == w && g_routeStagingH == h &&
+        (g_routeStagingMips == targetMips || g_routeStagingMips == 1) && g_routeStagingFmt == fmt) {
         return true;
     }
     ReleaseRouteStaging();
@@ -865,15 +916,20 @@ bool EnsureRouteStaging(ID3D11Device* pDevice, uint32_t w, uint32_t h, DXGI_FORM
     D3D11_TEXTURE2D_DESC td{};
     td.Width = w;
     td.Height = h;
-    td.MipLevels = 1;
+    td.MipLevels = targetMips;
     td.ArraySize = 1;
     td.Format = fmt;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.MiscFlags = (targetMips > 1) ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
 
     if (FAILED(pDevice->CreateTexture2D(&td, nullptr, &g_routeStagingTex)) || !g_routeStagingTex) {
-        return false;
+        td.MipLevels = 1;
+        td.MiscFlags = 0;
+        if (FAILED(pDevice->CreateTexture2D(&td, nullptr, &g_routeStagingTex)) || !g_routeStagingTex) {
+            return false;
+        }
     }
     D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
     rtvDesc.Format = ResolveRtvFormat(fmt);
@@ -882,8 +938,16 @@ bool EnsureRouteStaging(ID3D11Device* pDevice, uint32_t w, uint32_t h, DXGI_FORM
         ReleaseRouteStaging();
         return false;
     }
+    if (td.MipLevels > 1) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = rtvDesc.Format;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = td.MipLevels;
+        pDevice->CreateShaderResourceView(g_routeStagingTex, &srvDesc, &g_routeStagingSrv);
+    }
     g_routeStagingW = w;
     g_routeStagingH = h;
+    g_routeStagingMips = td.MipLevels;
     g_routeStagingFmt = fmt;
     return true;
 }
@@ -896,7 +960,9 @@ bool BlitSharedVideoToDesktop(ID3D11Device* pDevice, ID3D11DeviceContext* pConte
     D3D11_TEXTURE2D_DESC vidDesc{};
     pSharedTex->GetDesc(&vidDesc);
 
-    if (vidDesc.Width == deskDesc.Width && vidDesc.Height == deskDesc.Height && vidDesc.Format == deskDesc.Format) {
+    if (vidDesc.Width == deskDesc.Width && vidDesc.Height == deskDesc.Height &&
+        vidDesc.Format == deskDesc.Format && vidDesc.MipLevels == deskDesc.MipLevels &&
+        vidDesc.ArraySize == deskDesc.ArraySize && vidDesc.SampleDesc.Count == deskDesc.SampleDesc.Count) {
         pContext->CopyResource(pDesktopTex, pSharedTex);
         return true;
     }
@@ -911,7 +977,7 @@ bool BlitSharedVideoToDesktop(ID3D11Device* pDevice, ID3D11DeviceContext* pConte
         }
     }
 
-    if (!EnsureRouteStaging(pDevice, deskDesc.Width, deskDesc.Height, deskDesc.Format)) {
+    if (!EnsureRouteStaging(pDevice, deskDesc.Width, deskDesc.Height, deskDesc.MipLevels, deskDesc.Format)) {
         return false;
     }
 
@@ -937,7 +1003,15 @@ bool BlitSharedVideoToDesktop(ID3D11Device* pDevice, ID3D11DeviceContext* pConte
 
     ID3D11ShaderResourceView* nullSrv = nullptr;
     pContext->PSSetShaderResources(0, 1, &nullSrv);
-    pContext->CopyResource(pDesktopTex, g_routeStagingTex);
+    ID3D11RenderTargetView* nullRtv = nullptr;
+    pContext->OMSetRenderTargets(1, &nullRtv, nullptr);
+
+    if (g_routeStagingMips == deskDesc.MipLevels && g_routeStagingSrv) {
+        pContext->GenerateMips(g_routeStagingSrv);
+        pContext->CopyResource(pDesktopTex, g_routeStagingTex);
+    } else {
+        pContext->CopySubresourceRegion(pDesktopTex, 0, 0, 0, 0, g_routeStagingTex, 0, nullptr);
+    }
     pContext->Flush();
 
     saved.Restore(pContext);
@@ -1039,9 +1113,12 @@ void RouteDesktopTexture() {
                 }
             }
         } else if (state.privacyMode) {
-            EnsureBlackTexture(pDevice, deskDesc);
-            if (g_blackTex) {
-                pContext->CopyResource(pDesktopTex, g_blackTex);
+            if (EnsureBlackTexture(pDevice, pContext, deskDesc) && g_blackTex) {
+                if (g_blackMips == deskDesc.MipLevels) {
+                    pContext->CopyResource(pDesktopTex, g_blackTex);
+                } else {
+                    pContext->CopySubresourceRegion(pDesktopTex, 0, 0, 0, 0, g_blackTex, 0, nullptr);
+                }
             }
         }
 
@@ -1930,7 +2007,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
         if (g_sharedVideoSrv) { g_sharedVideoSrv->Release(); g_sharedVideoSrv = nullptr; }
         if (g_sharedVideoTex) { g_sharedVideoTex->Release(); g_sharedVideoTex = nullptr; }
         ReleaseRouteStaging();
-        if (g_blackTex) { g_blackTex->Release(); g_blackTex = nullptr; }
+        ReleaseBlackTexture();
         if (g_pTrampolineLocal) { VirtualFree(g_pTrampolineLocal, 0, MEM_RELEASE); g_pTrampolineLocal = nullptr; }
         if (g_pTrampolinePeer) { VirtualFree(g_pTrampolinePeer, 0, MEM_RELEASE); g_pTrampolinePeer = nullptr; }
         if (g_pTrampolineMedia) { VirtualFree(g_pTrampolineMedia, 0, MEM_RELEASE); g_pTrampolineMedia = nullptr; }

@@ -1307,6 +1307,7 @@ void StartProjectingAppWindow(HWND targetHwnd, const std::wstring& title) {
     g_lookYaw = 0.0f;
     g_lookPitch = 0.0f;
     SyncPointerAndLook();
+    CaptureProjectedWindowFrame();
     CloakAppWindow(g_projectedHwnd);
     Log("Started projecting isolated application window: %ls (Cloaked from desktop)", g_projectedTitle.c_str());
 }
