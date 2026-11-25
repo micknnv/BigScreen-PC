@@ -142,6 +142,8 @@ StereoSplitMode g_stereoMode = StereoSplitMode::Normal2D;
 size_t g_aspectPresetIndex = 0;
 bool g_isFullscreen = false;
 bool g_alwaysOnTop = false;
+bool g_keepForegroundUntilMinimized = false;
+bool g_inProjectAppMenu = false;
 WINDOWPLACEMENT g_wpPrev = { sizeof(g_wpPrev) };
 
 // Room Ownership State
@@ -766,6 +768,9 @@ void ToggleDesktopMenu() {
     }
     if (IsIconic(hwnd)) {
         // Currently minimized -> Restore and bring to front
+        if (g_keepForegroundUntilMinimized && g_hwnd) {
+            SetWindowPos(g_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
         ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
         g_waitingForNewFeed = true;
@@ -776,6 +781,9 @@ void ToggleDesktopMenu() {
     } else {
         // Currently visible/open -> Minimize it!
         ShowWindow(hwnd, SW_MINIMIZE);
+        if (g_keepForegroundUntilMinimized && g_hwnd && !IsIconic(g_hwnd)) {
+            SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        }
         SetForegroundWindow(g_hwnd);
         g_waitingForNewFeed = false;
         Log("User minimized Bigscreen desktop menu.");
@@ -822,6 +830,9 @@ void CheckFeedStatus() {
                 HWND hwndBig = FindBigscreenWindow();
                 if (hwndBig && !IsIconic(hwndBig)) {
                     ShowWindow(hwndBig, SW_MINIMIZE);
+                    if (g_keepForegroundUntilMinimized && g_hwnd && !IsIconic(g_hwnd)) {
+                        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                    }
                     SetForegroundWindow(g_hwnd);
                     Log("New audio/video feed detected (audio peak=%.3f). Loaded Theater Mode & auto-minimized Bigscreen menu.", g_audioPeak);
                 }
@@ -881,7 +892,61 @@ void TerminateVrProcesses() {
     CloseHandle(snap);
 }
 
+void MaintainForegroundWhileLaunching() {
+    if (!g_keepForegroundUntilMinimized || !g_hwnd || !IsWindow(g_hwnd) || IsIconic(g_hwnd)) {
+        return;
+    }
+    if (g_waitingForNewFeed || g_inProjectAppMenu) {
+        return;
+    }
+
+    static ULONGLONG s_lastEnforceMs = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - s_lastEnforceMs < 150) return;
+    s_lastEnforceMs = now;
+
+    if ((GetWindowLongW(g_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0) {
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    HWND fg = GetForegroundWindow();
+    if (fg && fg != g_hwnd) {
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(fg, &fgPid);
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, fgPid);
+        bool vrOrSteamStoleFocus = false;
+        if (hProc) {
+            wchar_t exePath[MAX_PATH]{};
+            DWORD sz = MAX_PATH;
+            if (QueryFullProcessImageNameW(hProc, 0, exePath, &sz)) {
+                if (wcsstr(exePath, L"Bigscreen.exe") ||
+                    wcsstr(exePath, L"vrmonitor.exe") ||
+                    wcsstr(exePath, L"vrserver.exe") ||
+                    wcsstr(exePath, L"vrcompositor.exe") ||
+                    wcsstr(exePath, L"steam.exe") ||
+                    wcsstr(exePath, L"steamwebhelper.exe")) {
+                    vrOrSteamStoleFocus = true;
+                }
+            }
+            CloseHandle(hProc);
+        }
+        if (vrOrSteamStoleFocus) {
+            SetForegroundWindow(g_hwnd);
+        }
+    }
+}
+
 void LaunchVrProcesses() {
+    g_keepForegroundUntilMinimized = true;
+    if (g_hwnd && IsWindow(g_hwnd)) {
+        if (IsIconic(g_hwnd)) {
+            ShowWindow(g_hwnd, SW_RESTORE);
+        }
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetForegroundWindow(g_hwnd);
+    }
     ShellExecuteW(nullptr, L"open", L"steam://rungameid/250820", nullptr, nullptr, SW_SHOW);
     ShellExecuteW(nullptr, L"open", L"steam://rungameid/457550", nullptr, nullptr, SW_SHOW);
 }
@@ -1263,7 +1328,9 @@ void ShowProjectAppMenu(HWND parentHwnd, float clickX, float clickY) {
     }
     POINT pt{ static_cast<LONG>(clickX), static_cast<LONG>(clickY) };
     ClientToScreen(parentHwnd, &pt);
+    g_inProjectAppMenu = true;
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, parentHwnd, nullptr);
+    g_inProjectAppMenu = false;
     DestroyMenu(hMenu);
     if (cmd >= 1000 && static_cast<size_t>(cmd - 1000) < windows.size()) {
         if (CanProjectInCurrentRoom()) {
@@ -2406,6 +2473,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
     }
 
     if (message == WM_SIZE) {
+        if (wParam == SIZE_MINIMIZED) {
+            if (g_keepForegroundUntilMinimized) {
+                g_keepForegroundUntilMinimized = false;
+                if (!g_alwaysOnTop) {
+                    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+                Log("User minimized viewer: cleared persistent foreground lock.");
+            }
+        }
         ResizeSwapChain(LOWORD(lParam), HIWORD(lParam));
         return 0;
     }
@@ -2802,6 +2879,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             DispatchMessage(&message);
         }
         EnsureBigscreenHookInjected();
+        MaintainForegroundWhileLaunching();
         UpdateRoomOwnershipState();
         CheckFeedStatus();
         ID3D11ShaderResourceView* source = nullptr;

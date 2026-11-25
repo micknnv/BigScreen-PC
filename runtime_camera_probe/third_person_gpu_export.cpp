@@ -137,6 +137,8 @@ const void* g_mFindObjectsOfType = nullptr;
 const void* g_mCompGetTransform = nullptr;
 const void* g_mGoGetTransform = nullptr;
 const void* g_mTransformSetLocalScale = nullptr;
+const void* g_mMonitorSetAspect = nullptr;
+const void* g_mMirroredUpdateAspect = nullptr;
 
 const void* g_fldMediaOrigScale = nullptr;
 const void* g_fldMediaScreensGo = nullptr;
@@ -809,37 +811,71 @@ const bigscreen_projected_video::State* GetProjectedVideoState() {
     return g_projectedState;
 }
 
+ID3D11Texture2D* ResolveDesktopTexture2D(void* nativePtr) {
+    if (!nativePtr) return nullptr;
+    IUnknown* unk = reinterpret_cast<IUnknown*>(nativePtr);
+    ID3D11Texture2D* tex = nullptr;
+    if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(&tex))) && tex) {
+        return tex;
+    }
+    ID3D11ShaderResourceView* srv = nullptr;
+    if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(&srv))) && srv) {
+        ID3D11Resource* res = nullptr;
+        srv->GetResource(&res);
+        if (res) {
+            res->QueryInterface(IID_PPV_ARGS(&tex));
+            res->Release();
+        }
+        srv->Release();
+    }
+    return tex;
+}
+
 void RouteDesktopTexture() {
     const auto* pState = GetProjectedVideoState();
     if (!pState) {
         return;
     }
 
+    const auto state = *pState;
+    if (!state.active && !state.privacyMode) {
+        if (g_sharedVideoTex) {
+            g_sharedVideoTex->Release();
+            g_sharedVideoTex = nullptr;
+            g_currentSharedHandle = 0;
+        }
+        return;
+    }
+
     if (!g_pfnGetNativeDesktop) return;
-    ID3D11Texture2D* pDesktopTex = g_pfnGetNativeDesktop(0);
+    void* rawDesktopPtr = g_pfnGetNativeDesktop(0);
+    ID3D11Texture2D* pDesktopTex = ResolveDesktopTexture2D(rawDesktopPtr);
     if (!pDesktopTex) return;
 
     ID3D11Device* pDevice = nullptr;
     pDesktopTex->GetDevice(&pDevice);
-    if (!pDevice) return;
+    if (!pDevice) {
+        pDesktopTex->Release();
+        return;
+    }
 
     ID3D11DeviceContext* pContext = nullptr;
     pDevice->GetImmediateContext(&pContext);
     if (!pContext) {
         pDevice->Release();
+        pDesktopTex->Release();
         return;
     }
 
     D3D11_TEXTURE2D_DESC deskDesc{};
     pDesktopTex->GetDesc(&deskDesc);
 
-    const auto state = *g_projectedState;
-
     if (state.active && state.sharedHandle) {
         if (!g_sharedVideoTex || g_currentSharedHandle != state.sharedHandle) {
             if (g_sharedVideoTex) {
                 g_sharedVideoTex->Release();
                 g_sharedVideoTex = nullptr;
+                g_currentSharedHandle = 0;
             }
             HRESULT hr = pDevice->OpenSharedResource(reinterpret_cast<HANDLE>(state.sharedHandle), IID_PPV_ARGS(&g_sharedVideoTex));
             if (SUCCEEDED(hr) && g_sharedVideoTex) {
@@ -851,9 +887,16 @@ void RouteDesktopTexture() {
             D3D11_TEXTURE2D_DESC vidDesc{};
             g_sharedVideoTex->GetDesc(&vidDesc);
 
-            if (vidDesc.Width == deskDesc.Width && vidDesc.Height == deskDesc.Height && vidDesc.Format == deskDesc.Format) {
+            auto isBgra8 = [](DXGI_FORMAT f) {
+                return f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                       f == DXGI_FORMAT_B8G8R8A8_TYPELESS || f == DXGI_FORMAT_B8G8R8X8_UNORM;
+            };
+            const bool compatFmt = (vidDesc.Format == deskDesc.Format) ||
+                                   (isBgra8(vidDesc.Format) && isBgra8(deskDesc.Format));
+
+            if (vidDesc.Width == deskDesc.Width && vidDesc.Height == deskDesc.Height && compatFmt) {
                 pContext->CopyResource(pDesktopTex, g_sharedVideoTex);
-            } else {
+            } else if (compatFmt) {
                 UINT copyW = (std::min)(vidDesc.Width, deskDesc.Width);
                 UINT copyH = (std::min)(vidDesc.Height, deskDesc.Height);
                 UINT dstX = (deskDesc.Width > copyW) ? (deskDesc.Width - copyW) / 2 : 0;
@@ -863,18 +906,15 @@ void RouteDesktopTexture() {
             }
         }
     } else if (state.privacyMode) {
-        if (g_sharedVideoTex && !state.active) {
-            pContext->CopyResource(pDesktopTex, g_sharedVideoTex);
-        } else {
-            EnsureBlackTexture(pDevice, deskDesc);
-            if (g_blackTex) {
-                pContext->CopyResource(pDesktopTex, g_blackTex);
-            }
+        EnsureBlackTexture(pDevice, deskDesc);
+        if (g_blackTex) {
+            pContext->CopyResource(pDesktopTex, g_blackTex);
         }
     }
 
     pContext->Release();
     pDevice->Release();
+    pDesktopTex->Release();
 }
 
 // --------------------------------------------------------------------------
@@ -1316,7 +1356,7 @@ void ApplyScreenAspectOverridesOnMainThread() {
                 int applyW = (ov > 0.1f) ? static_cast<int>(ov * 1000.0f + 0.5f) : origW;
                 int applyH = (ov > 0.1f) ? 1000 : origH;
                 g_inAspectReapply = true;
-                g_origMonitorSetAspect(sizer, applyW, applyH, nullptr);
+                g_origMonitorSetAspect(sizer, applyW, applyH, g_mMonitorSetAspect);
                 g_inAspectReapply = false;
             }
         }
@@ -1333,12 +1373,16 @@ void ApplyScreenAspectOverridesOnMainThread() {
             for (uint32_t i = 0; i < n && i < 32; ++i) {
                 void* mirrored = elems[i];
                 if (!mirrored) continue;
-                void* tex = FindMirroredTexFallback(mirrored);
-                if (!tex) continue;
+                void* trackedTex = nullptr;
+                for (const auto& e : g_trackedMirrored) {
+                    if (e.ptr == mirrored) { trackedTex = e.lastTex; break; }
+                }
                 if (changed && ov <= 0.1f) {
-                    g_inAspectReapply = true;
-                    g_origMirroredUpdateAspect(mirrored, tex, nullptr);
-                    g_inAspectReapply = false;
+                    if (trackedTex) {
+                        g_inAspectReapply = true;
+                        g_origMirroredUpdateAspect(mirrored, trackedTex, g_mMirroredUpdateAspect);
+                        g_inAspectReapply = false;
+                    }
                 } else if (ov > 0.1f) {
                     const auto* orig = reinterpret_cast<const Il2CppVec3*>(reinterpret_cast<const uint8_t*>(mirrored) + 0x80);
                     if (orig->x > 0.001f && orig->x < 5000.0f && orig->z > 0.0001f && orig->z < 5000.0f) {
@@ -1485,6 +1529,8 @@ void TryInstallAppTickHook() {
         const void* mSetAspect = fnMethodFromName(g_klassMonitorSizer, "SetAspectRatio", 2);
         const void* mLerpAspect = fnMethodFromName(g_klassMonitorSizer, "LerpAspectRatio", 2);
         const void* mMirroredUpdate = fnMethodFromName(g_klassMirroredScreen, "UpdateScreenAspectRatio", 1);
+        g_mMonitorSetAspect = mSetAspect;
+        g_mMirroredUpdateAspect = mMirroredUpdate;
 
         InstallNonRipPrologueHook(mSetAspect, prefMovRbxRsiRdi, 15, 15, reinterpret_cast<void*>(Hooked_MonitorSetAspect),
                                   reinterpret_cast<void**>(&g_origMonitorSetAspect), &g_pTrampMonitorSet);
