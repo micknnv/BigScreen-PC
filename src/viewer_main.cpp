@@ -1522,15 +1522,42 @@ std::wstring FindBundledVddInfPath() {
     return L"";
 }
 
-bool EnsureVddSettingsFile(const std::wstring& infPath) {
+bool EnsureVddSettingsFile(const std::wstring& infPath, bool* outUpdated = nullptr) {
+    if (outUpdated) *outUpdated = false;
     std::error_code ec;
     fs::path targetDir(L"C:\\VirtualDisplayDriver");
     fs::create_directories(targetDir, ec);
     fs::path targetXml = targetDir / L"vdd_settings.xml";
-    if (!fs::exists(targetXml, ec) && !infPath.empty()) {
+    if (!infPath.empty()) {
         fs::path srcXml = fs::path(infPath).parent_path() / L"vdd_settings.xml";
         if (fs::exists(srcXml, ec)) {
-            fs::copy_file(srcXml, targetXml, fs::copy_options::overwrite_existing, ec);
+            bool differs = !fs::exists(targetXml, ec);
+            if (!differs) {
+                differs = (fs::file_size(srcXml, ec) != fs::file_size(targetXml, ec));
+            }
+            if (!differs) {
+                FILE* f1 = nullptr; FILE* f2 = nullptr;
+                if (_wfopen_s(&f1, srcXml.c_str(), L"rb") == 0 && f1 &&
+                    _wfopen_s(&f2, targetXml.c_str(), L"rb") == 0 && f2) {
+                    char buf1[4096]{}, buf2[4096]{};
+                    size_t n1 = fread(buf1, 1, sizeof(buf1), f1);
+                    size_t n2 = fread(buf2, 1, sizeof(buf2), f2);
+                    differs = (n1 != n2) || (std::memcmp(buf1, buf2, n1) != 0);
+                }
+                if (f1) fclose(f1);
+                if (f2) fclose(f2);
+            }
+            if (differs) {
+                if (fs::exists(targetXml, ec)) {
+                    fs::path bakXml = targetDir / L"vdd_settings.xml.pre_bigscreen_bak";
+                    if (!fs::exists(bakXml, ec)) {
+                        fs::copy_file(targetXml, bakXml, ec);
+                    }
+                }
+                if (fs::copy_file(srcXml, targetXml, fs::copy_options::overwrite_existing, ec)) {
+                    if (outUpdated) *outUpdated = true;
+                }
+            }
         }
     }
     return fs::exists(targetXml, ec);
@@ -1889,32 +1916,205 @@ void EnsureExtendedTopologyForVirtualScreen(std::wstring& devName, bool& already
 
     // Ensure a real physical display remains Primary at (0,0) if Windows promoted Virtual Screen to Primary
     IsVirtualDisplayClonedOrPrimary(devName, &isPrimary, &isCloned);
-    if (isPrimary) {
-        DISPLAY_DEVICEW dd{};
-        dd.cb = sizeof(dd);
-        for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
-            const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
-            if (attached && !IsVirtualDisplayDevice(dd) && wcsstr(dd.DeviceString, L"Immersed") == nullptr) {
-                DEVMODEW physDm{};
-                physDm.dmSize = sizeof(physDm);
-                if (EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &physDm, 0) &&
-                    physDm.dmPelsWidth > 0 && physDm.dmPelsHeight > 0) {
-                    physDm.dmFields |= DM_POSITION;
-                    physDm.dmPosition.x = 0;
-                    physDm.dmPosition.y = 0;
-                    ChangeDisplaySettingsExW(dd.DeviceName, &physDm, nullptr,
-                                             CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
-                    ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
-                    Sleep(300);
-                    break;
-                }
+}
+
+std::wstring FindPrimaryPhysicalDisplayDevice() {
+    std::wstring firstPhysical;
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+        if (attached && !IsVirtualDisplayDevice(dd) && wcsstr(dd.DeviceString, L"Immersed") == nullptr) {
+            if ((dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0) {
+                return dd.DeviceName;
             }
-            dd = {};
-            dd.cb = sizeof(dd);
+            if (firstPhysical.empty()) {
+                firstPhysical = dd.DeviceName;
+            }
         }
-        std::wstring refreshed = FindVirtualDisplayDeviceName(&alreadyAttached);
-        if (!refreshed.empty()) devName = refreshed;
+        dd = {};
+        dd.cb = sizeof(dd);
     }
+    return firstPhysical;
+}
+
+bool ForcePrimaryMonitorViaCcd(const std::wstring& primaryPhysDev, const std::wstring& vddDev,
+                               LONG vddPosX, uint32_t vddW, uint32_t vddH) {
+    if (primaryPhysDev.empty()) return false;
+    UINT32 np = 0, nm = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || np == 0) {
+        return false;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(np);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nm);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    UINT32 physModeIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    UINT32 vddModeIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    for (UINT32 i = 0; i < np; ++i) {
+        if (paths[i].sourceInfo.modeInfoIdx >= nm) continue;
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName{};
+        srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        srcName.header.size = sizeof(srcName);
+        srcName.header.adapterId = paths[i].sourceInfo.adapterId;
+        srcName.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&srcName.header) == ERROR_SUCCESS) {
+            if (_wcsicmp(srcName.viewGdiDeviceName, primaryPhysDev.c_str()) == 0) {
+                physModeIdx = paths[i].sourceInfo.modeInfoIdx;
+            } else if (!vddDev.empty() && _wcsicmp(srcName.viewGdiDeviceName, vddDev.c_str()) == 0) {
+                vddModeIdx = paths[i].sourceInfo.modeInfoIdx;
+            }
+        }
+    }
+    if (physModeIdx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID ||
+        modes[physModeIdx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+        return false;
+    }
+
+    const LONG shiftX = modes[physModeIdx].sourceMode.position.x;
+    const LONG shiftY = modes[physModeIdx].sourceMode.position.y;
+    for (UINT32 m = 0; m < nm; ++m) {
+        if (modes[m].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+            modes[m].sourceMode.position.x -= shiftX;
+            modes[m].sourceMode.position.y -= shiftY;
+        }
+    }
+    if (vddModeIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID &&
+        vddModeIdx != physModeIdx &&
+        modes[vddModeIdx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+        modes[vddModeIdx].sourceMode.position.x = vddPosX;
+        modes[vddModeIdx].sourceMode.position.y = 0;
+        modes[vddModeIdx].sourceMode.width = vddW;
+        modes[vddModeIdx].sourceMode.height = vddH;
+    }
+
+    LONG rc = SetDisplayConfig(np, paths.data(), nm, modes.data(),
+                               SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    return rc == ERROR_SUCCESS;
+}
+
+bool ApplyExtendedLayoutPreservingPrimary(const std::wstring& anchorPrimaryDev,
+                                          std::wstring& vddDev,
+                                          uint32_t targetW, uint32_t targetH) {
+    struct PhysMon {
+        std::wstring devName;
+        DEVMODEW dm{};
+        bool isPrimary = false;
+    };
+    std::vector<PhysMon> physList;
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+        if (attached && !IsVirtualDisplayDevice(dd) &&
+            wcsstr(dd.DeviceString, L"Immersed") == nullptr &&
+            _wcsicmp(dd.DeviceName, vddDev.c_str()) != 0) {
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0) &&
+                dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0) {
+                PhysMon pm;
+                pm.devName = dd.DeviceName;
+                pm.dm = dm;
+                pm.isPrimary = (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+                physList.push_back(pm);
+            }
+        }
+        dd = {};
+        dd.cb = sizeof(dd);
+    }
+
+    if (physList.empty()) return false;
+
+    size_t primIdx = 0;
+    bool foundAnchor = false;
+    if (!anchorPrimaryDev.empty()) {
+        for (size_t i = 0; i < physList.size(); ++i) {
+            if (_wcsicmp(physList[i].devName.c_str(), anchorPrimaryDev.c_str()) == 0) {
+                primIdx = i;
+                foundAnchor = true;
+                break;
+            }
+        }
+    }
+    if (!foundAnchor) {
+        for (size_t i = 0; i < physList.size(); ++i) {
+            if (physList[i].isPrimary) {
+                primIdx = i;
+                foundAnchor = true;
+                break;
+            }
+        }
+    }
+
+    const LONG origPrimX = physList[primIdx].dm.dmPosition.x;
+    const LONG origPrimY = physList[primIdx].dm.dmPosition.y;
+    LONG maxRight = 1920;
+
+    for (size_t i = 0; i < physList.size(); ++i) {
+        physList[i].dm.dmFields |= DM_POSITION;
+        physList[i].dm.dmPosition.x -= origPrimX;
+        physList[i].dm.dmPosition.y -= origPrimY;
+        LONG rightEdge = physList[i].dm.dmPosition.x + static_cast<LONG>(physList[i].dm.dmPelsWidth);
+        if (rightEdge > maxRight) maxRight = rightEdge;
+    }
+
+    // Find exact 1920x1080 mode supported by MttVDD (prefer 60Hz)
+    DEVMODEW vddDm{};
+    bool hasExact = false;
+    for (DWORD modeIdx = 0;; ++modeIdx) {
+        DEVMODEW cand{};
+        cand.dmSize = sizeof(cand);
+        if (!EnumDisplaySettingsExW(vddDev.c_str(), modeIdx, &cand, 0)) break;
+        if (cand.dmPelsWidth == targetW && cand.dmPelsHeight == targetH && cand.dmBitsPerPel == 32) {
+            if (!hasExact || cand.dmDisplayFrequency == 60) {
+                vddDm = cand;
+                hasExact = true;
+                if (cand.dmDisplayFrequency == 60) break;
+            }
+        }
+    }
+    if (!hasExact) {
+        vddDm.dmSize = sizeof(vddDm);
+        vddDm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY | DM_POSITION;
+        vddDm.dmPelsWidth = targetW;
+        vddDm.dmPelsHeight = targetH;
+        vddDm.dmBitsPerPel = 32;
+        vddDm.dmDisplayFrequency = 60;
+    } else {
+        vddDm.dmFields |= DM_POSITION;
+    }
+    vddDm.dmPosition.x = maxRight;
+    vddDm.dmPosition.y = 0;
+
+    // Atomic batch: stage ALL monitors before calling commit once so Windows preserves Main Display cleanly
+    for (size_t i = 0; i < physList.size(); ++i) {
+        DWORD flags = CDS_UPDATEREGISTRY | CDS_NORESET;
+        if (i == primIdx) flags |= CDS_SET_PRIMARY;
+        ChangeDisplaySettingsExW(physList[i].devName.c_str(), &physList[i].dm, nullptr, flags, nullptr);
+    }
+    LONG vddStageRes = ChangeDisplaySettingsExW(vddDev.c_str(), &vddDm, nullptr,
+                                                CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+    if (vddStageRes != DISP_CHANGE_SUCCESSFUL) {
+        vddDm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_POSITION;
+        ChangeDisplaySettingsExW(vddDev.c_str(), &vddDm, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+    }
+    LONG commitRes = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+    Sleep(250);
+
+    bool dummyAttached = false;
+    std::wstring refreshed = FindVirtualDisplayDeviceName(&dummyAttached);
+    if (!refreshed.empty()) vddDev = refreshed;
+
+    bool vddStillPrimary = false, vddCloned = false;
+    IsVirtualDisplayClonedOrPrimary(vddDev, &vddStillPrimary, &vddCloned);
+    if (commitRes != DISP_CHANGE_SUCCESSFUL || vddStillPrimary) {
+        ForcePrimaryMonitorViaCcd(physList[primIdx].devName, vddDev, maxRight, targetW, targetH);
+        Sleep(250);
+    }
+    return true;
 }
 
 bool ActivateDisplayPathViaCcd(const std::wstring& devName) {
@@ -2017,6 +2217,17 @@ std::vector<MonitorEntry> EnumerateSelectableScreens() {
 
 bool LoadVirtualScreen() {
     g_lastVddError.clear();
+
+    // Snapshot user's real Primary monitor BEFORE attaching/reloading Virtual Screen
+    std::wstring anchorPrimaryDev = FindPrimaryPhysicalDisplayDevice();
+
+    // Sync C:\VirtualDisplayDriver\vdd_settings.xml so ONLY 1920x1080 is exposed (no 800x600)
+    bool xmlUpdated = false;
+    EnsureVddSettingsFile(FindBundledVddInfPath(), &xmlUpdated);
+    if (xmlUpdated && SendMttVddCommand(L"RELOAD_DRIVER")) {
+        Sleep(500);
+    }
+
     if (!EnsureVirtualDisplayDriverInstalled(g_hwnd)) {
         return false;
     }
@@ -2030,112 +2241,37 @@ bool LoadVirtualScreen() {
 
     EnsureExtendedTopologyForVirtualScreen(devName, alreadyAttached);
 
-    // Place Virtual Screen cleanly to the right of all currently attached real displays (never at (0,0) Primary)
-    LONG posX = 0;
-    bool anyAttached = false;
-    DISPLAY_DEVICEW dd{};
-    dd.cb = sizeof(dd);
-    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
-        if ((dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0 &&
-            _wcsicmp(dd.DeviceName, devName.c_str()) != 0 &&
-            !IsVirtualDisplayDevice(dd)) {
-            DEVMODEW dm{};
-            dm.dmSize = sizeof(dm);
-            if (EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0)) {
-                LONG rightEdge = dm.dmPosition.x + static_cast<LONG>(dm.dmPelsWidth);
-                if (!anyAttached || rightEdge > posX) {
-                    posX = rightEdge;
-                    anyAttached = true;
-                }
-            }
-        }
-        dd = {};
-        dd.cb = sizeof(dd);
-    }
-    if (!anyAttached || posX <= 0) posX = (std::max)(1920, GetSystemMetrics(SM_CXSCREEN));
-
-    // Find an exact enumerated 1920x1080 mode supported by the driver (prefer 60Hz)
-    DEVMODEW exactMode{};
-    bool hasExactMode = false;
-    for (DWORD modeIdx = 0;; ++modeIdx) {
-        DEVMODEW cand{};
-        cand.dmSize = sizeof(cand);
-        if (!EnumDisplaySettingsExW(devName.c_str(), modeIdx, &cand, 0)) break;
-        if (cand.dmPelsWidth == 1920 && cand.dmPelsHeight == 1080 && cand.dmBitsPerPel == 32) {
-            if (!hasExactMode || cand.dmDisplayFrequency == 60) {
-                exactMode = cand;
-                hasExactMode = true;
-                if (cand.dmDisplayFrequency == 60) break;
-            }
-        }
+    if (!alreadyAttached) {
+        ActivateDisplayPathViaCcd(devName);
+        Sleep(300);
+        std::wstring refreshed = FindVirtualDisplayDeviceName(&alreadyAttached);
+        if (!refreshed.empty()) devName = refreshed;
     }
 
-    DEVMODEW curDm{};
-    curDm.dmSize = sizeof(curDm);
-    bool isNowAttached = alreadyAttached &&
-                         EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &curDm, 0) &&
-                         curDm.dmPelsWidth == 1920 && curDm.dmPelsHeight == 1080 &&
-                         (curDm.dmPosition.x != 0 || curDm.dmPosition.y != 0);
+    // Apply 1920x1080 on Virtual Screen and guarantee physical monitor stays Main Display (0,0)
+    ApplyExtendedLayoutPreservingPrimary(anchorPrimaryDev, devName, 1920, 1080);
 
-    if (!isNowAttached) {
-        if (!alreadyAttached) {
-            ActivateDisplayPathViaCcd(devName);
-            Sleep(300);
-            std::wstring refreshed = FindVirtualDisplayDeviceName(&alreadyAttached);
-            if (!refreshed.empty()) devName = refreshed;
-        }
-
-        DEVMODEW targetDm{};
-        if (hasExactMode) {
-            targetDm = exactMode;
-            targetDm.dmFields |= DM_POSITION;
-        } else {
-            targetDm.dmSize = sizeof(targetDm);
-            targetDm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY | DM_POSITION;
-            targetDm.dmPelsWidth = 1920;
-            targetDm.dmPelsHeight = 1080;
-            targetDm.dmBitsPerPel = 32;
-            targetDm.dmDisplayFrequency = 60;
-        }
-        targetDm.dmPosition.x = posX;
-        targetDm.dmPosition.y = 0;
-
-        LONG res = ChangeDisplaySettingsExW(devName.c_str(), &targetDm, nullptr,
-                                            CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
-        if (res != DISP_CHANGE_SUCCESSFUL) {
-            targetDm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_POSITION;
-            res = ChangeDisplaySettingsExW(devName.c_str(), &targetDm, nullptr,
-                                           CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
-        }
-        if (res == DISP_CHANGE_SUCCESSFUL) {
-            ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
-        } else {
-            res = ChangeDisplaySettingsExW(devName.c_str(), &targetDm, nullptr, CDS_NORESET, nullptr);
-            if (res == DISP_CHANGE_SUCCESSFUL) {
-                ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
-            }
-        }
-        Sleep(250);
-    }
-
-    // Re-query GDI device name in case Windows renumbered DISPLAY18 -> DISPLAY19 during attach
     std::wstring finalDev = FindVirtualDisplayDeviceName(&alreadyAttached);
     if (!finalDev.empty()) devName = finalDev;
 
-    // Final duplicate check so we never expose a cloned primary display as Virtual Screen
     bool finalPrimary = false, finalCloned = false;
     if (IsVirtualDisplayClonedOrPrimary(devName, &finalPrimary, &finalCloned)) {
-        EnsureExtendedTopologyForVirtualScreen(devName, alreadyAttached);
+        if (finalCloned) {
+            EnsureExtendedTopologyForVirtualScreen(devName, alreadyAttached);
+        }
+        ApplyExtendedLayoutPreservingPrimary(anchorPrimaryDev, devName, 1920, 1080);
     }
 
     DEVMODEW verifyDm{};
     verifyDm.dmSize = sizeof(verifyDm);
     if (!EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &verifyDm, 0) ||
-        verifyDm.dmPelsWidth == 0 || verifyDm.dmPelsHeight == 0) {
+        verifyDm.dmPelsWidth != 1920 || verifyDm.dmPelsHeight != 1080) {
         wchar_t msg[256]{};
-        swprintf_s(msg, L"Could not attach %ls at 1920x1080 on Windows Desktop.", devName.c_str());
+        swprintf_s(msg, L"Could not attach %ls at 1920x1080 on Windows Desktop (got %ux%u).",
+                   devName.c_str(), verifyDm.dmPelsWidth, verifyDm.dmPelsHeight);
         g_lastVddError = msg;
-        Log("LoadVirtualScreen failed to activate %ls at 1920x1080", devName.c_str());
+        Log("LoadVirtualScreen failed to activate %ls at 1920x1080 (got %ux%u)",
+            devName.c_str(), verifyDm.dmPelsWidth, verifyDm.dmPelsHeight);
         return false;
     }
 
@@ -2150,10 +2286,11 @@ bool LoadVirtualScreen() {
     g_projectedMonitorRect = g_virtualMonitorRect;
     g_selectedScreenLabel = L"Virtual Screen (1920x1080)";
     g_controlVirtualScreen = true;
-    Log("Loaded Virtual Screen %ls at (%ld,%ld) %ux%u",
+    Log("Loaded Virtual Screen %ls at (%ld,%ld) %ux%u (Primary physical=%ls)",
         g_virtualMonitorDev.c_str(),
         g_virtualMonitorRect.left, g_virtualMonitorRect.top,
-        verifyDm.dmPelsWidth, verifyDm.dmPelsHeight);
+        verifyDm.dmPelsWidth, verifyDm.dmPelsHeight,
+        anchorPrimaryDev.c_str());
     return true;
 }
 
