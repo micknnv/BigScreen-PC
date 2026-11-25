@@ -363,6 +363,10 @@ struct MonitorEntry {
 std::wstring g_virtualMonitorDev;
 RECT g_virtualMonitorRect{};
 bool g_virtualScreenLoaded = false;
+int g_vddBaseCountBeforeLoad = 0;
+bool g_heldProjectBtn = false;
+ULONGLONG g_projectHoldStartMs = 0;
+bool g_projectHoldTriggered = false;
 std::wstring g_selectedScreenLabel;
 RECT g_projectedMonitorRect{};
 bool g_controlVirtualScreen = false;
@@ -1601,6 +1605,7 @@ void ExecuteRemoteDpadStep(RemoteBtn btn, bool updateLcd = true) {
 
 void StartProjectingAppWindow(HWND targetHwnd, const std::wstring& title) {
     if (!targetHwnd || !IsWindow(targetHwnd)) return;
+    UnloadVirtualScreen();
     ReleaseProjectedAppResources();
     g_projectedHwnd = targetHwnd;
     g_projectedTitle = title;
@@ -1611,6 +1616,7 @@ void StartProjectingAppWindow(HWND targetHwnd, const std::wstring& title) {
     SyncPointerAndLook();
     CaptureProjectedWindowFrame();
     CloakAppWindow(g_projectedHwnd);
+    SetLcdNotification(L"PROJECTING APP", L"PRIVATE WINDOW", 3500);
     Log("Started projecting isolated application window: %ls (Cloaked from desktop)", g_projectedTitle.c_str());
 }
 
@@ -1690,7 +1696,7 @@ std::wstring FindBundledVddInfPath() {
     return L"";
 }
 
-bool EnsureVddSettingsFile(const std::wstring& infPath, bool* outUpdated = nullptr) {
+bool EnsureVddSettingsFile(const std::wstring& infPath, bool* outUpdated = nullptr, int targetMonitorCount = 1) {
     if (outUpdated) *outUpdated = false;
     std::error_code ec;
     fs::path targetDir(L"C:\\VirtualDisplayDriver");
@@ -1699,31 +1705,47 @@ bool EnsureVddSettingsFile(const std::wstring& infPath, bool* outUpdated = nullp
     if (!infPath.empty()) {
         fs::path srcXml = fs::path(infPath).parent_path() / L"vdd_settings.xml";
         if (fs::exists(srcXml, ec)) {
-            bool differs = !fs::exists(targetXml, ec);
-            if (!differs) {
-                differs = (fs::file_size(srcXml, ec) != fs::file_size(targetXml, ec));
-            }
-            if (!differs) {
-                FILE* f1 = nullptr; FILE* f2 = nullptr;
-                if (_wfopen_s(&f1, srcXml.c_str(), L"rb") == 0 && f1 &&
-                    _wfopen_s(&f2, targetXml.c_str(), L"rb") == 0 && f2) {
-                    char buf1[4096]{}, buf2[4096]{};
-                    size_t n1 = fread(buf1, 1, sizeof(buf1), f1);
-                    size_t n2 = fread(buf2, 1, sizeof(buf2), f2);
-                    differs = (n1 != n2) || (std::memcmp(buf1, buf2, n1) != 0);
+            std::string desiredXml;
+            {
+                FILE* f1 = nullptr;
+                if (_wfopen_s(&f1, srcXml.c_str(), L"rb") == 0 && f1) {
+                    char buf[4096]{};
+                    size_t n = fread(buf, 1, sizeof(buf) - 1, f1);
+                    fclose(f1);
+                    desiredXml.assign(buf, n);
                 }
-                if (f1) fclose(f1);
-                if (f2) fclose(f2);
             }
-            if (differs) {
-                if (fs::exists(targetXml, ec)) {
-                    fs::path bakXml = targetDir / L"vdd_settings.xml.pre_bigscreen_bak";
-                    if (!fs::exists(bakXml, ec)) {
-                        fs::copy_file(targetXml, bakXml, ec);
+            if (!desiredXml.empty()) {
+                if (targetMonitorCount > 1) {
+                    size_t cOpen = desiredXml.find("<count>");
+                    size_t cClose = (cOpen != std::string::npos) ? desiredXml.find("</count>", cOpen) : std::string::npos;
+                    if (cOpen != std::string::npos && cClose != std::string::npos) {
+                        desiredXml.replace(cOpen + 7, cClose - (cOpen + 7), std::to_string(targetMonitorCount));
                     }
                 }
-                if (fs::copy_file(srcXml, targetXml, fs::copy_options::overwrite_existing, ec)) {
-                    if (outUpdated) *outUpdated = true;
+                std::string currentXml;
+                if (fs::exists(targetXml, ec)) {
+                    FILE* f2 = nullptr;
+                    if (_wfopen_s(&f2, targetXml.c_str(), L"rb") == 0 && f2) {
+                        char buf[4096]{};
+                        size_t n = fread(buf, 1, sizeof(buf) - 1, f2);
+                        fclose(f2);
+                        currentXml.assign(buf, n);
+                    }
+                }
+                if (currentXml != desiredXml) {
+                    if (fs::exists(targetXml, ec)) {
+                        fs::path bakXml = targetDir / L"vdd_settings.xml.pre_bigscreen_bak";
+                        if (!fs::exists(bakXml, ec)) {
+                            fs::copy_file(targetXml, bakXml, ec);
+                        }
+                    }
+                    FILE* fOut = nullptr;
+                    if (_wfopen_s(&fOut, targetXml.c_str(), L"wb") == 0 && fOut) {
+                        size_t written = fwrite(desiredXml.data(), 1, desiredXml.size(), fOut);
+                        fclose(fOut);
+                        if (written == desiredXml.size() && outUpdated) *outUpdated = true;
+                    }
                 }
             }
         }
@@ -1743,6 +1765,49 @@ bool SendMttVddCommand(const wchar_t* cmd) {
     BOOL ok = WriteFile(hPipe, cmd, bytes, &written, nullptr);
     CloseHandle(hPipe);
     return ok && written == bytes;
+}
+
+std::vector<std::wstring> EnumerateAttachedVddDevices() {
+    std::vector<std::wstring> devs;
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        if (IsVirtualDisplayDevice(dd) && (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0) {
+            devs.push_back(dd.DeviceName);
+        }
+        dd = {};
+        dd.cb = sizeof(dd);
+    }
+    return devs;
+}
+
+bool ContainsDeviceName(const std::vector<std::wstring>& list, const std::wstring& dev) {
+    for (const auto& s : list) {
+        if (_wcsicmp(s.c_str(), dev.c_str()) == 0) return true;
+    }
+    return false;
+}
+
+std::wstring FindNewVirtualDisplayDeviceName(const std::vector<std::wstring>& excludeDevs, bool* outAttached) {
+    if (outAttached) *outAttached = false;
+    std::wstring fallbackUnattached;
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        if (IsVirtualDisplayDevice(dd) && !ContainsDeviceName(excludeDevs, dd.DeviceName)) {
+            const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+            if (attached) {
+                if (outAttached) *outAttached = true;
+                return dd.DeviceName;
+            }
+            if (fallbackUnattached.empty()) {
+                fallbackUnattached = dd.DeviceName;
+            }
+        }
+        dd = {};
+        dd.cb = sizeof(dd);
+    }
+    return fallbackUnattached;
 }
 
 std::wstring FindVirtualDisplayDeviceName(bool* outAttached) {
@@ -2088,22 +2153,28 @@ void EnsureExtendedTopologyForVirtualScreen(std::wstring& devName, bool& already
 
 std::wstring FindPrimaryPhysicalDisplayDevice() {
     std::wstring firstPhysical;
+    std::wstring primaryFallback;
+    std::wstring anyAttachedFallback;
     DISPLAY_DEVICEW dd{};
     dd.cb = sizeof(dd);
     for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
         const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
-        if (attached && !IsVirtualDisplayDevice(dd) && wcsstr(dd.DeviceString, L"Immersed") == nullptr) {
-            if ((dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0) {
-                return dd.DeviceName;
-            }
-            if (firstPhysical.empty()) {
-                firstPhysical = dd.DeviceName;
+        if (attached && wcsstr(dd.DeviceString, L"Immersed") == nullptr) {
+            const bool isPrimary = (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+            if (!IsVirtualDisplayDevice(dd)) {
+                if (isPrimary) return dd.DeviceName;
+                if (firstPhysical.empty()) firstPhysical = dd.DeviceName;
+            } else {
+                if (isPrimary && primaryFallback.empty()) primaryFallback = dd.DeviceName;
+                if (anyAttachedFallback.empty()) anyAttachedFallback = dd.DeviceName;
             }
         }
         dd = {};
         dd.cb = sizeof(dd);
     }
-    return firstPhysical;
+    if (!firstPhysical.empty()) return firstPhysical;
+    if (!primaryFallback.empty()) return primaryFallback;
+    return anyAttachedFallback;
 }
 
 bool ForcePrimaryMonitorViaCcd(const std::wstring& primaryPhysDev, const std::wstring& vddDev,
@@ -2176,7 +2247,7 @@ bool ApplyExtendedLayoutPreservingPrimary(const std::wstring& anchorPrimaryDev,
     dd.cb = sizeof(dd);
     for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
         const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
-        if (attached && !IsVirtualDisplayDevice(dd) &&
+        if (attached &&
             wcsstr(dd.DeviceString, L"Immersed") == nullptr &&
             _wcsicmp(dd.DeviceName, vddDev.c_str()) != 0) {
             DEVMODEW dm{};
@@ -2345,20 +2416,25 @@ bool ActivateDisplayPathViaCcd(const std::wstring& devName) {
     return rc == ERROR_SUCCESS;
 }
 
-std::vector<MonitorEntry> EnumerateSelectableScreens() {
+std::vector<MonitorEntry> EnumerateSelectableScreens(bool* outOnlyVddMonitors = nullptr) {
+    if (outOnlyVddMonitors) *outOnlyVddMonitors = false;
     std::vector<MonitorEntry> screens;
+    int nonVddCount = 0;
+    int vddCount = 0;
     DISPLAY_DEVICEW dd{};
     dd.cb = sizeof(dd);
     int screenNum = 1;
     for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
         const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
-        const bool isVdd = IsVirtualDisplayDevice(dd) ||
-                           (!g_virtualMonitorDev.empty() && _wcsicmp(dd.DeviceName, g_virtualMonitorDev.c_str()) == 0);
-        if (attached && !isVdd) {
+        const bool isViewerOwnedVdd = !g_virtualMonitorDev.empty() && _wcsicmp(dd.DeviceName, g_virtualMonitorDev.c_str()) == 0;
+        if (attached && !isViewerOwnedVdd && wcsstr(dd.DeviceString, L"Immersed") == nullptr) {
+            const bool isVdd = IsVirtualDisplayDevice(dd);
             DEVMODEW dm{};
             dm.dmSize = sizeof(dm);
             if (EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0) &&
                 dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0) {
+                if (isVdd) ++vddCount;
+                else ++nonVddCount;
                 MonitorEntry entry;
                 entry.deviceName = dd.DeviceName;
                 entry.isPrimary = (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
@@ -2369,9 +2445,10 @@ std::vector<MonitorEntry> EnumerateSelectableScreens() {
                     dm.dmPosition.y + static_cast<LONG>(dm.dmPelsHeight)
                 };
                 wchar_t buf[160]{};
-                swprintf_s(buf, L"Monitor %d%ls  (%ux%u)",
+                swprintf_s(buf, L"Monitor %d%ls%ls  (%ux%u)",
                            screenNum++,
                            entry.isPrimary ? L" [Primary]" : L"",
+                           isVdd ? L" [Virtual]" : L"",
                            dm.dmPelsWidth, dm.dmPelsHeight);
                 entry.label = buf;
                 screens.push_back(entry);
@@ -2380,18 +2457,32 @@ std::vector<MonitorEntry> EnumerateSelectableScreens() {
         dd = {};
         dd.cb = sizeof(dd);
     }
+    if (outOnlyVddMonitors) {
+        *outOnlyVddMonitors = (nonVddCount == 0 && vddCount >= 1);
+    }
     return screens;
 }
 
 bool LoadVirtualScreen() {
     g_lastVddError.clear();
 
-    // Snapshot user's real Primary monitor BEFORE attaching/reloading Virtual Screen
+    // Snapshot pre-existing attached VDD displays (exclude viewer's own if reloading)
+    std::vector<std::wstring> existingVddDevs = EnumerateAttachedVddDevices();
+    if (!g_virtualMonitorDev.empty()) {
+        existingVddDevs.erase(
+            std::remove_if(existingVddDevs.begin(), existingVddDevs.end(),
+                           [&](const std::wstring& s) { return _wcsicmp(s.c_str(), g_virtualMonitorDev.c_str()) == 0; }),
+            existingVddDevs.end());
+    }
+    g_vddBaseCountBeforeLoad = static_cast<int>(existingVddDevs.size());
+    const int targetVddCount = g_vddBaseCountBeforeLoad + 1;
+
+    // Snapshot user's real Primary monitor (physical or pre-existing primary VDD) BEFORE attaching/reloading
     std::wstring anchorPrimaryDev = FindPrimaryPhysicalDisplayDevice();
 
-    // Sync C:\VirtualDisplayDriver\vdd_settings.xml so ONLY 1920x1080 is exposed (no 800x600)
+    // Sync C:\VirtualDisplayDriver\vdd_settings.xml with desired display count & 1920x1080-only resolution
     bool xmlUpdated = false;
-    EnsureVddSettingsFile(FindBundledVddInfPath(), &xmlUpdated);
+    EnsureVddSettingsFile(FindBundledVddInfPath(), &xmlUpdated, targetVddCount);
     if (xmlUpdated && SendMttVddCommand(L"RELOAD_DRIVER")) {
         Sleep(500);
     }
@@ -2401,9 +2492,20 @@ bool LoadVirtualScreen() {
     }
 
     bool alreadyAttached = false;
-    std::wstring devName = FindVirtualDisplayDeviceName(&alreadyAttached);
+    std::wstring devName = FindNewVirtualDisplayDeviceName(existingVddDevs, &alreadyAttached);
+    if (devName.empty() && targetVddCount > 1) {
+        wchar_t countCmd[32]{};
+        swprintf_s(countCmd, L"SETDISPLAYCOUNT %d", targetVddCount);
+        for (int attempt = 0; attempt < 15 && devName.empty(); ++attempt) {
+            SendMttVddCommand(countCmd);
+            Sleep(250);
+            devName = FindNewVirtualDisplayDeviceName(existingVddDevs, &alreadyAttached);
+        }
+    }
     if (devName.empty()) {
-        g_lastVddError = L"Virtual Display Driver installed, but no Virtual Display output is active.";
+        g_lastVddError = (targetVddCount > 1)
+            ? L"Virtual Display Driver could not create a second 1920x1080 display output."
+            : L"Virtual Display Driver installed, but no Virtual Display output is active.";
         return false;
     }
 
@@ -2412,14 +2514,14 @@ bool LoadVirtualScreen() {
     if (!alreadyAttached) {
         ActivateDisplayPathViaCcd(devName);
         Sleep(300);
-        std::wstring refreshed = FindVirtualDisplayDeviceName(&alreadyAttached);
+        std::wstring refreshed = FindNewVirtualDisplayDeviceName(existingVddDevs, &alreadyAttached);
         if (!refreshed.empty()) devName = refreshed;
     }
 
-    // Apply 1920x1080 on Virtual Screen and guarantee physical monitor stays Main Display (0,0)
+    // Apply 1920x1080 on Virtual Screen and guarantee base Primary monitor stays Main Display (0,0)
     ApplyExtendedLayoutPreservingPrimary(anchorPrimaryDev, devName, 1920, 1080);
 
-    std::wstring finalDev = FindVirtualDisplayDeviceName(&alreadyAttached);
+    std::wstring finalDev = FindNewVirtualDisplayDeviceName(existingVddDevs, &alreadyAttached);
     if (!finalDev.empty()) devName = finalDev;
 
     bool finalPrimary = false, finalCloned = false;
@@ -2452,13 +2554,13 @@ bool LoadVirtualScreen() {
     };
     g_virtualScreenLoaded = true;
     g_projectedMonitorRect = g_virtualMonitorRect;
-    g_selectedScreenLabel = L"Virtual Screen (1920x1080)";
+    g_selectedScreenLabel = (targetVddCount > 1) ? L"Second Virtual Screen (1920x1080)" : L"Virtual Screen (1920x1080)";
     g_controlVirtualScreen = true;
-    Log("Loaded Virtual Screen %ls at (%ld,%ld) %ux%u (Primary physical=%ls)",
+    Log("Loaded Virtual Screen %ls at (%ld,%ld) %ux%u (Anchor primary=%ls, baseVdd=%d)",
         g_virtualMonitorDev.c_str(),
         g_virtualMonitorRect.left, g_virtualMonitorRect.top,
         verifyDm.dmPelsWidth, verifyDm.dmPelsHeight,
-        anchorPrimaryDev.c_str());
+        anchorPrimaryDev.c_str(), g_vddBaseCountBeforeLoad);
     return true;
 }
 
@@ -2532,13 +2634,22 @@ void UnloadVirtualScreen() {
             }
             ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
         }
-        SendMttVddCommand(L"SETDISPLAYCOUNT 0");
-        Log("Unloaded Virtual Screen %ls", devName.c_str());
+        if (g_vddBaseCountBeforeLoad > 0) {
+            bool dummyUpdated = false;
+            EnsureVddSettingsFile(FindBundledVddInfPath(), &dummyUpdated, g_vddBaseCountBeforeLoad);
+            wchar_t restoreCmd[32]{};
+            swprintf_s(restoreCmd, L"SETDISPLAYCOUNT %d", g_vddBaseCountBeforeLoad);
+            SendMttVddCommand(restoreCmd);
+        } else {
+            SendMttVddCommand(L"SETDISPLAYCOUNT 0");
+        }
+        Log("Unloaded Virtual Screen %ls (restored base VDD count=%d)", devName.c_str(), g_vddBaseCountBeforeLoad);
     }
 
     g_virtualScreenLoaded = false;
     g_virtualMonitorDev.clear();
     g_virtualMonitorRect = {};
+    g_vddBaseCountBeforeLoad = 0;
 }
 
 void StopAllProjectionAndUnloadVirtual() {
@@ -2613,10 +2724,15 @@ bool CaptureProjectedMonitorFrame() {
 void ShowMoveToVirtualMenu(HWND parentHwnd, float clickX, float clickY);
 
 void ShowProjectScreenMenu(HWND parentHwnd, float clickX, float clickY) {
-    auto screens = EnumerateSelectableScreens();
+    bool onlyVddMonitors = false;
+    auto screens = EnumerateSelectableScreens(&onlyVddMonitors);
     HMENU hMenu = CreatePopupMenu();
     AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, L"--- Choose Screen to Project Privately ---");
-    AppendMenuW(hMenu, MF_STRING, 2000, L"Virtual Screen (1920x1080)  [Isolated Private Display]");
+    if (onlyVddMonitors) {
+        AppendMenuW(hMenu, MF_STRING, 2000, L"Install Second 1920x1080 Screen  [Add Virtual Display]");
+    } else {
+        AppendMenuW(hMenu, MF_STRING, 2000, L"Virtual Screen (1920x1080)  [Isolated Private Display]");
+    }
     if (!screens.empty()) {
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         for (size_t i = 0; i < screens.size() && i < 16; ++i) {
@@ -2642,9 +2758,9 @@ void ShowProjectScreenMenu(HWND parentHwnd, float clickX, float clickY) {
             g_lookZoom = 0.0f;
             SyncPointerAndLook();
             CaptureProjectedMonitorFrame();
-            SetLcdNotification(L"PROJECTING ON", L"VIRTUAL SCREEN", 4000);
+            SetLcdNotification(L"PROJECTING ON",
+                               onlyVddMonitors ? L"VIRTUAL SCREEN #2" : L"VIRTUAL SCREEN", 4000);
             Log("Projection started on Virtual Screen (1920x1080)");
-            ShowMoveToVirtualMenu(parentHwnd, clickX, clickY);
         } else {
             const wchar_t* errText = !g_lastVddError.empty()
                 ? g_lastVddError.c_str()
@@ -3818,9 +3934,9 @@ void GetInfoSlideOutContent(RemoteBtn hovered, std::wstring& outTitle, std::wstr
             break;
         case RemoteBtn::ProjectScreen:
             outTitle = L"PROJECT SCREEN";
-            outBody = L"Projects a connected monitor or an isolated 1920x1080 Virtual Screen onto your Bigscreen theater screen.\n\n"
-                      L"If you are in another user's room, click once to load your own room, then click again to select a monitor.\n\n"
-                      L"Click again while projecting to stop.";
+            outBody = L"Click to project a connected monitor or Virtual Screen (1920x1080) onto your Bigscreen theater screen.\n\n"
+                      L"Hold for 2 seconds to open the Project App menu.\n\n"
+                      L"In another user's room, click once to load your own room first.";
             break;
         case RemoteBtn::MovieMode:
             outTitle = L"MOVIE MODE";
@@ -5415,10 +5531,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     if (g_projectionMode != ProjectionMode::None) {
                         StopAllProjectionAndUnloadVirtual();
                         SetLcdNotification(L"PROJECTION", L"STOPPED", 3000);
-                    } else if (CanProjectInCurrentRoom()) {
-                        ShowProjectScreenMenu(hwnd, g_rBtnProject.left, g_rBtnProject.bottom);
-                    } else if (CanLeaveToOwnRoomToProject()) {
-                        RequestOwnRoomTransition();
+                    } else {
+                        g_heldProjectBtn = true;
+                        g_projectHoldTriggered = false;
+                        g_projectHoldStartMs = GetTickCount64();
+                        SetCapture(hwnd);
                     }
                     break;
                 case RemoteBtn::Info:
@@ -5521,7 +5638,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
+    if (message == WM_CAPTURECHANGED) {
+        g_isDraggingRemote = false;
+        g_heldDpadBtn = RemoteBtn::None;
+        g_heldProjectBtn = false;
+        g_projectHoldTriggered = false;
+        return 0;
+    }
+
     if (message == WM_LBUTTONUP) {
+        if (g_heldProjectBtn) {
+            const bool holdTriggered = g_projectHoldTriggered;
+            g_heldProjectBtn = false;
+            g_projectHoldTriggered = false;
+            ReleaseCapture();
+            if (!holdTriggered) {
+                if (CanProjectInCurrentRoom()) {
+                    ShowProjectScreenMenu(hwnd, g_rBtnProject.left, g_rBtnProject.bottom);
+                } else if (CanLeaveToOwnRoomToProject()) {
+                    RequestOwnRoomTransition();
+                }
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         if (g_isDraggingRemote) {
             g_isDraggingRemote = false;
             ReleaseCapture();
@@ -5831,6 +5971,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
             if (nowTick - g_lastDpadRepeatMs >= 45) {
                 g_lastDpadRepeatMs = nowTick;
                 ExecuteRemoteDpadStep(g_heldDpadBtn, true);
+            }
+        }
+        if (g_heldProjectBtn && !g_projectHoldTriggered) {
+            const ULONGLONG heldMs = GetTickCount64() - g_projectHoldStartMs;
+            if (heldMs >= 2000) {
+                g_projectHoldTriggered = true;
+                g_heldProjectBtn = false;
+                ReleaseCapture();
+                if (CanProjectInCurrentRoom()) {
+                    SetLcdNotification(L"PROJECT APP", L"SELECT WINDOW", 2500);
+                    ShowProjectAppMenu(g_hwnd, g_rBtnProject.left, g_rBtnProject.bottom);
+                } else if (CanLeaveToOwnRoomToProject()) {
+                    RequestOwnRoomTransition();
+                }
+            } else if (heldMs >= 300 && CanProjectInCurrentRoom()) {
+                SetLcdNotification(L"HOLD 2s FOR", L"PROJECT APP MENU", 250);
             }
         }
         EnsureBigscreenHookInjected();
