@@ -120,6 +120,37 @@ bool g_peerGpuFailed = false;
 ULONGLONG g_lastBigSoupPeerMs = 0;
 ULONGLONG g_lastMediaPlayerMs = 0;
 
+// --------------------------------------------------------------------------
+// IL2CPP Room Ownership & Own-Room Switch State (Bigscreen.App)
+// --------------------------------------------------------------------------
+typedef void (*pfnAppTick)(void* appThis, const void* methodInfo);
+typedef void* (*pfnIl2CppDomainGet)();
+typedef const void** (*pfnIl2CppDomainGetAssemblies)(void* domain, size_t* size);
+typedef const void* (*pfnIl2CppAssemblyGetImage)(const void* assembly);
+typedef void* (*pfnIl2CppClassFromName)(const void* image, const char* ns, const char* name);
+typedef const void* (*pfnIl2CppClassGetMethodFromName)(void* klass, const char* name, int argsCount);
+typedef void* (*pfnIl2CppRuntimeInvoke)(const void* method, void* obj, void** params, void** exc);
+typedef void* (*pfnIl2CppObjectUnbox)(void* obj);
+typedef void* (*pfnIl2CppThreadAttach)(void* domain);
+typedef void (*pfnIl2CppThreadDetach)(void* thread);
+
+pfnIl2CppRuntimeInvoke g_il2cppInvoke = nullptr;
+pfnIl2CppObjectUnbox g_il2cppUnbox = nullptr;
+
+const void* g_mGetCurrentRoom = nullptr;
+const void* g_mGetIsLoadingScene = nullptr;
+const void* g_mLeaveRoom = nullptr;
+const void* g_mGetIsLocalUserOwner = nullptr;
+const void* g_mGetIsSinglePlayer = nullptr;
+const void* g_mInLobby = nullptr;
+
+pfnAppTick g_originalAppTick = nullptr;
+uint8_t* g_pTrampolineAppTick = nullptr;
+bool g_appTickHookInstalled = false;
+uint64_t g_handledOwnRoomSeq = 0;
+ULONGLONG g_lastRoomPollMs = 0;
+ULONGLONG g_lastLeaveRoomMs = 0;
+
 struct alignas(16) PeerNv12Cb {
     float yUseAlpha;
     float uvUseAlpha;
@@ -689,7 +720,7 @@ void EnsureBlackTexture(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC& deskD
     pDevice->CreateTexture2D(&bDesc, &initData, &g_blackTex);
 }
 
-void RouteDesktopTexture() {
+const bigscreen_projected_video::State* GetProjectedVideoState() {
     if (!g_projectedState) {
         if (!g_projectedMapping) {
             g_projectedMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, bigscreen_projected_video::kMappingName);
@@ -699,8 +730,15 @@ void RouteDesktopTexture() {
                 MapViewOfFile(g_projectedMapping, FILE_MAP_READ, 0, 0, sizeof(bigscreen_projected_video::State)));
         }
     }
-
     if (!g_projectedState || g_projectedState->magic != bigscreen_projected_video::kMagic) {
+        return nullptr;
+    }
+    return g_projectedState;
+}
+
+void RouteDesktopTexture() {
+    const auto* pState = GetProjectedVideoState();
+    if (!pState) {
         return;
     }
 
@@ -955,6 +993,177 @@ bool InstallHookInternal(HMODULE hBigSoup) {
     return g_localHookInstalled;
 }
 
+bool InvokeBoolGetter(const void* method, void* instance, bool defaultVal) {
+    if (!g_il2cppInvoke || !g_il2cppUnbox || !method || !instance) return defaultVal;
+    void* exc = nullptr;
+    void* ret = g_il2cppInvoke(method, instance, nullptr, &exc);
+    if (exc || !ret) return defaultVal;
+    return (*reinterpret_cast<const uint8_t*>(g_il2cppUnbox(ret))) != 0;
+}
+
+void OnAppTickMainThread(void* pApp) {
+    if (!g_il2cppInvoke || !pApp || !g_peerCsInit) return;
+    ULONGLONG now = GetTickCount64();
+
+    const auto* projState = GetProjectedVideoState();
+    const uint64_t reqSeq = projState ? projState->requestOwnRoomSeq : 0;
+    const bool leaveRequested = (reqSeq != 0 && reqSeq != g_handledOwnRoomSeq);
+
+    if (!leaveRequested && (now - g_lastRoomPollMs < 100)) {
+        return;
+    }
+    g_lastRoomPollMs = now;
+
+    bool isLoading = false;
+    bool inOwnRoom = false;
+
+    __try {
+        isLoading = InvokeBoolGetter(g_mGetIsLoadingScene, pApp, false);
+        void* exc = nullptr;
+        void* pRoom = g_mGetCurrentRoom ? g_il2cppInvoke(g_mGetCurrentRoom, pApp, nullptr, &exc) : nullptr;
+        if (!exc && pRoom) {
+            const bool isSinglePlayer = InvokeBoolGetter(g_mGetIsSinglePlayer, pRoom, false);
+            const bool isOwner = InvokeBoolGetter(g_mGetIsLocalUserOwner, pRoom, false);
+            const bool inLobby = InvokeBoolGetter(g_mInLobby, pRoom, false);
+            inOwnRoom = !isLoading && (isSinglePlayer || (isOwner && !inLobby));
+        }
+
+        if (leaveRequested) {
+            g_handledOwnRoomSeq = reqSeq;
+            if (!inOwnRoom && !isLoading && g_mLeaveRoom && (now - g_lastLeaveRoomMs > 2500)) {
+                g_lastLeaveRoomMs = now;
+                uint8_t disconnecting = 0;
+                uint8_t resetToSinglePlayer = 1;
+                void* args[2] = { &disconnecting, &resetToSinglePlayer };
+                void* leaveExc = nullptr;
+                g_il2cppInvoke(g_mLeaveRoom, pApp, args, &leaveExc);
+                isLoading = true;
+                inOwnRoom = false;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
+
+    EnterCriticalSection(&g_peerCs);
+    EnsurePeerMovieIpc();
+    if (g_peerState) {
+        g_peerState->roomHookReady = 1;
+        g_peerState->inOwnRoom = inOwnRoom ? 1 : 0;
+        g_peerState->isLoadingRoom = isLoading ? 1 : 0;
+        g_peerState->handledOwnRoomSeq = g_handledOwnRoomSeq;
+    }
+    LeaveCriticalSection(&g_peerCs);
+}
+
+void Hooked_AppTick(void* appThis, const void* methodInfo) {
+    if (g_originalAppTick) {
+        g_originalAppTick(appThis, methodInfo);
+    }
+    if (appThis) {
+        OnAppTickMainThread(appThis);
+    }
+}
+
+void TryInstallAppTickHook() {
+    if (g_appTickHookInstalled) return;
+    HMODULE hGame = GetModuleHandleW(L"GameAssembly.dll");
+    if (!hGame) return;
+
+    auto fnDomainGet = reinterpret_cast<pfnIl2CppDomainGet>(GetProcAddress(hGame, "il2cpp_domain_get"));
+    auto fnDomainAssemblies = reinterpret_cast<pfnIl2CppDomainGetAssemblies>(GetProcAddress(hGame, "il2cpp_domain_get_assemblies"));
+    auto fnAsmImage = reinterpret_cast<pfnIl2CppAssemblyGetImage>(GetProcAddress(hGame, "il2cpp_assembly_get_image"));
+    auto fnClassFromName = reinterpret_cast<pfnIl2CppClassFromName>(GetProcAddress(hGame, "il2cpp_class_from_name"));
+    auto fnMethodFromName = reinterpret_cast<pfnIl2CppClassGetMethodFromName>(GetProcAddress(hGame, "il2cpp_class_get_method_from_name"));
+    auto fnThreadAttach = reinterpret_cast<pfnIl2CppThreadAttach>(GetProcAddress(hGame, "il2cpp_thread_attach"));
+    auto fnThreadDetach = reinterpret_cast<pfnIl2CppThreadDetach>(GetProcAddress(hGame, "il2cpp_thread_detach"));
+    g_il2cppInvoke = reinterpret_cast<pfnIl2CppRuntimeInvoke>(GetProcAddress(hGame, "il2cpp_runtime_invoke"));
+    g_il2cppUnbox = reinterpret_cast<pfnIl2CppObjectUnbox>(GetProcAddress(hGame, "il2cpp_object_unbox"));
+
+    if (!fnDomainGet || !fnDomainAssemblies || !fnAsmImage || !fnClassFromName ||
+        !fnMethodFromName || !fnThreadAttach || !fnThreadDetach || !g_il2cppInvoke || !g_il2cppUnbox) {
+        return;
+    }
+
+    void* domain = fnDomainGet();
+    if (!domain) return;
+    void* thread = fnThreadAttach(domain);
+    if (!thread) return;
+
+    void* appClass = nullptr;
+    void* roomClass = nullptr;
+    size_t asmCount = 0;
+    const void** assemblies = fnDomainAssemblies(domain, &asmCount);
+    if (assemblies) {
+        for (size_t i = 0; i < asmCount; ++i) {
+            const void* img = fnAsmImage(assemblies[i]);
+            if (!img) continue;
+            if (!appClass) appClass = fnClassFromName(img, "Bigscreen", "App");
+            if (!roomClass) roomClass = fnClassFromName(img, "Bigscreen.Cloud", "Room");
+            if (appClass && roomClass) break;
+        }
+    }
+
+    if (appClass && roomClass) {
+        const void* mTick = fnMethodFromName(appClass, "Tick", 0);
+        g_mGetCurrentRoom = fnMethodFromName(appClass, "get_CurrentRoom", 0);
+        g_mGetIsLoadingScene = fnMethodFromName(appClass, "get_IsLoadingScene", 0);
+        g_mLeaveRoom = fnMethodFromName(appClass, "LeaveRoom", 2);
+        g_mGetIsLocalUserOwner = fnMethodFromName(roomClass, "get_IsLocalUserOwner", 0);
+        g_mGetIsSinglePlayer = fnMethodFromName(roomClass, "get_IsSinglePlayer", 0);
+        g_mInLobby = fnMethodFromName(roomClass, "InLobby", 0);
+
+        if (mTick && g_mGetCurrentRoom && g_mGetIsLocalUserOwner && g_mGetIsSinglePlayer && g_mLeaveRoom) {
+            uint8_t* pTarget = *reinterpret_cast<uint8_t* const*>(mTick); // MethodInfo::methodPointer at +0
+            if (pTarget && pTarget[0] == 0xFF && pTarget[1] == 0x25) {
+                g_appTickHookInstalled = true;
+            } else if (pTarget &&
+                       pTarget[0] == 0x40 && pTarget[1] == 0x53 &&
+                       pTarget[2] == 0x48 && pTarget[3] == 0x83 && pTarget[4] == 0xEC && pTarget[5] == 0x70 &&
+                       pTarget[6] == 0x80 && pTarget[7] == 0x3D && pTarget[12] == 0x00 &&
+                       pTarget[13] == 0x48 && pTarget[14] == 0x8B && pTarget[15] == 0xD9) {
+                // Expected 16-byte prologue: push rbx; sub rsp,70h; cmp byte ptr [rip+disp32],0; mov rbx,rcx
+                int32_t disp = *reinterpret_cast<int32_t*>(pTarget + 8);
+                uint64_t absInitByte = reinterpret_cast<uint64_t>(pTarget + 13 + disp);
+
+                uint8_t* pTramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+                if (pTramp) {
+                    size_t k = 0;
+                    pTramp[k++] = 0x40; pTramp[k++] = 0x53; // push rbx
+                    pTramp[k++] = 0x48; pTramp[k++] = 0x83; pTramp[k++] = 0xEC; pTramp[k++] = 0x70; // sub rsp, 70h
+                    pTramp[k++] = 0x50; // push rax
+                    pTramp[k++] = 0x48; pTramp[k++] = 0xB8; // movabs rax, absInitByte
+                    *reinterpret_cast<uint64_t*>(pTramp + k) = absInitByte; k += 8;
+                    pTramp[k++] = 0x80; pTramp[k++] = 0x38; pTramp[k++] = 0x00; // cmp byte ptr [rax], 0
+                    pTramp[k++] = 0x58; // pop rax (preserves RFLAGS)
+                    pTramp[k++] = 0x48; pTramp[k++] = 0x8B; pTramp[k++] = 0xD9; // mov rbx, rcx
+                    pTramp[k++] = 0xFF; pTramp[k++] = 0x25;
+                    *reinterpret_cast<uint32_t*>(pTramp + k) = 0; k += 4;
+                    *reinterpret_cast<uint64_t*>(pTramp + k) = reinterpret_cast<uint64_t>(pTarget + 16); k += 8;
+                    FlushInstructionCache(GetCurrentProcess(), pTramp, 64);
+
+                    g_pTrampolineAppTick = pTramp;
+                    g_originalAppTick = reinterpret_cast<pfnAppTick>(pTramp);
+
+                    DWORD oldProtect = 0;
+                    if (VirtualProtect(pTarget, 16, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                        pTarget[0] = 0xFF; pTarget[1] = 0x25;
+                        *reinterpret_cast<uint32_t*>(pTarget + 2) = 0;
+                        *reinterpret_cast<uint64_t*>(pTarget + 6) = reinterpret_cast<uint64_t>(Hooked_AppTick);
+                        pTarget[14] = 0x90; pTarget[15] = 0x90;
+                        DWORD tmp = 0;
+                        VirtualProtect(pTarget, 16, oldProtect, &tmp);
+                        FlushInstructionCache(GetCurrentProcess(), pTarget, 16);
+                        g_appTickHookInstalled = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fnThreadDetach(thread);
+}
+
 DWORD WINAPI HookInitThread(LPVOID) {
     HMODULE hBigSoup = nullptr;
     for (int i = 0; ; ++i) {
@@ -963,7 +1172,8 @@ DWORD WINAPI HookInitThread(LPVOID) {
             InstallHookInternal(hBigSoup);
         }
         TryInstallMediaHook();
-        if (g_localHookInstalled && g_peerHookInstalled && g_mediaHookInstalled) break;
+        TryInstallAppTickHook();
+        if (g_localHookInstalled && g_peerHookInstalled && g_mediaHookInstalled && g_appTickHookInstalled) break;
         Sleep(i < 120 ? 250 : 2000);
     }
     return 0;
@@ -1043,6 +1253,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
         if (g_pTrampolineLocal) { VirtualFree(g_pTrampolineLocal, 0, MEM_RELEASE); g_pTrampolineLocal = nullptr; }
         if (g_pTrampolinePeer) { VirtualFree(g_pTrampolinePeer, 0, MEM_RELEASE); g_pTrampolinePeer = nullptr; }
         if (g_pTrampolineMedia) { VirtualFree(g_pTrampolineMedia, 0, MEM_RELEASE); g_pTrampolineMedia = nullptr; }
+        if (g_pTrampolineAppTick) { VirtualFree(g_pTrampolineAppTick, 0, MEM_RELEASE); g_pTrampolineAppTick = nullptr; }
         if (g_peerCsInit) { DeleteCriticalSection(&g_peerCs); g_peerCsInit = false; }
     }
     return TRUE;
