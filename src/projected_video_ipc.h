@@ -25,6 +25,8 @@ struct State {
     uint64_t frameSequence;    // Incremented on every new frame
     uint64_t lastFrameMicros;  // Timestamp in microseconds
     uint64_t requestOwnRoomSeq; // Incremented by viewer to request Bigscreen leave current room -> own room
+    float aspectOverride;      // > 0.0f to override film/screen aspect ratio (0.0f = Auto)
+    uint32_t aspectReserved;
 };
 
 } // namespace bigscreen_projected_video

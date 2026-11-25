@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <vector>
 #include <algorithm>
 
@@ -96,6 +97,78 @@ uint32_t g_peerVecEndOff = 0;
 
 HANDLE g_peerMapping = nullptr;
 bigscreen_peer_movie::State* g_peerState = nullptr;
+
+// --------------------------------------------------------------------------
+// Screen Aspect Ratio Override Hooks (MonitorSizer, MirroredScreen, BigMediaRenderer)
+// --------------------------------------------------------------------------
+struct Il2CppVec3 {
+    float x;
+    float y;
+    float z;
+};
+
+typedef const void* (*pfnIl2CppClassGetType)(const void* klass);
+typedef void* (*pfnIl2CppTypeGetObject)(const void* type);
+typedef void* (*pfnIl2CppClassGetFieldFromName)(const void* klass, const char* name);
+typedef size_t (*pfnIl2CppFieldGetOffset)(const void* field);
+typedef void (*pfnIl2CppFieldGetValue)(void* obj, const void* field, void* value);
+typedef void (*pfnIl2CppFieldSetValue)(void* obj, const void* field, void* value);
+typedef uint32_t (*pfnIl2CppArrayLength)(const void* arr);
+
+typedef void (*pfnMonitorSetAspectRatio)(void* self, int width, int height, const void* mi);
+typedef void (*pfnMirroredUpdateAspect)(void* self, void* texture, const void* mi);
+
+pfnIl2CppClassGetType g_fnClassGetType = nullptr;
+pfnIl2CppTypeGetObject g_fnTypeGetObject = nullptr;
+pfnIl2CppClassGetFieldFromName g_fnClassGetField = nullptr;
+pfnIl2CppFieldGetOffset g_fnFieldGetOffset = nullptr;
+pfnIl2CppFieldGetValue g_fnFieldGetValue = nullptr;
+pfnIl2CppFieldSetValue g_fnFieldSetValue = nullptr;
+pfnIl2CppArrayLength g_fnArrayLength = nullptr;
+
+void* g_klassMonitorSizer = nullptr;
+void* g_klassMirroredScreen = nullptr;
+void* g_klassBigMediaRenderer = nullptr;
+void* g_typeMonitorSizer = nullptr;
+void* g_typeMirroredScreen = nullptr;
+void* g_typeBigMediaRenderer = nullptr;
+
+const void* g_mFindObjectsOfType = nullptr;
+const void* g_mCompGetTransform = nullptr;
+const void* g_mGoGetTransform = nullptr;
+const void* g_mTransformSetLocalScale = nullptr;
+
+const void* g_fldMediaOrigScale = nullptr;
+const void* g_fldMediaScreensGo = nullptr;
+const void* g_fldMediaRegularRenderer = nullptr;
+const void* g_fldMediaResizeRequired = nullptr;
+const void* g_fldMediaCurrentSource = nullptr;
+const void* g_fldSizerAspectRatio = nullptr;
+const void* g_fldMirroredOrigScale = nullptr;
+const void* g_fldMirroredMainTexture = nullptr;
+
+pfnMonitorSetAspectRatio g_origMonitorSetAspect = nullptr;
+pfnMonitorSetAspectRatio g_origMonitorLerpAspect = nullptr;
+pfnMirroredUpdateAspect g_origMirroredUpdateAspect = nullptr;
+uint8_t* g_pTrampMonitorSet = nullptr;
+uint8_t* g_pTrampMonitorLerp = nullptr;
+uint8_t* g_pTrampMirroredUpdate = nullptr;
+bool g_screenAspectHooksAttempted = false;
+
+struct TrackedSizer {
+    void* ptr;
+    int origW;
+    int origH;
+};
+struct TrackedMirrored {
+    void* ptr;
+    void* lastTex;
+};
+TrackedSizer g_trackedSizers[32]{};
+TrackedMirrored g_trackedMirrored[32]{};
+bool g_inAspectReapply = false;
+float g_lastAppliedAspectOverride = -1.0f;
+ULONGLONG g_lastAspectSweepMs = 0;
 
 ID3D11Device* g_peerDev = nullptr;
 ID3D11Texture2D* g_peerExportTex = nullptr;
@@ -1056,12 +1129,270 @@ void OnAppTickMainThread(void* pApp) {
     LeaveCriticalSection(&g_peerCs);
 }
 
+float GetActiveAspectOverride() {
+    const auto* st = GetProjectedVideoState();
+    if (!st || st->magic != bigscreen_projected_video::kMagic) return 0.0f;
+    return (st->aspectOverride > 0.1f && st->aspectOverride < 20.0f) ? st->aspectOverride : 0.0f;
+}
+
+Il2CppVec3 ComputeFittedScale(const Il2CppVec3& frame, float targetAspect) {
+    Il2CppVec3 out = frame;
+    if (targetAspect <= 0.1f || frame.x <= 0.0001f) return out;
+    if (frame.y > 0.0001f) {
+        float frameAspect = frame.x / frame.y;
+        if (frameAspect <= targetAspect) {
+            out.x = frame.x;
+            out.y = frame.x / targetAspect;
+        } else {
+            out.x = frame.y * targetAspect;
+            out.y = frame.y;
+        }
+    } else {
+        out.x = frame.x;
+        out.y = frame.x / targetAspect;
+    }
+    return out;
+}
+
+void RecordTrackedSizer(void* ptr, int w, int h) {
+    if (!ptr || w <= 0 || h <= 0) return;
+    for (auto& e : g_trackedSizers) {
+        if (e.ptr == ptr) { e.origW = w; e.origH = h; return; }
+    }
+    for (auto& e : g_trackedSizers) {
+        if (!e.ptr) { e.ptr = ptr; e.origW = w; e.origH = h; return; }
+    }
+    g_trackedSizers[0] = { ptr, w, h };
+}
+
+void RecordTrackedMirrored(void* ptr, void* tex) {
+    if (!ptr) return;
+    for (auto& e : g_trackedMirrored) {
+        if (e.ptr == ptr) { if (tex) e.lastTex = tex; return; }
+    }
+    for (auto& e : g_trackedMirrored) {
+        if (!e.ptr) { e.ptr = ptr; e.lastTex = tex; return; }
+    }
+    g_trackedMirrored[0] = { ptr, tex };
+}
+
+void* FindMirroredTexFallback(void* ptr) {
+    if (!ptr) return nullptr;
+    for (const auto& e : g_trackedMirrored) {
+        if (e.ptr == ptr && e.lastTex) return e.lastTex;
+    }
+    return *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(ptr) + 0x78);
+}
+
+void ApplyTransformScale(void* obj, bool isGameObject, const Il2CppVec3& scale) {
+    if (!obj || !g_il2cppInvoke || !g_mTransformSetLocalScale) return;
+    const void* mGetTr = isGameObject ? g_mGoGetTransform : g_mCompGetTransform;
+    if (!mGetTr) return;
+    void* exc = nullptr;
+    void* tr = g_il2cppInvoke(mGetTr, obj, nullptr, &exc);
+    if (exc || !tr) return;
+    Il2CppVec3 s = scale;
+    void* args[1] = { &s };
+    exc = nullptr;
+    g_il2cppInvoke(g_mTransformSetLocalScale, tr, args, &exc);
+}
+
+void Hooked_MonitorSetAspect(void* self, int width, int height, const void* mi) {
+    if (!g_inAspectReapply && width > 0 && height > 0) {
+        RecordTrackedSizer(self, width, height);
+    }
+    float ov = GetActiveAspectOverride();
+    if (ov > 0.1f && !g_inAspectReapply) {
+        width = static_cast<int>(ov * 1000.0f + 0.5f);
+        height = 1000;
+    }
+    if (g_origMonitorSetAspect) {
+        g_origMonitorSetAspect(self, width, height, mi);
+    }
+}
+
+void Hooked_MonitorLerpAspect(void* self, int width, int height, const void* mi) {
+    if (!g_inAspectReapply && width > 0 && height > 0) {
+        RecordTrackedSizer(self, width, height);
+    }
+    float ov = GetActiveAspectOverride();
+    if (ov > 0.1f && !g_inAspectReapply) {
+        width = static_cast<int>(ov * 1000.0f + 0.5f);
+        height = 1000;
+    }
+    if (g_origMonitorLerpAspect) {
+        g_origMonitorLerpAspect(self, width, height, mi);
+    }
+}
+
+void Hooked_MirroredUpdateAspect(void* self, void* tex, const void* mi) {
+    if (!g_inAspectReapply) {
+        RecordTrackedMirrored(self, tex);
+    }
+    if (g_origMirroredUpdateAspect) {
+        g_origMirroredUpdateAspect(self, tex, mi);
+    }
+    float ov = GetActiveAspectOverride();
+    if (self && tex && ov > 0.1f) {
+        const auto* orig = reinterpret_cast<const Il2CppVec3*>(reinterpret_cast<const uint8_t*>(self) + 0x80);
+        if (orig->x > 0.001f && orig->x < 5000.0f && orig->z > 0.0001f && orig->z < 5000.0f) {
+            ApplyTransformScale(self, false, ComputeFittedScale(*orig, ov));
+        }
+    }
+}
+
+bool InstallNonRipPrologueHook(const void* methodInfo, const uint8_t* prefix, size_t prefixLen,
+                               size_t stolenLen, void* hookFn, void** outOrigFn, uint8_t** outTramp) {
+    if (!methodInfo || stolenLen < 14 || stolenLen > 32) return false;
+    uint8_t* pTarget = *reinterpret_cast<uint8_t* const*>(methodInfo);
+    if (!pTarget) return false;
+    if (pTarget[0] == 0xFF && pTarget[1] == 0x25) return true; // already hooked
+    if (std::memcmp(pTarget, prefix, prefixLen) != 0) return false;
+
+    uint8_t* pTramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!pTramp) return false;
+
+    std::memcpy(pTramp, pTarget, stolenLen);
+    size_t k = stolenLen;
+    pTramp[k++] = 0xFF; pTramp[k++] = 0x25;
+    *reinterpret_cast<uint32_t*>(pTramp + k) = 0; k += 4;
+    *reinterpret_cast<uint64_t*>(pTramp + k) = reinterpret_cast<uint64_t>(pTarget + stolenLen); k += 8;
+    FlushInstructionCache(GetCurrentProcess(), pTramp, 64);
+
+    *outOrigFn = pTramp;
+    *outTramp = pTramp;
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(pTarget, stolenLen, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        return false;
+    }
+    pTarget[0] = 0xFF; pTarget[1] = 0x25;
+    *reinterpret_cast<uint32_t*>(pTarget + 2) = 0;
+    *reinterpret_cast<uint64_t*>(pTarget + 6) = reinterpret_cast<uint64_t>(hookFn);
+    for (size_t i = 14; i < stolenLen; ++i) pTarget[i] = 0x90;
+    DWORD tmp = 0;
+    VirtualProtect(pTarget, stolenLen, oldProtect, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), pTarget, stolenLen);
+    return true;
+}
+
+void ApplyScreenAspectOverridesOnMainThread() {
+    float ov = GetActiveAspectOverride();
+    ULONGLONG now = GetTickCount64();
+    bool changed = (std::fabs(ov - g_lastAppliedAspectOverride) > 0.001f);
+    bool periodic = (ov > 0.1f) && (now - g_lastAspectSweepMs >= 250);
+    if (!changed && !periodic) return;
+
+    g_lastAppliedAspectOverride = ov;
+    g_lastAspectSweepMs = now;
+
+    // 1. MonitorSizer (desktop monitors / personal & presentation screens)
+    if (g_mFindObjectsOfType && g_typeMonitorSizer && g_origMonitorSetAspect && g_fnArrayLength) {
+        void* exc = nullptr;
+        void* args[1] = { g_typeMonitorSizer };
+        void* arr = g_il2cppInvoke(g_mFindObjectsOfType, nullptr, args, &exc);
+        if (!exc && arr) {
+            uint32_t n = g_fnArrayLength(arr);
+            auto** elems = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(arr) + 0x20);
+            for (uint32_t i = 0; i < n && i < 64; ++i) {
+                void* sizer = elems[i];
+                if (!sizer) continue;
+
+                int origW = 0, origH = 0;
+                for (const auto& e : g_trackedSizers) {
+                    if (e.ptr == sizer) { origW = e.origW; origH = e.origH; break; }
+                }
+                if (origW == 0 && g_fldSizerAspectRatio && g_fnFieldGetOffset) {
+                    size_t off = g_fnFieldGetOffset(g_fldSizerAspectRatio);
+                    float curAsp = *reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(sizer) + off);
+                    if (curAsp > 0.1f && curAsp < 20.0f) {
+                        origW = static_cast<int>(curAsp * 1000.0f + 0.5f);
+                        origH = 1000;
+                        RecordTrackedSizer(sizer, origW, origH);
+                    }
+                }
+                if (origW <= 0 || origH <= 0) { origW = 16; origH = 9; }
+
+                int applyW = (ov > 0.1f) ? static_cast<int>(ov * 1000.0f + 0.5f) : origW;
+                int applyH = (ov > 0.1f) ? 1000 : origH;
+                g_inAspectReapply = true;
+                g_origMonitorSetAspect(sizer, applyW, applyH, nullptr);
+                g_inAspectReapply = false;
+            }
+        }
+    }
+
+    // 2. MirroredScreen (theater cinema screens)
+    if (g_mFindObjectsOfType && g_typeMirroredScreen && g_origMirroredUpdateAspect && g_fnArrayLength) {
+        void* exc = nullptr;
+        void* args[1] = { g_typeMirroredScreen };
+        void* arr = g_il2cppInvoke(g_mFindObjectsOfType, nullptr, args, &exc);
+        if (!exc && arr) {
+            uint32_t n = g_fnArrayLength(arr);
+            auto** elems = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(arr) + 0x20);
+            for (uint32_t i = 0; i < n && i < 32; ++i) {
+                void* mirrored = elems[i];
+                if (!mirrored) continue;
+                void* tex = FindMirroredTexFallback(mirrored);
+                if (!tex) continue;
+                if (changed && ov <= 0.1f) {
+                    g_inAspectReapply = true;
+                    g_origMirroredUpdateAspect(mirrored, tex, nullptr);
+                    g_inAspectReapply = false;
+                } else if (ov > 0.1f) {
+                    const auto* orig = reinterpret_cast<const Il2CppVec3*>(reinterpret_cast<const uint8_t*>(mirrored) + 0x80);
+                    if (orig->x > 0.001f && orig->x < 5000.0f && orig->z > 0.0001f && orig->z < 5000.0f) {
+                        ApplyTransformScale(mirrored, false, ComputeFittedScale(*orig, ov));
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. BigMediaRenderer (BigMediaPlayer movies)
+    if (g_mFindObjectsOfType && g_typeBigMediaRenderer && g_fnArrayLength && g_fnFieldGetOffset && g_fldMediaOrigScale) {
+        void* exc = nullptr;
+        void* args[1] = { g_typeBigMediaRenderer };
+        void* arr = g_il2cppInvoke(g_mFindObjectsOfType, nullptr, args, &exc);
+        if (!exc && arr) {
+            uint32_t n = g_fnArrayLength(arr);
+            auto** elems = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(arr) + 0x20);
+            size_t offOrig = g_fnFieldGetOffset(g_fldMediaOrigScale);
+            size_t offGo = g_fldMediaScreensGo ? g_fnFieldGetOffset(g_fldMediaScreensGo) : 0;
+            size_t offRend = g_fldMediaRegularRenderer ? g_fnFieldGetOffset(g_fldMediaRegularRenderer) : 0;
+            size_t offResize = g_fldMediaResizeRequired ? g_fnFieldGetOffset(g_fldMediaResizeRequired) : 0;
+            size_t offSrc = g_fldMediaCurrentSource ? g_fnFieldGetOffset(g_fldMediaCurrentSource) : 0;
+            for (uint32_t i = 0; i < n && i < 16; ++i) {
+                void* mr = elems[i];
+                if (!mr) continue;
+                if (offSrc && !*reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(mr) + offSrc)) continue;
+                if (changed && ov <= 0.1f) {
+                    if (offResize) *reinterpret_cast<uint8_t*>(reinterpret_cast<uint8_t*>(mr) + offResize) = 1;
+                } else if (ov > 0.1f) {
+                    Il2CppVec3 orig = *reinterpret_cast<const Il2CppVec3*>(reinterpret_cast<const uint8_t*>(mr) + offOrig);
+                    if (orig.x > 0.001f && orig.x < 5000.0f && orig.z > 0.0001f && orig.z < 5000.0f) {
+                        Il2CppVec3 fitted = ComputeFittedScale(orig, ov);
+                        void* go = offGo ? *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(mr) + offGo) : nullptr;
+                        if (go) {
+                            ApplyTransformScale(go, true, fitted);
+                        } else if (offRend) {
+                            void* rend = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(mr) + offRend);
+                            if (rend) ApplyTransformScale(rend, false, fitted);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 void Hooked_AppTick(void* appThis, const void* methodInfo) {
     if (g_originalAppTick) {
         g_originalAppTick(appThis, methodInfo);
     }
     if (appThis) {
         OnAppTickMainThread(appThis);
+        ApplyScreenAspectOverridesOnMainThread();
     }
 }
 
@@ -1092,6 +1423,10 @@ void TryInstallAppTickHook() {
 
     void* appClass = nullptr;
     void* roomClass = nullptr;
+    void* unityObjClass = nullptr;
+    void* unityCompClass = nullptr;
+    void* unityGoClass = nullptr;
+    void* unityTransformClass = nullptr;
     size_t asmCount = 0;
     const void** assemblies = fnDomainAssemblies(domain, &asmCount);
     if (assemblies) {
@@ -1100,8 +1435,63 @@ void TryInstallAppTickHook() {
             if (!img) continue;
             if (!appClass) appClass = fnClassFromName(img, "Bigscreen", "App");
             if (!roomClass) roomClass = fnClassFromName(img, "Bigscreen.Cloud", "Room");
-            if (appClass && roomClass) break;
+            if (!g_klassMonitorSizer) g_klassMonitorSizer = fnClassFromName(img, "Bigscreen.Monitors", "MonitorSizer");
+            if (!g_klassMirroredScreen) g_klassMirroredScreen = fnClassFromName(img, "Bigscreen.Effects", "MirroredScreen");
+            if (!g_klassBigMediaRenderer) g_klassBigMediaRenderer = fnClassFromName(img, "Bigscreen.Media", "BigMediaRenderer");
+            if (!unityObjClass) unityObjClass = fnClassFromName(img, "UnityEngine", "Object");
+            if (!unityCompClass) unityCompClass = fnClassFromName(img, "UnityEngine", "Component");
+            if (!unityGoClass) unityGoClass = fnClassFromName(img, "UnityEngine", "GameObject");
+            if (!unityTransformClass) unityTransformClass = fnClassFromName(img, "UnityEngine", "Transform");
         }
+    }
+
+    if (!g_screenAspectHooksAttempted && g_klassMonitorSizer && g_klassMirroredScreen && unityObjClass && unityCompClass && unityGoClass && unityTransformClass) {
+        g_screenAspectHooksAttempted = true;
+        g_fnClassGetType = reinterpret_cast<pfnIl2CppClassGetType>(GetProcAddress(hGame, "il2cpp_class_get_type"));
+        g_fnTypeGetObject = reinterpret_cast<pfnIl2CppTypeGetObject>(GetProcAddress(hGame, "il2cpp_type_get_object"));
+        g_fnClassGetField = reinterpret_cast<pfnIl2CppClassGetFieldFromName>(GetProcAddress(hGame, "il2cpp_class_get_field_from_name"));
+        g_fnFieldGetOffset = reinterpret_cast<pfnIl2CppFieldGetOffset>(GetProcAddress(hGame, "il2cpp_field_get_offset"));
+        g_fnArrayLength = reinterpret_cast<pfnIl2CppArrayLength>(GetProcAddress(hGame, "il2cpp_array_length"));
+
+        g_mFindObjectsOfType = fnMethodFromName(unityObjClass, "FindObjectsOfType", 1);
+        g_mCompGetTransform = fnMethodFromName(unityCompClass, "get_transform", 0);
+        g_mGoGetTransform = fnMethodFromName(unityGoClass, "get_transform", 0);
+        g_mTransformSetLocalScale = fnMethodFromName(unityTransformClass, "set_localScale", 1);
+
+        if (g_fnClassGetType && g_fnTypeGetObject) {
+            const void* tSizer = g_fnClassGetType(g_klassMonitorSizer);
+            const void* tMirrored = g_fnClassGetType(g_klassMirroredScreen);
+            if (tSizer) g_typeMonitorSizer = g_fnTypeGetObject(tSizer);
+            if (tMirrored) g_typeMirroredScreen = g_fnTypeGetObject(tMirrored);
+            if (g_klassBigMediaRenderer) {
+                const void* tMedia = g_fnClassGetType(g_klassBigMediaRenderer);
+                if (tMedia) g_typeBigMediaRenderer = g_fnTypeGetObject(tMedia);
+            }
+        }
+        if (g_fnClassGetField) {
+            g_fldSizerAspectRatio = g_fnClassGetField(g_klassMonitorSizer, "AspectRatio");
+            if (g_klassBigMediaRenderer) {
+                g_fldMediaOrigScale = g_fnClassGetField(g_klassBigMediaRenderer, "originalScreenScale");
+                g_fldMediaScreensGo = g_fnClassGetField(g_klassBigMediaRenderer, "screensGameObject");
+                g_fldMediaRegularRenderer = g_fnClassGetField(g_klassBigMediaRenderer, "regularScreenRenderer");
+                g_fldMediaResizeRequired = g_fnClassGetField(g_klassBigMediaRenderer, "resizeRequired");
+                g_fldMediaCurrentSource = g_fnClassGetField(g_klassBigMediaRenderer, "currentMediaSource");
+            }
+        }
+
+        const uint8_t prefMovRbxRsiRdi[15] = { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10, 0x48,0x89,0x7C,0x24,0x18 };
+        const uint8_t prefLerpAspect[17] = { 0x66,0x0F,0x6E,0xCA, 0x33,0xD2, 0x66,0x41,0x0F,0x6E,0xC0, 0x0F,0x5B,0xC9, 0x0F,0x5B,0xC0 };
+
+        const void* mSetAspect = fnMethodFromName(g_klassMonitorSizer, "SetAspectRatio", 2);
+        const void* mLerpAspect = fnMethodFromName(g_klassMonitorSizer, "LerpAspectRatio", 2);
+        const void* mMirroredUpdate = fnMethodFromName(g_klassMirroredScreen, "UpdateScreenAspectRatio", 1);
+
+        InstallNonRipPrologueHook(mSetAspect, prefMovRbxRsiRdi, 15, 15, reinterpret_cast<void*>(Hooked_MonitorSetAspect),
+                                  reinterpret_cast<void**>(&g_origMonitorSetAspect), &g_pTrampMonitorSet);
+        InstallNonRipPrologueHook(mLerpAspect, prefLerpAspect, 17, 17, reinterpret_cast<void*>(Hooked_MonitorLerpAspect),
+                                  reinterpret_cast<void**>(&g_origMonitorLerpAspect), &g_pTrampMonitorLerp);
+        InstallNonRipPrologueHook(mMirroredUpdate, prefMovRbxRsiRdi, 15, 15, reinterpret_cast<void*>(Hooked_MirroredUpdateAspect),
+                                  reinterpret_cast<void**>(&g_origMirroredUpdateAspect), &g_pTrampMirroredUpdate);
     }
 
     if (appClass && roomClass) {
@@ -1254,6 +1644,9 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
         if (g_pTrampolinePeer) { VirtualFree(g_pTrampolinePeer, 0, MEM_RELEASE); g_pTrampolinePeer = nullptr; }
         if (g_pTrampolineMedia) { VirtualFree(g_pTrampolineMedia, 0, MEM_RELEASE); g_pTrampolineMedia = nullptr; }
         if (g_pTrampolineAppTick) { VirtualFree(g_pTrampolineAppTick, 0, MEM_RELEASE); g_pTrampolineAppTick = nullptr; }
+        if (g_pTrampMonitorSet) { VirtualFree(g_pTrampMonitorSet, 0, MEM_RELEASE); g_pTrampMonitorSet = nullptr; }
+        if (g_pTrampMonitorLerp) { VirtualFree(g_pTrampMonitorLerp, 0, MEM_RELEASE); g_pTrampMonitorLerp = nullptr; }
+        if (g_pTrampMirroredUpdate) { VirtualFree(g_pTrampMirroredUpdate, 0, MEM_RELEASE); g_pTrampMirroredUpdate = nullptr; }
         if (g_peerCsInit) { DeleteCriticalSection(&g_peerCs); g_peerCsInit = false; }
     }
     return TRUE;

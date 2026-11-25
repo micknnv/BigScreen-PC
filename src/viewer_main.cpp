@@ -115,9 +115,31 @@ enum class StereoSplitMode {
     SBS = 1,
     OU = 2
 };
+
+struct AspectRatioPreset {
+    const wchar_t* label;
+    float ratio;
+};
+
+static const AspectRatioPreset kAspectPresets[] = {
+    { L"Aspect: Auto",                           0.0f },
+    { L"2.39:1 / 2.40:1 Ultra-Wide Theatrical",  2.39f },
+    { L"1.85:1 Standard Widescreen Theatrical",  1.85f },
+    { L"1.78:1 (16:9) HDTV Ratio",               16.0f / 9.0f },
+    { L"1.33:1 (4:3)",                           4.0f / 3.0f },
+    { L"1.375:1 Classic TV Ratio",               1.375f },
+    { L"2.00:1 Univisium",                       2.00f },
+    { L"1.66:1 European Widescreen Format",      1.66f },
+    { L"1.90:1 Digital IMAX",                    1.90f },
+    { L"2.20:1 (70mm / Todd-AO)",                2.20f },
+    { L"1.43:1 (70mm IMAX)",                     1.43f },
+    { L"2.76:1 Ultra Panavision 70",             2.76f },
+};
+
 bool g_showRemote = true;
 bool g_movieOnly = false;
 StereoSplitMode g_stereoMode = StereoSplitMode::Normal2D;
+size_t g_aspectPresetIndex = 0;
 bool g_isFullscreen = false;
 bool g_alwaysOnTop = false;
 WINDOWPLACEMENT g_wpPrev = { sizeof(g_wpPrev) };
@@ -160,12 +182,14 @@ D2D1_RECT_F g_btnMenuRect{};
 D2D1_RECT_F g_btnSystemRect{};
 D2D1_RECT_F g_btnPowerRect{};
 D2D1_RECT_F g_pillRect{};
+D2D1_RECT_F g_btnAspectRect{};
 
 bool g_closeHovered = false;
 bool g_powerHeaderHovered = false;
 bool g_btnWholeHovered = false;
 bool g_btnMovieHovered = false;
 bool g_btnStereo3dHovered = false;
+bool g_btnAspectHovered = false;
 bool g_btnProjectScreenHovered = false;
 bool g_btnProjectAppHovered = false;
 bool g_btnFsHovered = false;
@@ -276,6 +300,20 @@ void EnsureProjectedVideoIpc() {
     }
 }
 
+float GetSelectedAspectOverride() {
+    if (g_aspectPresetIndex >= _countof(kAspectPresets)) return 0.0f;
+    return kAspectPresets[g_aspectPresetIndex].ratio;
+}
+
+void SyncAspectOverrideToIpc() {
+    EnsureProjectedVideoIpc();
+    if (g_projectedVideoState) {
+        g_projectedVideoState->magic = bigscreen_projected_video::kMagic;
+        g_projectedVideoState->version = bigscreen_projected_video::kVersion;
+        g_projectedVideoState->aspectOverride = GetSelectedAspectOverride();
+    }
+}
+
 void PublishProjectedVideoState(bool active, bool privacyMode, uint64_t sharedHandle,
                                 uint32_t width, uint32_t height, uint32_t vidW, uint32_t vidH) {
     EnsureProjectedVideoIpc();
@@ -289,12 +327,15 @@ void PublishProjectedVideoState(bool active, bool privacyMode, uint64_t sharedHa
         g_projectedVideoState->height = height;
         g_projectedVideoState->videoWidth = vidW;
         g_projectedVideoState->videoHeight = vidH;
+        g_projectedVideoState->aspectOverride = GetSelectedAspectOverride();
         ++g_projectedVideoState->frameSequence;
         g_projectedVideoState->lastFrameMicros = GetTickCount64() * 1000ull;
     }
 }
 
 float ComputeMovieDisplayAspect(uint32_t rawW, uint32_t rawH) {
+    float ov = GetSelectedAspectOverride();
+    if (ov > 0.0f) return ov;
     if (rawW == 0 || rawH == 0) return 16.0f / 9.0f;
     float rawAspect = static_cast<float>(rawW) / static_cast<float>(rawH);
     if (!g_movieOnly || g_stereoMode == StereoSplitMode::Normal2D) {
@@ -368,7 +409,8 @@ void RenderVideoToSharedDesktop() {
     g_context->ClearRenderTargetView(g_sharedDesktopRtv, black);
 
     if (g_projectionMode == ProjectionMode::App && g_projectedSrv && g_projectedWidth > 0 && g_projectedHeight > 0) {
-        float videoAspect = static_cast<float>(g_projectedWidth) / static_cast<float>(g_projectedHeight);
+        float ov = GetSelectedAspectOverride();
+        float videoAspect = (ov > 0.0f) ? ov : (static_cast<float>(g_projectedWidth) / static_cast<float>(g_projectedHeight));
         float canvasAspect = static_cast<float>(deskW) / static_cast<float>(deskH);
 
         float boxW = 0.0f, boxH = 0.0f, boxX = 0.0f, boxY = 0.0f;
@@ -1502,7 +1544,7 @@ void DrawPointerReticle(float x, float y, bool active) {
 
 void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
     const float panelWidth = 310.0f;
-    const float panelHeight = 560.0f;
+    const float panelHeight = 602.0f;
     const float left = windowWidth - panelWidth - 20.0f;
     const float top = 20.0f;
     const float right = left + panelWidth;
@@ -1580,15 +1622,21 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
     }
     DrawButton(g_btnStereo3dRect, stereoLabel, stereoActive, g_btnStereo3dHovered, 6.0f, !g_movieOnly);
 
+    g_btnAspectRect = D2D1::RectF(left + 18.0f, top + 142.0f, right - 18.0f, top + 180.0f);
+    const wchar_t* aspectLabel = (g_aspectPresetIndex < _countof(kAspectPresets))
+        ? kAspectPresets[g_aspectPresetIndex].label
+        : L"Aspect: Auto";
+    DrawButton(g_btnAspectRect, aspectLabel, g_aspectPresetIndex > 0, g_btnAspectHovered, 6.0f, false);
+
     // SECTION 2: PROJECTION & PRIVACY
     const wchar_t* s2Text = L"PROJECTION & PRIVACY";
-    D2D1_RECT_F s2Rect = D2D1::RectF(left + 18.0f, top + 148.0f, right - 18.0f, top + 164.0f);
+    D2D1_RECT_F s2Rect = D2D1::RectF(left + 18.0f, top + 190.0f, right - 18.0f, top + 206.0f);
     g_d2dRenderTarget->DrawText(
         s2Text, static_cast<UINT32>(wcslen(s2Text)),
         g_textFormatSection, &s2Rect, g_brushTextSection);
 
-    g_btnProjectScreenRect = D2D1::RectF(left + 18.0f, top + 166.0f, left + 148.0f, top + 198.0f);
-    g_btnProjectAppRect = D2D1::RectF(left + 156.0f, top + 166.0f, right - 18.0f, top + 198.0f);
+    g_btnProjectScreenRect = D2D1::RectF(left + 18.0f, top + 208.0f, left + 148.0f, top + 240.0f);
+    g_btnProjectAppRect = D2D1::RectF(left + 156.0f, top + 208.0f, right - 18.0f, top + 240.0f);
     const bool isScreenProj = (g_projectionMode == ProjectionMode::Screen);
     const bool isAppProj = (g_projectionMode == ProjectionMode::App);
     const bool canProject = CanProjectInCurrentRoom();
@@ -1607,37 +1655,37 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
     // SECTION 3: WINDOW & DISPLAY
     const wchar_t* s3Text = L"WINDOW & DISPLAY";
-    D2D1_RECT_F s3Rect = D2D1::RectF(left + 18.0f, top + 208.0f, right - 18.0f, top + 224.0f);
+    D2D1_RECT_F s3Rect = D2D1::RectF(left + 18.0f, top + 250.0f, right - 18.0f, top + 266.0f);
     g_d2dRenderTarget->DrawText(
         s3Text, static_cast<UINT32>(wcslen(s3Text)),
         g_textFormatSection, &s3Rect, g_brushTextSection);
 
-    g_btnFullscreenRect = D2D1::RectF(left + 18.0f, top + 226.0f, right - 18.0f, top + 258.0f);
+    g_btnFullscreenRect = D2D1::RectF(left + 18.0f, top + 268.0f, right - 18.0f, top + 300.0f);
     DrawButton(g_btnFullscreenRect, g_isFullscreen ? L"Exit Fullscreen (Windowed)" : L"Toggle Fullscreen", g_isFullscreen, g_btnFsHovered);
 
     // SECTION 4: QUICK ACTIONS
     const wchar_t* s4Text = L"QUICK ACTIONS";
-    D2D1_RECT_F s4Rect = D2D1::RectF(left + 18.0f, top + 268.0f, right - 18.0f, top + 284.0f);
+    D2D1_RECT_F s4Rect = D2D1::RectF(left + 18.0f, top + 310.0f, right - 18.0f, top + 326.0f);
     g_d2dRenderTarget->DrawText(
         s4Text, static_cast<UINT32>(wcslen(s4Text)),
         g_textFormatSection, &s4Rect, g_brushTextSection);
 
-    g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 286.0f, left + 148.0f, top + 318.0f);
-    g_btnMenuRect = D2D1::RectF(left + 156.0f, top + 286.0f, right - 18.0f, top + 318.0f);
+    g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 328.0f, left + 148.0f, top + 360.0f);
+    g_btnMenuRect = D2D1::RectF(left + 156.0f, top + 328.0f, right - 18.0f, top + 360.0f);
     DrawButton(g_btnRecenterRect, L"Recenter", false, g_btnRecenterHovered);
     DrawButton(g_btnMenuRect, L"BigScreen Menu", false, g_btnMenuHovered);
 
-    g_btnSystemRect = D2D1::RectF(left + 18.0f, top + 324.0f, right - 18.0f, top + 354.0f);
+    g_btnSystemRect = D2D1::RectF(left + 18.0f, top + 366.0f, right - 18.0f, top + 396.0f);
     DrawButton(g_btnSystemRect, L"SteamVR Dashboard", false, g_btnSystemHovered);
 
     // SECTION 5: VR SYSTEM POWER
     const wchar_t* s5Text = L"VR SYSTEM POWER";
-    D2D1_RECT_F s5Rect = D2D1::RectF(left + 18.0f, top + 364.0f, right - 18.0f, top + 380.0f);
+    D2D1_RECT_F s5Rect = D2D1::RectF(left + 18.0f, top + 406.0f, right - 18.0f, top + 422.0f);
     g_d2dRenderTarget->DrawText(
         s5Text, static_cast<UINT32>(wcslen(s5Text)),
         g_textFormatSection, &s5Rect, g_brushTextSection);
 
-    g_btnPowerRect = D2D1::RectF(left + 18.0f, top + 382.0f, right - 18.0f, top + 414.0f);
+    g_btnPowerRect = D2D1::RectF(left + 18.0f, top + 424.0f, right - 18.0f, top + 456.0f);
     const wchar_t* pwrBtnText = nullptr;
     if (g_btnPowerHovered) {
         pwrBtnText = vrRunning ? L"\x23FB Turn off BigScreen" : L"\x23FB Turn on BigScreen";
@@ -1648,12 +1696,12 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
     // SECTION 6: MEDIA FEED STATUS
     const wchar_t* s6Text = L"MEDIA FEED STATUS";
-    D2D1_RECT_F s6Rect = D2D1::RectF(left + 18.0f, top + 424.0f, right - 18.0f, top + 440.0f);
+    D2D1_RECT_F s6Rect = D2D1::RectF(left + 18.0f, top + 466.0f, right - 18.0f, top + 482.0f);
     g_d2dRenderTarget->DrawText(
         s6Text, static_cast<UINT32>(wcslen(s6Text)),
         g_textFormatSection, &s6Rect, g_brushTextSection);
 
-    D2D1_RECT_F feedBoxRect = D2D1::RectF(left + 18.0f, top + 442.0f, right - 18.0f, top + 472.0f);
+    D2D1_RECT_F feedBoxRect = D2D1::RectF(left + 18.0f, top + 484.0f, right - 18.0f, top + 514.0f);
     D2D1_ROUNDED_RECT feedBox = D2D1::RoundedRect(feedBoxRect, 6.0f, 6.0f);
     g_d2dRenderTarget->FillRoundedRectangle(&feedBox, g_brushBtnInactiveBg);
     
@@ -1693,13 +1741,13 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
     // Footer separator line
     g_d2dRenderTarget->DrawLine(
-        D2D1::Point2F(left + 18.0f, top + 482.0f),
-        D2D1::Point2F(right - 18.0f, top + 482.0f),
+        D2D1::Point2F(left + 18.0f, top + 524.0f),
+        D2D1::Point2F(right - 18.0f, top + 524.0f),
         g_brushSeparator, 1.0f);
 
     // Footer Hotkey Hints
     const wchar_t* footerText = L"Mouse Move: Laser Pointer  |  Left-Click: Trigger\nRight-Click Drag: Look  |  Esc: SteamVR Dashboard\nR: Recenter  |  Alt+Drag or Header: Move Window";
-    D2D1_RECT_F footerRect = D2D1::RectF(left + 8.0f, top + 486.0f, right - 8.0f, bottom - 6.0f);
+    D2D1_RECT_F footerRect = D2D1::RectF(left + 8.0f, top + 528.0f, right - 8.0f, bottom - 6.0f);
     g_d2dRenderTarget->DrawText(
         footerText, static_cast<UINT32>(wcslen(footerText)),
         g_textFormatFooter, &footerRect, g_brushTextMuted);
@@ -2221,6 +2269,9 @@ void Render(ID3D11ShaderResourceView* source, bool flipVertical) {
         sourceAspect = ComputeMovieDisplayAspect(g_projectedWidth, g_projectedHeight);
     } else if (activeSource == g_peerSrv && g_peerWidth && g_peerHeight) {
         sourceAspect = ComputeMovieDisplayAspect(g_peerWidth, g_peerHeight);
+    } else if (g_movieOnly) {
+        float ov = GetSelectedAspectOverride();
+        if (ov > 0.0f) sourceAspect = ov;
     }
 
     D3D11_VIEWPORT viewport{};
@@ -2382,6 +2433,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_btnWholeHovered = inRect(mx, my, g_btnWholeTheaterRect);
             g_btnMovieHovered = inRect(mx, my, g_btnMovieOnlyRect);
             g_btnStereo3dHovered = inRect(mx, my, g_btnStereo3dRect);
+            g_btnAspectHovered = inRect(mx, my, g_btnAspectRect);
             g_btnProjectScreenHovered = inRect(mx, my, g_btnProjectScreenRect);
             g_btnProjectAppHovered = inRect(mx, my, g_btnProjectAppRect);
             g_btnFsHovered = inRect(mx, my, g_btnFullscreenRect);
@@ -2400,6 +2452,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_btnWholeHovered = false;
             g_btnMovieHovered = false;
             g_btnStereo3dHovered = false;
+            g_btnAspectHovered = false;
             g_btnProjectScreenHovered = false;
             g_btnProjectAppHovered = false;
             g_btnFsHovered = false;
@@ -2453,6 +2506,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         g_btnWholeHovered = false;
         g_btnMovieHovered = false;
         g_btnStereo3dHovered = false;
+        g_btnAspectHovered = false;
         g_btnProjectScreenHovered = false;
         g_btnProjectAppHovered = false;
         g_btnFsHovered = false;
@@ -2515,6 +2569,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                         AdjustWindowToVideoAspect(hwnd, ComputeMovieDisplayAspect(g_projectedWidth, g_projectedHeight));
                     }
                 }
+                return 0;
+            }
+            if (inRect(mx, my, g_btnAspectRect)) {
+                g_aspectPresetIndex = (g_aspectPresetIndex + 1) % _countof(kAspectPresets);
+                g_lastAdjustedAspect = 0.0f;
+                SyncAspectOverrideToIpc();
+                if (g_movieOnly) {
+                    uint32_t w = (g_projectionMode == ProjectionMode::App) ? g_projectedWidth : g_peerWidth;
+                    uint32_t h = (g_projectionMode == ProjectionMode::App) ? g_projectedHeight : g_peerHeight;
+                    if (w == 0 || h == 0) { w = g_sourceWidth; h = g_sourceHeight; }
+                    AdjustWindowToVideoAspect(hwnd, ComputeMovieDisplayAspect(w, h));
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
             if (inRect(mx, my, g_btnProjectScreenRect)) {
