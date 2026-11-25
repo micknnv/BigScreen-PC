@@ -1058,78 +1058,74 @@ void RouteDesktopTexture() {
 
     if (!g_pfnGetNativeDesktop) return;
 
-    uint32_t foundCount = 0;
-    for (int deskIdx = 0; deskIdx < 4; ++deskIdx) {
-        void* rawDesktopPtr = g_pfnGetNativeDesktop(deskIdx);
-        ID3D11Texture2D* pDesktopTex = ResolveDesktopTexture2D(rawDesktopPtr);
-        if (!pDesktopTex) continue;
-        ++foundCount;
+    void* rawDesktopPtr = g_pfnGetNativeDesktop(0);
+    ID3D11Texture2D* pDesktopTex = ResolveDesktopTexture2D(rawDesktopPtr);
+    if (!pDesktopTex) {
+        if (g_projectedState) g_projectedState->diagDesktopCount = 0;
+        return;
+    }
 
-        ID3D11Device* pDevice = nullptr;
-        pDesktopTex->GetDevice(&pDevice);
-        if (!pDevice) {
-            pDesktopTex->Release();
-            continue;
-        }
+    ID3D11Device* pDevice = nullptr;
+    pDesktopTex->GetDevice(&pDevice);
+    if (!pDevice) {
+        pDesktopTex->Release();
+        return;
+    }
 
-        ID3D11DeviceContext* pContext = nullptr;
-        pDevice->GetImmediateContext(&pContext);
-        if (!pContext) {
-            pDevice->Release();
-            pDesktopTex->Release();
-            continue;
-        }
-
-        D3D11_TEXTURE2D_DESC deskDesc{};
-        pDesktopTex->GetDesc(&deskDesc);
-        if (g_projectedState && deskIdx == 0) {
-            g_projectedState->diagDeskFmt = static_cast<uint32_t>(deskDesc.Format);
-        }
-
-        if (state.active && state.sharedHandle) {
-            if (!g_sharedVideoTex || g_currentSharedHandle != state.sharedHandle) {
-                if (g_sharedVideoSrv) { g_sharedVideoSrv->Release(); g_sharedVideoSrv = nullptr; }
-                if (g_sharedVideoTex) { g_sharedVideoTex->Release(); g_sharedVideoTex = nullptr; }
-                g_currentSharedHandle = 0;
-                HRESULT hr = pDevice->OpenSharedResource(reinterpret_cast<HANDLE>(state.sharedHandle), IID_PPV_ARGS(&g_sharedVideoTex));
-                if (g_projectedState) {
-                    g_projectedState->diagOpenHr = static_cast<int32_t>(hr);
-                }
-                if (SUCCEEDED(hr) && g_sharedVideoTex) {
-                    g_currentSharedHandle = state.sharedHandle;
-                }
-            }
-
-            if (g_sharedVideoTex) {
-                D3D11_TEXTURE2D_DESC vidDesc{};
-                g_sharedVideoTex->GetDesc(&vidDesc);
-                if (g_projectedState) {
-                    g_projectedState->diagVidFmt = static_cast<uint32_t>(vidDesc.Format);
-                }
-                if (BlitSharedVideoToDesktop(pDevice, pContext, pDesktopTex, deskDesc, g_sharedVideoTex)) {
-                    if (g_projectedState) {
-                        ++g_projectedState->diagCopiedCount;
-                    }
-                }
-            }
-        } else if (state.privacyMode) {
-            if (EnsureBlackTexture(pDevice, pContext, deskDesc) && g_blackTex) {
-                if (g_blackMips == deskDesc.MipLevels) {
-                    pContext->CopyResource(pDesktopTex, g_blackTex);
-                } else {
-                    pContext->CopySubresourceRegion(pDesktopTex, 0, 0, 0, 0, g_blackTex, 0, nullptr);
-                }
-            }
-        }
-
-        pContext->Release();
+    ID3D11DeviceContext* pContext = nullptr;
+    pDevice->GetImmediateContext(&pContext);
+    if (!pContext) {
         pDevice->Release();
         pDesktopTex->Release();
+        return;
     }
 
+    D3D11_TEXTURE2D_DESC deskDesc{};
+    pDesktopTex->GetDesc(&deskDesc);
     if (g_projectedState) {
-        g_projectedState->diagDesktopCount = foundCount;
+        g_projectedState->diagDesktopCount = 1;
+        g_projectedState->diagDeskFmt = static_cast<uint32_t>(deskDesc.Format);
     }
+
+    if (state.active && state.sharedHandle) {
+        if (!g_sharedVideoTex || g_currentSharedHandle != state.sharedHandle) {
+            if (g_sharedVideoSrv) { g_sharedVideoSrv->Release(); g_sharedVideoSrv = nullptr; }
+            if (g_sharedVideoTex) { g_sharedVideoTex->Release(); g_sharedVideoTex = nullptr; }
+            g_currentSharedHandle = 0;
+            HRESULT hr = pDevice->OpenSharedResource(reinterpret_cast<HANDLE>(state.sharedHandle), IID_PPV_ARGS(&g_sharedVideoTex));
+            if (g_projectedState) {
+                g_projectedState->diagOpenHr = static_cast<int32_t>(hr);
+            }
+            if (SUCCEEDED(hr) && g_sharedVideoTex) {
+                g_currentSharedHandle = state.sharedHandle;
+            }
+        }
+
+        if (g_sharedVideoTex) {
+            D3D11_TEXTURE2D_DESC vidDesc{};
+            g_sharedVideoTex->GetDesc(&vidDesc);
+            if (g_projectedState) {
+                g_projectedState->diagVidFmt = static_cast<uint32_t>(vidDesc.Format);
+            }
+            if (BlitSharedVideoToDesktop(pDevice, pContext, pDesktopTex, deskDesc, g_sharedVideoTex)) {
+                if (g_projectedState) {
+                    ++g_projectedState->diagCopiedCount;
+                }
+            }
+        }
+    } else if (state.privacyMode) {
+        if (EnsureBlackTexture(pDevice, pContext, deskDesc) && g_blackTex) {
+            if (g_blackMips == deskDesc.MipLevels) {
+                pContext->CopyResource(pDesktopTex, g_blackTex);
+            } else {
+                pContext->CopySubresourceRegion(pDesktopTex, 0, 0, 0, 0, g_blackTex, 0, nullptr);
+            }
+        }
+    }
+
+    pContext->Release();
+    pDevice->Release();
+    pDesktopTex->Release();
 }
 
 // --------------------------------------------------------------------------
