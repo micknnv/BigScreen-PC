@@ -9,6 +9,10 @@
 #include <endpointvolume.h>
 #include <tlhelp32.h>
 #include <shellapi.h>
+#include <setupapi.h>
+#include <newdev.h>
+#include <cfgmgr32.h>
+#include <shlobj.h>
 #include <string>
 #include <vector>
 
@@ -1471,12 +1475,65 @@ void ShowProjectAppMenu(HWND parentHwnd, float clickX, float clickY) {
 }
 
 HWND g_lastVirtualTargetHwnd = nullptr;
+std::wstring g_lastVddError;
 
-bool IsVirtualDisplayDeviceString(const wchar_t* devString) {
-    if (!devString || !*devString) return false;
-    return wcsstr(devString, L"Virtual Display") != nullptr ||
-           wcsstr(devString, L"MttVDD") != nullptr ||
-           wcsstr(devString, L"Indirect Display") != nullptr;
+static const GUID kGuidDevClassDisplay = {
+    0x4d36e968, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 }
+};
+
+bool IsVirtualDisplayDevice(const DISPLAY_DEVICEW& dd) {
+    if (!dd.DeviceString[0]) return false;
+    if (wcsstr(dd.DeviceString, L"Immersed") != nullptr) return false;
+    return _wcsicmp(dd.DeviceString, L"Virtual Display Driver") == 0 ||
+           wcsstr(dd.DeviceString, L"MttVDD") != nullptr ||
+           wcsstr(dd.DeviceID, L"MttVDD") != nullptr ||
+           wcsstr(dd.DeviceID, L"MTTVDD") != nullptr;
+}
+
+bool ContainsCaseInsensitive(const wchar_t* haystack, const wchar_t* needle) {
+    if (!haystack || !needle || !*needle) return false;
+    size_t nlen = wcslen(needle);
+    for (const wchar_t* p = haystack; *p; ++p) {
+        if (_wcsnicmp(p, needle, nlen) == 0) return true;
+    }
+    return false;
+}
+
+std::wstring GetExeDirectory() {
+    wchar_t exePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    fs::path p(exePath);
+    return p.parent_path().wstring();
+}
+
+std::wstring FindBundledVddInfPath() {
+    fs::path exeDir(GetExeDirectory());
+    fs::path candidates[] = {
+        exeDir / L"vdd" / L"mttvdd.inf",
+        exeDir.parent_path().parent_path() / L"resources" / L"vdd" / L"mttvdd.inf",
+        exeDir.parent_path().parent_path().parent_path() / L"resources" / L"vdd" / L"mttvdd.inf"
+    };
+    for (const auto& c : candidates) {
+        std::error_code ec;
+        if (fs::exists(c, ec)) {
+            return fs::weakly_canonical(c, ec).wstring();
+        }
+    }
+    return L"";
+}
+
+bool EnsureVddSettingsFile(const std::wstring& infPath) {
+    std::error_code ec;
+    fs::path targetDir(L"C:\\VirtualDisplayDriver");
+    fs::create_directories(targetDir, ec);
+    fs::path targetXml = targetDir / L"vdd_settings.xml";
+    if (!fs::exists(targetXml, ec) && !infPath.empty()) {
+        fs::path srcXml = fs::path(infPath).parent_path() / L"vdd_settings.xml";
+        if (fs::exists(srcXml, ec)) {
+            fs::copy_file(srcXml, targetXml, fs::copy_options::overwrite_existing, ec);
+        }
+    }
+    return fs::exists(targetXml, ec);
 }
 
 bool SendMttVddCommand(const wchar_t* cmd) {
@@ -1499,7 +1556,7 @@ std::wstring FindVirtualDisplayDeviceName(bool* outAttached) {
     DISPLAY_DEVICEW dd{};
     dd.cb = sizeof(dd);
     for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
-        if (IsVirtualDisplayDeviceString(dd.DeviceString)) {
+        if (IsVirtualDisplayDevice(dd)) {
             const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
             if (attached) {
                 if (outAttached) *outAttached = true;
@@ -1515,6 +1572,312 @@ std::wstring FindVirtualDisplayDeviceName(bool* outAttached) {
     return fallbackName;
 }
 
+bool CheckMttVddPnpDeviceState(bool* outExists, bool* outDisabled, bool* outHasProblem) {
+    if (outExists) *outExists = false;
+    if (outDisabled) *outDisabled = false;
+    if (outHasProblem) *outHasProblem = false;
+
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(&kGuidDevClassDisplay, nullptr, nullptr, 0);
+    if (hDevInfo == INVALID_HANDLE_VALUE) return false;
+
+    SP_DEVINFO_DATA devInfoData{};
+    devInfoData.cbSize = sizeof(devInfoData);
+    for (DWORD idx = 0; SetupDiEnumDeviceInfo(hDevInfo, idx, &devInfoData); ++idx) {
+        wchar_t hwIdBuf[512]{};
+        wchar_t descBuf[256]{};
+        SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfoData, SPDRP_HARDWAREID, nullptr,
+                                          reinterpret_cast<PBYTE>(hwIdBuf), sizeof(hwIdBuf) - sizeof(wchar_t), nullptr);
+        SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfoData, SPDRP_DEVICEDESC, nullptr,
+                                          reinterpret_cast<PBYTE>(descBuf), sizeof(descBuf) - sizeof(wchar_t), nullptr);
+
+        bool isMtt = false;
+        for (const wchar_t* p = hwIdBuf; *p; p += wcslen(p) + 1) {
+            if (ContainsCaseInsensitive(p, L"MttVDD")) {
+                isMtt = true;
+                break;
+            }
+        }
+        if (!isMtt && !ContainsCaseInsensitive(descBuf, L"Immersed") &&
+            _wcsicmp(descBuf, L"Virtual Display Driver") == 0) {
+            isMtt = true;
+        }
+        if (isMtt) {
+            if (outExists) *outExists = true;
+            ULONG status = 0, problem = 0;
+            if (CM_Get_DevNode_Status(&status, &problem, devInfoData.DevInst, 0) == CR_SUCCESS) {
+                if ((status & DN_HAS_PROBLEM) != 0) {
+                    if (outHasProblem) *outHasProblem = true;
+                    if (problem == CM_PROB_DISABLED && outDisabled) *outDisabled = true;
+                }
+            }
+            SetupDiDestroyDeviceInfoList(hDevInfo);
+            return true;
+        }
+    }
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    return true;
+}
+
+DWORD InstallOrEnableVddElevatedWorker() {
+    std::wstring infPath = FindBundledVddInfPath();
+    if (infPath.empty()) {
+        Log("Bundled vdd\\mttvdd.inf not found next to viewer.");
+        return ERROR_FILE_NOT_FOUND;
+    }
+
+    EnsureVddSettingsFile(infPath);
+
+    // Stage INF + CAT + DLL into Windows DriverStore from our bundled folder
+    if (!SetupCopyOEMInfW(infPath.c_str(), nullptr, SPOST_PATH, 0, nullptr, 0, nullptr, nullptr)) {
+        DWORD copyErr = GetLastError();
+        Log("SetupCopyOEMInfW returned %u (continuing to bind/create device)...", copyErr);
+    }
+
+    bool anyExisting = false;
+    bool anyFixed = false;
+
+    // 1) Enable or repair any existing MttVDD PnP device nodes
+    HDEVINFO hExisting = SetupDiGetClassDevsW(&kGuidDevClassDisplay, nullptr, nullptr, 0);
+    if (hExisting != INVALID_HANDLE_VALUE) {
+        SP_DEVINFO_DATA devData{};
+        devData.cbSize = sizeof(devData);
+        for (DWORD idx = 0; SetupDiEnumDeviceInfo(hExisting, idx, &devData); ++idx) {
+            wchar_t hwIdBuf[512]{};
+            SetupDiGetDeviceRegistryPropertyW(hExisting, &devData, SPDRP_HARDWAREID, nullptr,
+                                              reinterpret_cast<PBYTE>(hwIdBuf), sizeof(hwIdBuf) - sizeof(wchar_t), nullptr);
+            bool isMtt = false;
+            for (const wchar_t* p = hwIdBuf; *p; p += wcslen(p) + 1) {
+                if (ContainsCaseInsensitive(p, L"MttVDD")) {
+                    isMtt = true;
+                    break;
+                }
+            }
+            if (!isMtt) continue;
+
+            anyExisting = true;
+            ULONG status = 0, problem = 0;
+            if (CM_Get_DevNode_Status(&status, &problem, devData.DevInst, 0) == CR_SUCCESS &&
+                (status & DN_HAS_PROBLEM) != 0 && problem == CM_PROB_DISABLED) {
+                SP_PROPCHANGE_PARAMS pcp{};
+                pcp.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+                pcp.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+                pcp.StateChange = DICS_ENABLE;
+                pcp.Scope = DICS_FLAG_GLOBAL;
+                pcp.HwProfile = 0;
+                if (SetupDiSetClassInstallParamsW(hExisting, &devData, &pcp.ClassInstallHeader, sizeof(pcp))) {
+                    SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, hExisting, &devData);
+                }
+                CM_Enable_DevNode(devData.DevInst, 0);
+            }
+            BOOL rebootReq = FALSE;
+            if (DiInstallDevice(nullptr, hExisting, &devData, nullptr, 0, &rebootReq)) {
+                anyFixed = true;
+            }
+        }
+        SetupDiDestroyDeviceInfoList(hExisting);
+    }
+
+    if (anyExisting) {
+        BOOL rebootReq = FALSE;
+        UpdateDriverForPlugAndPlayDevicesW(nullptr, L"Root\\MttVDD", infPath.c_str(), INSTALLFLAG_FORCE, &rebootReq);
+        if (anyFixed) return 0;
+    }
+
+    // 2) Create a brand new Root\MttVDD Virtual Display Driver device node if none exists
+    HDEVINFO hDevInfo = SetupDiCreateDeviceInfoList(&kGuidDevClassDisplay, nullptr);
+    if (hDevInfo == INVALID_HANDLE_VALUE) {
+        return GetLastError();
+    }
+
+    SP_DEVINFO_DATA devInfoData{};
+    devInfoData.cbSize = sizeof(devInfoData);
+    if (!SetupDiCreateDeviceInfoW(hDevInfo, L"DISPLAY", &kGuidDevClassDisplay,
+                                  L"Virtual Display Driver", nullptr, DICD_GENERATE_ID, &devInfoData)) {
+        DWORD err = GetLastError();
+        SetupDiDestroyDeviceInfoList(hDevInfo);
+        return err;
+    }
+
+    static const wchar_t kHwIds[] = L"Root\\MttVDD\0";
+    if (!SetupDiSetDeviceRegistryPropertyW(hDevInfo, &devInfoData, SPDRP_HARDWAREID,
+                                           reinterpret_cast<const BYTE*>(kHwIds), sizeof(kHwIds))) {
+        DWORD err = GetLastError();
+        SetupDiDestroyDeviceInfoList(hDevInfo);
+        return err;
+    }
+
+    if (!SetupDiCallClassInstaller(DIF_REGISTERDEVICE, hDevInfo, &devInfoData)) {
+        DWORD err = GetLastError();
+        SetupDiDestroyDeviceInfoList(hDevInfo);
+        return err;
+    }
+
+    BOOL rebootReq = FALSE;
+    BOOL updated = UpdateDriverForPlugAndPlayDevicesW(nullptr, L"Root\\MttVDD", infPath.c_str(),
+                                                      INSTALLFLAG_FORCE, &rebootReq);
+    if (!updated) {
+        updated = DiInstallDevice(nullptr, hDevInfo, &devInfoData, nullptr, 0, &rebootReq);
+    }
+    DWORD finalErr = updated ? 0 : GetLastError();
+    if (!updated) {
+        SetupDiCallClassInstaller(DIF_REMOVE, hDevInfo, &devInfoData);
+    }
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    return finalErr;
+}
+
+bool EnsureVirtualDisplayDriverInstalled(HWND parentHwnd) {
+    bool attached = false;
+    if (!FindVirtualDisplayDeviceName(&attached).empty()) {
+        return true;
+    }
+
+    bool devExists = false, devDisabled = false, devProblem = false;
+    CheckMttVddPnpDeviceState(&devExists, &devDisabled, &devProblem);
+
+    // If device is installed & enabled and pipe responds, trigger 1 virtual display without elevation
+    if (devExists && !devDisabled && !devProblem) {
+        if (SendMttVddCommand(L"SETDISPLAYCOUNT 1")) {
+            for (int i = 0; i < 15; ++i) {
+                Sleep(200);
+                if (!FindVirtualDisplayDeviceName(&attached).empty()) return true;
+            }
+        }
+    }
+
+    std::wstring infPath = FindBundledVddInfPath();
+    if (infPath.empty()) {
+        g_lastVddError = L"Bundled Virtual Display Driver files (vdd\\mttvdd.inf) were not found next to BigscreenDesktopViewer.exe.";
+        return false;
+    }
+
+    if (IsUserAnAdmin()) {
+        DWORD err = InstallOrEnableVddElevatedWorker();
+        if (err != 0) {
+            wchar_t msg[256]{};
+            swprintf_s(msg, L"Virtual Display Driver installation failed (Win32 error %u).", err);
+            g_lastVddError = msg;
+            return false;
+        }
+    } else {
+        wchar_t exePath[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize = sizeof(sei);
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        sei.hwnd = parentHwnd;
+        sei.lpVerb = L"runas";
+        sei.lpFile = exePath;
+        sei.lpParameters = L"--install-vdd";
+        sei.lpDirectory = GetExeDirectory().c_str();
+        sei.nShow = SW_HIDE;
+        if (!ShellExecuteExW(&sei)) {
+            DWORD err = GetLastError();
+            if (err == ERROR_CANCELLED) {
+                g_lastVddError = L"Administrator permission (UAC) was cancelled. Elevation is required once to install the Virtual Display Driver.";
+            } else {
+                wchar_t msg[256]{};
+                swprintf_s(msg, L"Could not launch Virtual Display Driver installer (error %u).", err);
+                g_lastVddError = msg;
+            }
+            return false;
+        }
+
+        if (sei.hProcess) {
+            const ULONGLONG startWait = GetTickCount64();
+            while (WaitForSingleObject(sei.hProcess, 50) == WAIT_TIMEOUT) {
+                MSG msg{};
+                while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
+                if (GetTickCount64() - startWait > 45000) break;
+            }
+            DWORD exitCode = 1;
+            GetExitCodeProcess(sei.hProcess, &exitCode);
+            CloseHandle(sei.hProcess);
+            if (exitCode != 0) {
+                wchar_t msg[256]{};
+                swprintf_s(msg, L"Virtual Display Driver setup exited with error %u.", exitCode);
+                g_lastVddError = msg;
+                return false;
+            }
+        }
+    }
+
+    // Give UMDF IddCx driver host up to ~4s to initialize the virtual monitor
+    for (int i = 0; i < 20; ++i) {
+        SendMttVddCommand(L"SETDISPLAYCOUNT 1");
+        Sleep(200);
+        if (!FindVirtualDisplayDeviceName(&attached).empty()) {
+            return true;
+        }
+    }
+
+    g_lastVddError = L"Virtual Display Driver was installed, but Windows has not exposed the virtual display output yet.";
+    return false;
+}
+
+bool ActivateDisplayPathViaCcd(const std::wstring& devName) {
+    UINT32 numPaths = 0, numModes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS || numPaths == 0) {
+        return false;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
+    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(), &numModes, modes.data(), nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> newPaths;
+    for (UINT32 i = 0; i < numPaths; ++i) {
+        if ((paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE) != 0) {
+            newPaths.push_back(paths[i]);
+        }
+    }
+
+    auto isSourceInUse = [&](const LUID& adapterId, UINT32 sourceId) {
+        for (const auto& ap : newPaths) {
+            if (ap.sourceInfo.adapterId.LowPart == adapterId.LowPart &&
+                ap.sourceInfo.adapterId.HighPart == adapterId.HighPart &&
+                ap.sourceInfo.id == sourceId) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool added = false;
+    for (UINT32 i = 0; i < numPaths; ++i) {
+        const auto& p = paths[i];
+        if ((p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0) continue;
+        if (!p.targetInfo.targetAvailable) continue;
+        if (isSourceInUse(p.sourceInfo.adapterId, p.sourceInfo.id)) continue;
+
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName{};
+        srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        srcName.header.size = sizeof(srcName);
+        srcName.header.adapterId = p.sourceInfo.adapterId;
+        srcName.header.id = p.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&srcName.header) == ERROR_SUCCESS &&
+            _wcsicmp(srcName.viewGdiDeviceName, devName.c_str()) == 0) {
+            DISPLAYCONFIG_PATH_INFO addPath = p;
+            addPath.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+            addPath.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            addPath.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            newPaths.push_back(addPath);
+            added = true;
+            break;
+        }
+    }
+
+    if (!added) return false;
+    LONG rc = SetDisplayConfig(static_cast<UINT32>(newPaths.size()), newPaths.data(),
+                               numModes, modes.data(),
+                               SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    return rc == ERROR_SUCCESS;
+}
+
 std::vector<MonitorEntry> EnumerateSelectableScreens() {
     std::vector<MonitorEntry> screens;
     DISPLAY_DEVICEW dd{};
@@ -1522,7 +1885,7 @@ std::vector<MonitorEntry> EnumerateSelectableScreens() {
     int screenNum = 1;
     for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
         const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
-        const bool isVdd = IsVirtualDisplayDeviceString(dd.DeviceString) ||
+        const bool isVdd = IsVirtualDisplayDevice(dd) ||
                            (!g_virtualMonitorDev.empty() && _wcsicmp(dd.DeviceName, g_virtualMonitorDev.c_str()) == 0);
         if (attached && !isVdd) {
             DEVMODEW dm{};
@@ -1554,17 +1917,15 @@ std::vector<MonitorEntry> EnumerateSelectableScreens() {
 }
 
 bool LoadVirtualScreen() {
+    g_lastVddError.clear();
+    if (!EnsureVirtualDisplayDriverInstalled(g_hwnd)) {
+        return false;
+    }
+
     bool alreadyAttached = false;
     std::wstring devName = FindVirtualDisplayDeviceName(&alreadyAttached);
     if (devName.empty()) {
-        Log("No VDD display device enumerated yet; requesting SETDISPLAYCOUNT 1 via MTT pipe...");
-        if (SendMttVddCommand(L"SETDISPLAYCOUNT 1")) {
-            Sleep(400);
-            devName = FindVirtualDisplayDeviceName(&alreadyAttached);
-        }
-    }
-    if (devName.empty()) {
-        Log("Failed to locate Virtual Display Driver display device.");
+        g_lastVddError = L"Virtual Display Driver installed, but no Virtual Display output is active.";
         return false;
     }
 
@@ -1591,21 +1952,46 @@ bool LoadVirtualScreen() {
     }
     if (!anyAttached) posX = (std::max)(1920, GetSystemMetrics(SM_CXSCREEN));
 
-    bool configured = false;
+    // Find an exact enumerated 1920x1080 mode supported by the driver (prefer 60Hz)
+    DEVMODEW exactMode{};
+    bool hasExactMode = false;
+    for (DWORD modeIdx = 0;; ++modeIdx) {
+        DEVMODEW cand{};
+        cand.dmSize = sizeof(cand);
+        if (!EnumDisplaySettingsExW(devName.c_str(), modeIdx, &cand, 0)) break;
+        if (cand.dmPelsWidth == 1920 && cand.dmPelsHeight == 1080 && cand.dmBitsPerPel == 32) {
+            if (!hasExactMode || cand.dmDisplayFrequency == 60) {
+                exactMode = cand;
+                hasExactMode = true;
+                if (cand.dmDisplayFrequency == 60) break;
+            }
+        }
+    }
+
     DEVMODEW curDm{};
     curDm.dmSize = sizeof(curDm);
-    if (alreadyAttached &&
-        EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &curDm, 0) &&
-        curDm.dmPelsWidth == 1920 && curDm.dmPelsHeight == 1080) {
-        configured = true;
-    } else {
+    bool isNowAttached = alreadyAttached &&
+                         EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &curDm, 0) &&
+                         curDm.dmPelsWidth == 1920 && curDm.dmPelsHeight == 1080;
+
+    if (!isNowAttached) {
+        if (!alreadyAttached) {
+            // Try CCD first if display was detached/inactive
+            ActivateDisplayPathViaCcd(devName);
+        }
+
         DEVMODEW targetDm{};
-        targetDm.dmSize = sizeof(targetDm);
-        targetDm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY | DM_POSITION;
-        targetDm.dmPelsWidth = 1920;
-        targetDm.dmPelsHeight = 1080;
-        targetDm.dmBitsPerPel = 32;
-        targetDm.dmDisplayFrequency = 60;
+        if (hasExactMode) {
+            targetDm = exactMode;
+            targetDm.dmFields |= DM_POSITION;
+        } else {
+            targetDm.dmSize = sizeof(targetDm);
+            targetDm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY | DM_POSITION;
+            targetDm.dmPelsWidth = 1920;
+            targetDm.dmPelsHeight = 1080;
+            targetDm.dmBitsPerPel = 32;
+            targetDm.dmDisplayFrequency = 60;
+        }
         targetDm.dmPosition.x = posX;
         targetDm.dmPosition.y = 0;
 
@@ -1617,25 +2003,22 @@ bool LoadVirtualScreen() {
                                            CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
         }
         if (res == DISP_CHANGE_SUCCESSFUL) {
-            res = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
-        }
-        if (res == DISP_CHANGE_SUCCESSFUL) {
-            configured = true;
+            ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
         } else {
-            // Retry without registry persistence flags in case dynamic-only attach succeeds
-            targetDm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_POSITION;
             res = ChangeDisplaySettingsExW(devName.c_str(), &targetDm, nullptr, CDS_NORESET, nullptr);
             if (res == DISP_CHANGE_SUCCESSFUL) {
-                res = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+                ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
             }
-            configured = (res == DISP_CHANGE_SUCCESSFUL);
         }
     }
 
     DEVMODEW verifyDm{};
     verifyDm.dmSize = sizeof(verifyDm);
-    if (!configured || !EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &verifyDm, 0) ||
+    if (!EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &verifyDm, 0) ||
         verifyDm.dmPelsWidth == 0 || verifyDm.dmPelsHeight == 0) {
+        wchar_t msg[256]{};
+        swprintf_s(msg, L"Could not attach %ls at 1920x1080 on Windows Desktop.", devName.c_str());
+        g_lastVddError = msg;
         Log("LoadVirtualScreen failed to activate %ls at 1920x1080", devName.c_str());
         return false;
     }
@@ -1719,6 +2102,7 @@ void UnloadVirtualScreen() {
             ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr, CDS_NORESET, nullptr);
         }
         ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+        SendMttVddCommand(L"SETDISPLAYCOUNT 0");
         Log("Unloaded Virtual Screen %ls", devName.c_str());
     }
 
@@ -1827,10 +2211,10 @@ void ShowProjectScreenMenu(HWND parentHwnd, float clickX, float clickY) {
             CaptureProjectedMonitorFrame();
             Log("Projection started on Virtual Screen (1920x1080)");
         } else {
-            MessageBoxW(parentHwnd,
-                        L"Could not activate the Virtual Display Driver (1920x1080).\n"
-                        L"Please check Virtual Display Driver installation.",
-                        L"Virtual Screen Unavailable", MB_OK | MB_ICONWARNING);
+            const wchar_t* errText = !g_lastVddError.empty()
+                ? g_lastVddError.c_str()
+                : L"Could not activate the Virtual Display Driver (1920x1080).";
+            MessageBoxW(parentHwnd, errText, L"Virtual Screen Unavailable", MB_OK | MB_ICONWARNING);
         }
     } else if (cmd >= 2001 && static_cast<size_t>(cmd - 2001) < screens.size()) {
         UnloadVirtualScreen();
@@ -3693,7 +4077,10 @@ void UpdateRoomOwnershipState() {
     }
 }
 
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
+    if (cmdLine && wcsstr(cmdLine, L"--install-vdd") != nullptr) {
+        return static_cast<int>(InstallOrEnableVddElevatedWorker());
+    }
     HINSTANCE instance = GetModuleHandleA(nullptr);
     WNDCLASSA windowClass{};
     windowClass.hInstance = instance;

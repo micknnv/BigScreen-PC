@@ -96,7 +96,7 @@ target_compile_definitions(BigscreenDesktopViewer PRIVATE WIN32_LEAN_AND_MEAN NO
 target_include_directories(BigscreenDesktopViewer PRIVATE src)
 target_link_libraries(BigscreenDesktopViewer PRIVATE
   "${OPENVR_SDK_ROOT}/lib/win64/openvr_api.lib"
-  d3d11 dxgi d3dcompiler d2d1 dwrite ole32
+  d3d11 dxgi d3dcompiler d2d1 dwrite ole32 setupapi newdev cfgmgr32 shell32
 )
 set_target_properties(BigscreenDesktopViewer PROPERTIES
   OUTPUT_NAME "BigscreenDesktopViewer"
@@ -110,6 +110,20 @@ add_custom_command(TARGET BigscreenDesktopViewer POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${OPENVR_SDK_ROOT}/bin/win64/openvr_api.dll"
     "${CMAKE_BINARY_DIR}/runtime/openvr_api.dll"
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+    "${CMAKE_BINARY_DIR}/runtime/vdd"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/vdd/mttvdd.inf"
+    "${CMAKE_BINARY_DIR}/runtime/vdd/mttvdd.inf"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/vdd/MttVDD.cat"
+    "${CMAKE_BINARY_DIR}/runtime/vdd/MttVDD.cat"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/vdd/MttVDD.dll"
+    "${CMAKE_BINARY_DIR}/runtime/vdd/MttVDD.dll"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/vdd/vdd_settings.xml"
+    "${CMAKE_BINARY_DIR}/runtime/vdd/vdd_settings.xml"
 )
 
 add_library(BigscreenThirdPersonGpuExport SHARED
