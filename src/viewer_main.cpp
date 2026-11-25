@@ -161,9 +161,15 @@ bool g_roomHookReady = false;
 bool g_inOwnRoom = false;
 bool g_isLoadingRoom = false;
 bool g_peerStreamActive = false;
+uint64_t g_reqOwnRoomSeq = 0;
+bool g_waitingOwnRoomForProject = false;
 
 bool CanProjectInCurrentRoom() {
     return g_bigscreenRunning && g_roomHookReady && g_inOwnRoom && !g_isLoadingRoom && !g_peerStreamActive;
+}
+
+bool CanLeaveToOwnRoomToProject() {
+    return g_bigscreenRunning && g_roomHookReady && !g_inOwnRoom && !g_isLoadingRoom;
 }
 
 // Mouse Pointer & Look State
@@ -2967,6 +2973,18 @@ void ToggleFullscreen(HWND hwnd) {
     }
 }
 
+void RequestOwnRoomTransition() {
+    EnsureProjectedVideoIpc();
+    if (g_projectedVideoState) {
+        g_projectedVideoState->magic = bigscreen_projected_video::kMagic;
+        g_projectedVideoState->version = bigscreen_projected_video::kVersion;
+        g_projectedVideoState->requestOwnRoomSeq = ++g_reqOwnRoomSeq;
+    }
+    g_waitingOwnRoomForProject = true;
+    SetLcdNotification(L"LOADING OWN ROOM", L"PLEASE WAIT...", 5000);
+    Log("Requested Bigscreen leave current room -> own room (seq=%llu)", static_cast<unsigned long long>(g_reqOwnRoomSeq));
+}
+
 void ToggleAlwaysOnTop(HWND hwnd) {
     g_alwaysOnTop = !g_alwaysOnTop;
     SetWindowPos(hwnd, g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
@@ -3372,7 +3390,7 @@ bool IsRemoteBtnSelectable(RemoteBtn btn) {
         case RemoteBtn::DpadSelect:
             return !g_movieOnly; // Theater Mode (Panning recenter or Zoom reset)
         case RemoteBtn::ProjectScreen:
-            return (g_projectionMode != ProjectionMode::None) || CanProjectInCurrentRoom();
+            return (g_projectionMode != ProjectionMode::None) || CanProjectInCurrentRoom() || CanLeaveToOwnRoomToProject();
         case RemoteBtn::Microphone:
             return g_bigscreenRunning;
         case RemoteBtn::MuteOthers:
@@ -3502,9 +3520,15 @@ void GetRemoteLcdLines(std::wstring& l1, std::wstring& l2) {
             } else if (CanProjectInCurrentRoom()) {
                 l1 = L"PICK VIRTUAL SCREEN";
                 l2 = L"(1920x1080) OR MON";
-            } else {
-                l1 = L"ENTER OWN ROOM";
+            } else if (g_isLoadingRoom || g_waitingOwnRoomForProject) {
+                l1 = L"LOADING OWN ROOM";
+                l2 = L"PLEASE WAIT...";
+            } else if (CanLeaveToOwnRoomToProject()) {
+                l1 = L"LOAD OWN ROOM";
                 l2 = L"TO PROJECT SCREEN";
+            } else {
+                l1 = L"PROJECT SCREEN";
+                l2 = g_bigscreenRunning ? L"INITIALIZING..." : L"BIGSCREEN OFF";
             }
             return;
         case RemoteBtn::Info:
@@ -3795,7 +3819,8 @@ void GetInfoSlideOutContent(RemoteBtn hovered, std::wstring& outTitle, std::wstr
         case RemoteBtn::ProjectScreen:
             outTitle = L"PROJECT SCREEN";
             outBody = L"Projects a connected monitor or an isolated 1920x1080 Virtual Screen onto your Bigscreen theater screen.\n\n"
-                      L"Click again while active to stop projecting and unload the Virtual Screen.";
+                      L"If you are in another user's room, click once to load your own room, then click again to select a monitor.\n\n"
+                      L"Click again while projecting to stop.";
             break;
         case RemoteBtn::MovieMode:
             outTitle = L"MOVIE MODE";
@@ -4192,7 +4217,7 @@ void DrawRemotePanel(float windowWidth, float windowHeight) {
 
     // 4b. Project Screen
     const bool projActive = (g_projectionMode != ProjectionMode::None);
-    const bool projEnabled = projActive || CanProjectInCurrentRoom();
+    const bool projEnabled = projActive || CanProjectInCurrentRoom() || CanLeaveToOwnRoomToProject();
     DrawRemoteCirclePad(g_rBtnProject, RemoteBtn::ProjectScreen, projEnabled);
     {
         float cx = (g_rBtnProject.left + g_rBtnProject.right) * 0.5f;
@@ -5392,6 +5417,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                         SetLcdNotification(L"PROJECTION", L"STOPPED", 3000);
                     } else if (CanProjectInCurrentRoom()) {
                         ShowProjectScreenMenu(hwnd, g_rBtnProject.left, g_rBtnProject.bottom);
+                    } else if (CanLeaveToOwnRoomToProject()) {
+                        RequestOwnRoomTransition();
                     }
                     break;
                 case RemoteBtn::Info:
@@ -5717,6 +5744,7 @@ void UpdateRoomOwnershipState() {
             g_micMuted = false;
             g_allMuted = false;
             g_bigscreenMenuToggled = false;
+            g_waitingOwnRoomForProject = false;
             s_hasRoomSeq = false;
             if (s_prevBigscreenRunning) {
                 roomChanged = true;
@@ -5728,6 +5756,12 @@ void UpdateRoomOwnershipState() {
     s_prevInOwnRoom = g_inOwnRoom;
     s_prevRoomHookReady = g_roomHookReady;
     s_prevBigscreenRunning = g_bigscreenRunning;
+
+    if (g_waitingOwnRoomForProject && CanProjectInCurrentRoom()) {
+        g_waitingOwnRoomForProject = false;
+        SetLcdNotification(L"OWN ROOM READY", L"CLICK PROJECT", 3500);
+        Log("Own room finished loading; Project Screen is ready to select monitor or Virtual Screen");
+    }
 
     if (roomChanged && g_aspectPresetIndex != 0) {
         g_aspectPresetIndex = 0; // Reset Aspect Ratio to Auto when changing rooms

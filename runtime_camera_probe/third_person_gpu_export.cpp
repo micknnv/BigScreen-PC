@@ -1788,6 +1788,8 @@ void OnAppTickMainThread(void* pApp) {
                 g_il2cppInvoke(g_mLeaveRoom, pApp, args, &leaveExc);
                 isLoading = true;
                 inOwnRoom = false;
+                g_lastBigSoupPeerMs = 0;
+                ClearPeerMovieActive();
             }
         }
 
