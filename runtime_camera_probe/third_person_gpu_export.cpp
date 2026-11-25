@@ -256,9 +256,18 @@ typedef void* (*pfnIl2CppRuntimeInvoke)(const void* method, void* obj, void** pa
 typedef void* (*pfnIl2CppObjectUnbox)(void* obj);
 typedef void* (*pfnIl2CppThreadAttach)(void* domain);
 typedef void (*pfnIl2CppThreadDetach)(void* thread);
+typedef void (*pfnIl2CppFieldStaticGetValue)(const void* field, void* value);
+typedef void* (*pfnIl2CppObjectGetClass)(void* obj);
+typedef const void* (*pfnIl2CppMethodGetParam)(const void* method, uint32_t index);
+typedef int (*pfnIl2CppTypeGetType)(const void* type);
 
 pfnIl2CppRuntimeInvoke g_il2cppInvoke = nullptr;
 pfnIl2CppObjectUnbox g_il2cppUnbox = nullptr;
+pfnIl2CppFieldStaticGetValue g_fnFieldStaticGetValue = nullptr;
+pfnIl2CppObjectGetClass g_fnObjectGetClass = nullptr;
+pfnIl2CppClassGetMethodFromName g_fnMethodFromName = nullptr;
+pfnIl2CppMethodGetParam g_fnMethodGetParam = nullptr;
+pfnIl2CppTypeGetType g_fnTypeGetType = nullptr;
 
 const void* g_mGetCurrentRoom = nullptr;
 const void* g_mGetIsLoadingScene = nullptr;
@@ -266,11 +275,44 @@ const void* g_mLeaveRoom = nullptr;
 const void* g_mGetIsLocalUserOwner = nullptr;
 const void* g_mGetIsSinglePlayer = nullptr;
 const void* g_mInLobby = nullptr;
+const void* g_mGetRemoteUsers = nullptr;
+const void* g_mGetRemoteUsersDict = nullptr;
+
+void* g_klassStaticSingletons = nullptr;
+void* g_klassBlockingController = nullptr;
+void* g_klassMicInput = nullptr;
+void* g_klassControlStrip = nullptr;
+void* g_klassNameListPage = nullptr;
+void* g_klassBigSoup = nullptr;
+void* g_typeControlStrip = nullptr;
+void* g_typeNameListPage = nullptr;
+
+const void* g_fldStaticBlockingCtrl = nullptr;
+const void* g_fldStaticMicInput = nullptr;
+const void* g_fldStaticBigSoup = nullptr;
+const void* g_fldMicIsMuted = nullptr;
+const void* g_fldMicSelectedMute = nullptr;
+const void* g_fldControlStripMicBtn = nullptr;
+const void* g_fldNameListMuteAllBtn = nullptr;
+
+const void* g_mGetAllMuted = nullptr;
+const void* g_mSetAllMuted = nullptr;
+const void* g_mBlockingToggleMuteAll = nullptr;
+const void* g_mMicMute = nullptr;
+const void* g_mBigSoupIsStreamingMic = nullptr;
+const void* g_mBigSoupSetLocalMicEnabled = nullptr;
+const void* g_mBigSoupToggleMuteAll = nullptr;
+const void* g_mOnMicButtonPressed = nullptr;
+const void* g_mUpdateMicBtn = nullptr;
+const void* g_mOnMuteAllPressed = nullptr;
+const void* g_mUpdateMuteAllBtn = nullptr;
 
 pfnAppTick g_originalAppTick = nullptr;
 uint8_t* g_pTrampolineAppTick = nullptr;
 bool g_appTickHookInstalled = false;
 uint64_t g_handledOwnRoomSeq = 0;
+uint64_t g_handledMicToggleSeq = 0;
+uint64_t g_handledMuteAllToggleSeq = 0;
 ULONGLONG g_lastRoomPollMs = 0;
 ULONGLONG g_lastLeaveRoomMs = 0;
 
@@ -1653,21 +1695,69 @@ bool InvokeBoolGetter(const void* method, void* instance, bool defaultVal) {
     return (*reinterpret_cast<const uint8_t*>(g_il2cppUnbox(ret))) != 0;
 }
 
+uint32_t ReadRemoteUserCount(void* pRoom) {
+    if (!pRoom || !g_il2cppInvoke || !g_il2cppUnbox || !g_fnObjectGetClass || !g_fnMethodFromName) return 0;
+    const void* getters[2] = { g_mGetRemoteUsers, g_mGetRemoteUsersDict };
+    for (const void* g : getters) {
+        if (!g) continue;
+        void* exc = nullptr;
+        void* col = g_il2cppInvoke(g, pRoom, nullptr, &exc);
+        if (exc || !col) continue;
+        void* colClass = g_fnObjectGetClass(col);
+        if (!colClass) continue;
+        const void* mCount = g_fnMethodFromName(colClass, "get_Count", 0);
+        if (!mCount) continue;
+        void* ret = g_il2cppInvoke(mCount, col, nullptr, &exc);
+        if (!exc && ret) {
+            int32_t c = *reinterpret_cast<const int32_t*>(g_il2cppUnbox(ret));
+            return c > 0 ? static_cast<uint32_t>(c) : 0u;
+        }
+    }
+    return 0;
+}
+
+void* GetStaticSingletonPtr(const void* staticField) {
+    if (!staticField || !g_fnFieldStaticGetValue) return nullptr;
+    void* obj = nullptr;
+    g_fnFieldStaticGetValue(staticField, &obj);
+    return obj;
+}
+
+void* FindFirstUnityObjectOfType(void* typeObj) {
+    if (!typeObj || !g_mFindObjectsOfType || !g_il2cppInvoke || !g_fnArrayLength) return nullptr;
+    void* exc = nullptr;
+    void* args[1] = { typeObj };
+    void* arr = g_il2cppInvoke(g_mFindObjectsOfType, nullptr, args, &exc);
+    if (exc || !arr) return nullptr;
+    uint32_t n = g_fnArrayLength(arr);
+    if (n == 0) return nullptr;
+    auto** elems = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(arr) + 0x20);
+    return elems[0];
+}
+
 void OnAppTickMainThread(void* pApp) {
     if (!g_il2cppInvoke || !pApp || !g_peerCsInit) return;
     ULONGLONG now = GetTickCount64();
 
     const auto* projState = GetProjectedVideoState();
     const uint64_t reqSeq = projState ? projState->requestOwnRoomSeq : 0;
+    const uint64_t micSeq = projState ? projState->requestMicToggleSeq : 0;
+    const uint64_t muteAllSeq = projState ? projState->requestMuteAllToggleSeq : 0;
     const bool leaveRequested = (reqSeq != 0 && reqSeq != g_handledOwnRoomSeq);
+    const bool micRequested = (micSeq != 0 && micSeq != g_handledMicToggleSeq);
+    const bool muteAllRequested = (muteAllSeq != 0 && muteAllSeq != g_handledMuteAllToggleSeq);
 
-    if (!leaveRequested && (now - g_lastRoomPollMs < 100)) {
+    if (!leaveRequested && !micRequested && !muteAllRequested && (now - g_lastRoomPollMs < 100)) {
         return;
     }
     g_lastRoomPollMs = now;
 
     bool isLoading = false;
     bool inOwnRoom = false;
+    bool micMuted = false;
+    bool allMuted = false;
+    uint32_t remoteUsers = 0;
+    bool audioReady = false;
 
     __try {
         isLoading = InvokeBoolGetter(g_mGetIsLoadingScene, pApp, false);
@@ -1678,6 +1768,7 @@ void OnAppTickMainThread(void* pApp) {
             const bool isOwner = InvokeBoolGetter(g_mGetIsLocalUserOwner, pRoom, false);
             const bool inLobby = InvokeBoolGetter(g_mInLobby, pRoom, false);
             inOwnRoom = !isLoading && (isSinglePlayer || (isOwner && !inLobby));
+            remoteUsers = ReadRemoteUserCount(pRoom);
         }
 
         if (leaveRequested) {
@@ -1693,6 +1784,132 @@ void OnAppTickMainThread(void* pApp) {
                 inOwnRoom = false;
             }
         }
+
+        void* pMicInput = GetStaticSingletonPtr(g_fldStaticMicInput);
+        void* pBlocking = GetStaticSingletonPtr(g_fldStaticBlockingCtrl);
+        void* pBigSoup = GetStaticSingletonPtr(g_fldStaticBigSoup);
+        audioReady = (pMicInput != nullptr || pBlocking != nullptr || pBigSoup != nullptr);
+
+        auto readMicState = [&]() -> bool {
+            if (pMicInput && g_fnFieldGetOffset) {
+                if (g_fldMicSelectedMute) {
+                    size_t off = g_fnFieldGetOffset(g_fldMicSelectedMute);
+                    if (*reinterpret_cast<const uint8_t*>(reinterpret_cast<const uint8_t*>(pMicInput) + off) != 0) return true;
+                }
+                if (g_fldMicIsMuted) {
+                    size_t off = g_fnFieldGetOffset(g_fldMicIsMuted);
+                    if (*reinterpret_cast<const uint8_t*>(reinterpret_cast<const uint8_t*>(pMicInput) + off) != 0) return true;
+                }
+                return false;
+            }
+            if (pBigSoup && g_mBigSoupIsStreamingMic) {
+                return !InvokeBoolGetter(g_mBigSoupIsStreamingMic, pBigSoup, true);
+            }
+            return false;
+        };
+
+        auto readAllMutedState = [&]() -> bool {
+            if (pBlocking && g_mGetAllMuted) {
+                return InvokeBoolGetter(g_mGetAllMuted, pBlocking, false);
+            }
+            return false;
+        };
+
+        if (micRequested) {
+            g_handledMicToggleSeq = micSeq;
+            bool curMuted = readMicState();
+            bool targetMuted = !curMuted;
+
+            void* pStrip = FindFirstUnityObjectOfType(g_typeControlStrip);
+            if (pStrip && g_mOnMicButtonPressed && g_fldControlStripMicBtn && g_fnFieldGetOffset) {
+                size_t offBtn = g_fnFieldGetOffset(g_fldControlStripMicBtn);
+                void* micBtn = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(pStrip) + offBtn);
+                void* args[1] = { micBtn };
+                void* mExc = nullptr;
+                g_il2cppInvoke(g_mOnMicButtonPressed, pStrip, args, &mExc);
+            }
+
+            // Ensure MicInput + BigSoup reflect toggled state even if ControlStrip is hidden/unmounted
+            if (readMicState() == curMuted) {
+                if (pMicInput && g_mMicMute) {
+                    uint8_t argMute = targetMuted ? 1 : 0;
+                    void* args[1] = { &argMute };
+                    void* mExc = nullptr;
+                    g_il2cppInvoke(g_mMicMute, pMicInput, args, &mExc);
+                }
+                if (pMicInput && g_fnFieldGetOffset && g_fldMicSelectedMute) {
+                    size_t off = g_fnFieldGetOffset(g_fldMicSelectedMute);
+                    *reinterpret_cast<uint8_t*>(reinterpret_cast<uint8_t*>(pMicInput) + off) = targetMuted ? 1 : 0;
+                }
+                if (pBigSoup && g_mBigSoupSetLocalMicEnabled) {
+                    uint8_t argEn = targetMuted ? 0 : 1;
+                    void* args[1] = { &argEn };
+                    void* mExc = nullptr;
+                    g_il2cppInvoke(g_mBigSoupSetLocalMicEnabled, pBigSoup, args, &mExc);
+                }
+                if (pStrip && g_mUpdateMicBtn) {
+                    void* uExc = nullptr;
+                    g_il2cppInvoke(g_mUpdateMicBtn, pStrip, nullptr, &uExc);
+                }
+            }
+        }
+
+        if (muteAllRequested) {
+            g_handledMuteAllToggleSeq = muteAllSeq;
+            bool curAllMuted = readAllMutedState();
+            bool targetAllMuted = !curAllMuted;
+
+            void* pNameList = FindFirstUnityObjectOfType(g_typeNameListPage);
+            if (pNameList && g_mOnMuteAllPressed && g_fldNameListMuteAllBtn && g_fnFieldGetOffset) {
+                size_t offBtn = g_fnFieldGetOffset(g_fldNameListMuteAllBtn);
+                void* muteBtn = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(pNameList) + offBtn);
+                void* args[1] = { muteBtn };
+                void* mExc = nullptr;
+                g_il2cppInvoke(g_mOnMuteAllPressed, pNameList, args, &mExc);
+            }
+
+            if (readAllMutedState() == curAllMuted && pBlocking) {
+                bool toggledViaMethod = false;
+                if (g_mBlockingToggleMuteAll && g_fnMethodGetParam && g_fnTypeGetType) {
+                    const void* pt = g_fnMethodGetParam(g_mBlockingToggleMuteAll, 0);
+                    int ptype = pt ? g_fnTypeGetType(pt) : 0;
+                    if (ptype == 2 /* IL2CPP_TYPE_BOOLEAN */) {
+                        uint8_t argMute = targetAllMuted ? 1 : 0;
+                        void* args[1] = { &argMute };
+                        void* bExc = nullptr;
+                        g_il2cppInvoke(g_mBlockingToggleMuteAll, pBlocking, args, &bExc);
+                        toggledViaMethod = (bExc == nullptr);
+                    } else if (pRoom) {
+                        void* args[1] = { pRoom };
+                        void* bExc = nullptr;
+                        g_il2cppInvoke(g_mBlockingToggleMuteAll, pBlocking, args, &bExc);
+                        toggledViaMethod = (bExc == nullptr);
+                    }
+                }
+                if ((!toggledViaMethod || readAllMutedState() == curAllMuted) && g_mSetAllMuted) {
+                    uint8_t argMute = targetAllMuted ? 1 : 0;
+                    void* args[1] = { &argMute };
+                    void* sExc = nullptr;
+                    g_il2cppInvoke(g_mSetAllMuted, pBlocking, args, &sExc);
+                }
+                if (pBigSoup && g_mBigSoupToggleMuteAll && g_fnMethodGetParam && g_fnTypeGetType) {
+                    const void* pt = g_fnMethodGetParam(g_mBigSoupToggleMuteAll, 0);
+                    if (pt && g_fnTypeGetType(pt) == 2 /* IL2CPP_TYPE_BOOLEAN */) {
+                        uint8_t argMute = targetAllMuted ? 1 : 0;
+                        void* args[1] = { &argMute };
+                        void* bExc = nullptr;
+                        g_il2cppInvoke(g_mBigSoupToggleMuteAll, pBigSoup, args, &bExc);
+                    }
+                }
+                if (pNameList && g_mUpdateMuteAllBtn) {
+                    void* uExc = nullptr;
+                    g_il2cppInvoke(g_mUpdateMuteAllBtn, pNameList, nullptr, &uExc);
+                }
+            }
+        }
+
+        micMuted = readMicState();
+        allMuted = readAllMutedState();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return;
     }
@@ -1704,6 +1921,12 @@ void OnAppTickMainThread(void* pApp) {
         g_peerState->inOwnRoom = inOwnRoom ? 1 : 0;
         g_peerState->isLoadingRoom = isLoading ? 1 : 0;
         g_peerState->handledOwnRoomSeq = g_handledOwnRoomSeq;
+        g_peerState->micMuted = micMuted ? 1 : 0;
+        g_peerState->allMuted = allMuted ? 1 : 0;
+        g_peerState->remoteUserCount = remoteUsers;
+        g_peerState->audioHookReady = audioReady ? 1 : 0;
+        g_peerState->handledMicToggleSeq = g_handledMicToggleSeq;
+        g_peerState->handledMuteAllToggleSeq = g_handledMuteAllToggleSeq;
     }
     LeaveCriticalSection(&g_peerCs);
 }
@@ -2072,6 +2295,11 @@ void TryInstallAppTickHook() {
     auto fnThreadDetach = reinterpret_cast<pfnIl2CppThreadDetach>(GetProcAddress(hGame, "il2cpp_thread_detach"));
     g_il2cppInvoke = reinterpret_cast<pfnIl2CppRuntimeInvoke>(GetProcAddress(hGame, "il2cpp_runtime_invoke"));
     g_il2cppUnbox = reinterpret_cast<pfnIl2CppObjectUnbox>(GetProcAddress(hGame, "il2cpp_object_unbox"));
+    g_fnFieldStaticGetValue = reinterpret_cast<pfnIl2CppFieldStaticGetValue>(GetProcAddress(hGame, "il2cpp_field_static_get_value"));
+    g_fnObjectGetClass = reinterpret_cast<pfnIl2CppObjectGetClass>(GetProcAddress(hGame, "il2cpp_object_get_class"));
+    g_fnMethodFromName = fnMethodFromName;
+    g_fnMethodGetParam = reinterpret_cast<pfnIl2CppMethodGetParam>(GetProcAddress(hGame, "il2cpp_method_get_param"));
+    g_fnTypeGetType = reinterpret_cast<pfnIl2CppTypeGetType>(GetProcAddress(hGame, "il2cpp_type_get_type"));
 
     if (!fnDomainGet || !fnDomainAssemblies || !fnAsmImage || !fnClassFromName ||
         !fnMethodFromName || !fnThreadAttach || !fnThreadDetach || !g_il2cppInvoke || !g_il2cppUnbox) {
@@ -2097,6 +2325,12 @@ void TryInstallAppTickHook() {
             if (!img) continue;
             if (!appClass) appClass = fnClassFromName(img, "Bigscreen", "App");
             if (!roomClass) roomClass = fnClassFromName(img, "Bigscreen.Cloud", "Room");
+            if (!g_klassStaticSingletons) g_klassStaticSingletons = fnClassFromName(img, "Bigscreen", "BIG_STATIC_SINGLETONS");
+            if (!g_klassBlockingController) g_klassBlockingController = fnClassFromName(img, "Bigscreen.Users", "BlockingController");
+            if (!g_klassMicInput) g_klassMicInput = fnClassFromName(img, "Bigscreen.Voice", "MicInput");
+            if (!g_klassControlStrip) g_klassControlStrip = fnClassFromName(img, "Bigscreen.UI", "ControlStrip");
+            if (!g_klassNameListPage) g_klassNameListPage = fnClassFromName(img, "Bigscreen.UI", "NameListPage");
+            if (!g_klassBigSoup) g_klassBigSoup = fnClassFromName(img, "Bigscreen.Native", "BigSoup");
             if (!g_klassMonitorSizer) g_klassMonitorSizer = fnClassFromName(img, "Bigscreen.Monitors", "MonitorSizer");
             if (!g_klassMirroredScreen) g_klassMirroredScreen = fnClassFromName(img, "Bigscreen.Effects", "MirroredScreen");
             if (!g_klassBigMediaRenderer) g_klassBigMediaRenderer = fnClassFromName(img, "Bigscreen.Media", "BigMediaRenderer");
@@ -2155,9 +2389,32 @@ void TryInstallAppTickHook() {
                 const void* tPres = g_fnClassGetType(g_klassPresentationSectionSizer);
                 if (tPres) g_typePresentationSectionSizer = g_fnTypeGetObject(tPres);
             }
+            if (g_klassControlStrip) {
+                const void* tCs = g_fnClassGetType(g_klassControlStrip);
+                if (tCs) g_typeControlStrip = g_fnTypeGetObject(tCs);
+            }
+            if (g_klassNameListPage) {
+                const void* tNl = g_fnClassGetType(g_klassNameListPage);
+                if (tNl) g_typeNameListPage = g_fnTypeGetObject(tNl);
+            }
         }
         if (g_fnClassGetField) {
             g_fldSizerAspectRatio = g_fnClassGetField(g_klassMonitorSizer, "AspectRatio");
+            if (g_klassStaticSingletons) {
+                g_fldStaticBlockingCtrl = g_fnClassGetField(g_klassStaticSingletons, "blockingController");
+                g_fldStaticMicInput = g_fnClassGetField(g_klassStaticSingletons, "micInput");
+                g_fldStaticBigSoup = g_fnClassGetField(g_klassStaticSingletons, "bigSoup");
+            }
+            if (g_klassMicInput) {
+                g_fldMicIsMuted = g_fnClassGetField(g_klassMicInput, "isMuted");
+                g_fldMicSelectedMute = g_fnClassGetField(g_klassMicInput, "muteSelectedByUser");
+            }
+            if (g_klassControlStrip) {
+                g_fldControlStripMicBtn = g_fnClassGetField(g_klassControlStrip, "micBtn");
+            }
+            if (g_klassNameListPage) {
+                g_fldNameListMuteAllBtn = g_fnClassGetField(g_klassNameListPage, "muteAllBtn");
+            }
             if (g_klassBigMediaRenderer) {
                 g_fldMediaOrigScale = g_fnClassGetField(g_klassBigMediaRenderer, "originalScreenScale");
                 g_fldMediaScreensGo = g_fnClassGetField(g_klassBigMediaRenderer, "screensGameObject");
@@ -2165,6 +2422,28 @@ void TryInstallAppTickHook() {
                 g_fldMediaResizeRequired = g_fnClassGetField(g_klassBigMediaRenderer, "resizeRequired");
                 g_fldMediaCurrentSource = g_fnClassGetField(g_klassBigMediaRenderer, "currentMediaSource");
             }
+        }
+
+        if (g_klassBlockingController) {
+            g_mGetAllMuted = fnMethodFromName(g_klassBlockingController, "get_AllMuted", 0);
+            g_mSetAllMuted = fnMethodFromName(g_klassBlockingController, "set_AllMuted", 1);
+            g_mBlockingToggleMuteAll = fnMethodFromName(g_klassBlockingController, "ToggleMuteAll", 1);
+        }
+        if (g_klassMicInput) {
+            g_mMicMute = fnMethodFromName(g_klassMicInput, "Mute", 1);
+        }
+        if (g_klassBigSoup) {
+            g_mBigSoupIsStreamingMic = fnMethodFromName(g_klassBigSoup, "get_IsStreamingLocalMic", 0);
+            g_mBigSoupSetLocalMicEnabled = fnMethodFromName(g_klassBigSoup, "SetLocalMicStreamEnabled", 1);
+            g_mBigSoupToggleMuteAll = fnMethodFromName(g_klassBigSoup, "ToggleMuteAll", 1);
+        }
+        if (g_klassControlStrip) {
+            g_mOnMicButtonPressed = fnMethodFromName(g_klassControlStrip, "OnMicButtonPressed", 1);
+            g_mUpdateMicBtn = fnMethodFromName(g_klassControlStrip, "UpdateMicBtn", 0);
+        }
+        if (g_klassNameListPage) {
+            g_mOnMuteAllPressed = fnMethodFromName(g_klassNameListPage, "OnMuteAllPressed", 1);
+            g_mUpdateMuteAllBtn = fnMethodFromName(g_klassNameListPage, "UpdateMuteAllBtn", 0);
         }
 
         const uint8_t prefMovRbxRsiRdi[15] = { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10, 0x48,0x89,0x7C,0x24,0x18 };
@@ -2192,6 +2471,8 @@ void TryInstallAppTickHook() {
         g_mGetIsLocalUserOwner = fnMethodFromName(roomClass, "get_IsLocalUserOwner", 0);
         g_mGetIsSinglePlayer = fnMethodFromName(roomClass, "get_IsSinglePlayer", 0);
         g_mInLobby = fnMethodFromName(roomClass, "InLobby", 0);
+        g_mGetRemoteUsers = fnMethodFromName(roomClass, "get_RemoteUsers", 0);
+        g_mGetRemoteUsersDict = fnMethodFromName(roomClass, "get_RemoteUsersDictionary", 0);
 
         if (mTick && g_mGetCurrentRoom && g_mGetIsLocalUserOwner && g_mGetIsSinglePlayer && g_mLeaveRoom) {
             uint8_t* pTarget = *reinterpret_cast<uint8_t* const*>(mTick); // MethodInfo::methodPointer at +0

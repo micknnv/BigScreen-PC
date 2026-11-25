@@ -51,6 +51,9 @@ struct State {
     int32_t  diagCapOpenHr;
     uint32_t diagCapCopiedCount;
     uint32_t diagCapReserved;
+    // Viewer -> Bigscreen.exe MainThread commands
+    uint64_t requestMicToggleSeq;
+    uint64_t requestMuteAllToggleSeq;
 };
 
 } // namespace bigscreen_projected_video

@@ -35,6 +35,12 @@ struct State {
     uint32_t isLoadingRoom;      // 1 if Bigscreen is currently transitioning rooms/scenes
     uint32_t pad0;
     uint64_t handledOwnRoomSeq;  // Last requestOwnRoomSeq processed by Bigscreen.exe
+    uint32_t micMuted;           // 1 if Bigscreen local mic is muted, 0 if unmuted (default)
+    uint32_t allMuted;           // 1 if Bigscreen Mute All is active, 0 otherwise
+    uint32_t remoteUserCount;    // Remote users currently in room (>= 1 means 2+ total users)
+    uint32_t audioHookReady;     // 1 once Mic/MuteAll IL2CPP endpoints are resolved
+    uint64_t handledMicToggleSeq;
+    uint64_t handledMuteAllToggleSeq;
 };
 
 } // namespace bigscreen_peer_movie
