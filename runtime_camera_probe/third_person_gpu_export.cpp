@@ -109,10 +109,17 @@ struct RouteBlitContext {
     uint32_t stagingH = 0;
     uint32_t stagingMips = 0;
     DXGI_FORMAT stagingFmt = DXGI_FORMAT_UNKNOWN;
+
+    ID3D11Texture2D* cpuFallbackTex = nullptr;
+    uint32_t cpuFallbackW = 0;
+    uint32_t cpuFallbackH = 0;
+    uint64_t cpuFallbackSeq = 0;
 };
 
 RouteBlitContext g_unityBlitCtx{};
 RouteBlitContext g_capBlitCtx{};
+HANDLE g_fallbackMapping = nullptr;
+const uint8_t* g_fallbackView = nullptr;
 
 // --------------------------------------------------------------------------
 // Remote Peer / MediaPlayer Movie Isolation State
@@ -850,6 +857,10 @@ void ReleaseBlitContext(RouteBlitContext& ctx) {
     ReleaseBlitShared(ctx);
     ReleaseBlitBlack(ctx);
     ReleaseBlitStaging(ctx);
+    if (ctx.cpuFallbackTex) { ctx.cpuFallbackTex->Release(); ctx.cpuFallbackTex = nullptr; }
+    ctx.cpuFallbackW = 0;
+    ctx.cpuFallbackH = 0;
+    ctx.cpuFallbackSeq = 0;
     if (ctx.raster) { ctx.raster->Release(); ctx.raster = nullptr; }
     if (ctx.depth) { ctx.depth->Release(); ctx.depth = nullptr; }
     if (ctx.blend) { ctx.blend->Release(); ctx.blend = nullptr; }
@@ -1131,6 +1142,22 @@ bool BlitSharedVideoToTex(RouteBlitContext& ctx, ID3D11Device* pDevice, ID3D11De
     return true;
 }
 
+const uint8_t* GetProjectedFallbackView() {
+    if (!g_fallbackView) {
+        if (!g_fallbackMapping) {
+            g_fallbackMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, bigscreen_projected_video::kFallbackMappingName);
+        }
+        if (g_fallbackMapping) {
+            const size_t totalBytes = sizeof(bigscreen_projected_video::FallbackHeader) +
+                static_cast<size_t>(bigscreen_projected_video::kFallbackMaxWidth) *
+                bigscreen_projected_video::kFallbackMaxHeight * 4u;
+            g_fallbackView = static_cast<const uint8_t*>(
+                MapViewOfFile(g_fallbackMapping, FILE_MAP_READ, 0, 0, totalBytes));
+        }
+    }
+    return g_fallbackView;
+}
+
 bool RouteIntoTargetTexture(RouteBlitContext& ctx, ID3D11Device* pDevice, ID3D11DeviceContext* pContext,
                             ID3D11Texture2D* pDstTex, const bigscreen_projected_video::State& state,
                             bool updateDiag) {
@@ -1150,8 +1177,12 @@ bool RouteIntoTargetTexture(RouteBlitContext& ctx, ID3D11Device* pDevice, ID3D11
         if (!ctx.sharedTex || ctx.sharedHandle != state.sharedHandle) {
             ReleaseBlitShared(ctx);
             HRESULT hr = pDevice->OpenSharedResource(reinterpret_cast<HANDLE>(state.sharedHandle), IID_PPV_ARGS(&ctx.sharedTex));
-            if (updateDiag && g_projectedState) {
-                g_projectedState->diagOpenHr = static_cast<int32_t>(hr);
+            if (g_projectedState) {
+                if (updateDiag) g_projectedState->diagOpenHr = static_cast<int32_t>(hr);
+                else g_projectedState->diagCapOpenHr = static_cast<int32_t>(hr);
+                if (FAILED(hr)) {
+                    g_projectedState->needCpuFallback = 1;
+                }
             }
             if (SUCCEEDED(hr) && ctx.sharedTex) {
                 ctx.sharedHandle = state.sharedHandle;
@@ -1164,10 +1195,54 @@ bool RouteIntoTargetTexture(RouteBlitContext& ctx, ID3D11Device* pDevice, ID3D11
                 g_projectedState->diagVidFmt = static_cast<uint32_t>(vidDesc.Format);
             }
             if (BlitSharedVideoToTex(ctx, pDevice, pContext, pDstTex, dstDesc, ctx.sharedTex)) {
-                if (updateDiag && g_projectedState) {
-                    ++g_projectedState->diagCopiedCount;
+                if (g_projectedState) {
+                    if (updateDiag) ++g_projectedState->diagCopiedCount;
+                    else ++g_projectedState->diagCapCopiedCount;
                 }
                 return true;
+            }
+        } else {
+            // Cross-adapter fallback via CPU staging buffer when OpenSharedResource fails across GPUs
+            const uint8_t* view = GetProjectedFallbackView();
+            if (view) {
+                const auto* hdr = reinterpret_cast<const bigscreen_projected_video::FallbackHeader*>(view);
+                if (hdr->magic == bigscreen_projected_video::kMagic &&
+                    hdr->width >= 64 && hdr->width <= bigscreen_projected_video::kFallbackMaxWidth &&
+                    hdr->height >= 64 && hdr->height <= bigscreen_projected_video::kFallbackMaxHeight &&
+                    hdr->stride >= hdr->width * 4u) {
+                    if (!ctx.cpuFallbackTex || ctx.cpuFallbackW != hdr->width || ctx.cpuFallbackH != hdr->height) {
+                        if (ctx.sharedSrv && !ctx.sharedTex) { ctx.sharedSrv->Release(); ctx.sharedSrv = nullptr; }
+                        if (ctx.cpuFallbackTex) { ctx.cpuFallbackTex->Release(); ctx.cpuFallbackTex = nullptr; }
+                        D3D11_TEXTURE2D_DESC fdesc{};
+                        fdesc.Width = hdr->width;
+                        fdesc.Height = hdr->height;
+                        fdesc.MipLevels = 1;
+                        fdesc.ArraySize = 1;
+                        fdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                        fdesc.SampleDesc.Count = 1;
+                        fdesc.Usage = D3D11_USAGE_DEFAULT;
+                        fdesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                        if (SUCCEEDED(pDevice->CreateTexture2D(&fdesc, nullptr, &ctx.cpuFallbackTex)) && ctx.cpuFallbackTex) {
+                            ctx.cpuFallbackW = hdr->width;
+                            ctx.cpuFallbackH = hdr->height;
+                            ctx.cpuFallbackSeq = 0;
+                        }
+                    }
+                    if (ctx.cpuFallbackTex) {
+                        if (hdr->sequence != ctx.cpuFallbackSeq) {
+                            const uint8_t* pixels = view + sizeof(bigscreen_projected_video::FallbackHeader);
+                            pContext->UpdateSubresource(ctx.cpuFallbackTex, 0, nullptr, pixels, hdr->stride, 0);
+                            ctx.cpuFallbackSeq = hdr->sequence;
+                        }
+                        if (BlitSharedVideoToTex(ctx, pDevice, pContext, pDstTex, dstDesc, ctx.cpuFallbackTex)) {
+                            if (g_projectedState) {
+                                if (updateDiag) ++g_projectedState->diagCopiedCount;
+                                else ++g_projectedState->diagCapCopiedCount;
+                            }
+                            return true;
+                        }
+                    }
+                }
             }
         }
     } else if (state.privacyMode) {
@@ -1258,6 +1333,9 @@ void __stdcall OnDesktopCaptureHook(void* captureThis) {
     if (!captureThis) return;
     const auto* pState = GetProjectedVideoState();
     if (!pState) return;
+    if (g_projectedState) {
+        ++g_projectedState->diagCapHookCalls;
+    }
     const auto state = *pState;
     if (!state.active && !state.privacyMode) {
         ReleaseBlitShared(g_capBlitCtx);
@@ -2236,6 +2314,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
 
         if (g_projectedState) { UnmapViewOfFile(g_projectedState); g_projectedState = nullptr; }
         if (g_projectedMapping) { CloseHandle(g_projectedMapping); g_projectedMapping = nullptr; }
+        if (g_fallbackView) { UnmapViewOfFile(g_fallbackView); g_fallbackView = nullptr; }
+        if (g_fallbackMapping) { CloseHandle(g_fallbackMapping); g_fallbackMapping = nullptr; }
         ReleaseBlitContext(g_unityBlitCtx);
         ReleaseBlitContext(g_capBlitCtx);
         if (g_pTrampolineLocal) { VirtualFree(g_pTrampolineLocal, 0, MEM_RELEASE); g_pTrampolineLocal = nullptr; }

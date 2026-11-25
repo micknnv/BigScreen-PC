@@ -42,6 +42,10 @@ namespace {
 void Log(const char* fmt, ...);
 void SyncPointerAndLook();
 void ReleasePeerMovieResources();
+void ReleaseProjectedAppResources();
+void ClearSharedDesktopToBlack();
+void UnloadVirtualScreen();
+void StopAllProjectionAndUnloadVirtual();
 
 HWND g_hwnd = nullptr;
 IDXGIAdapter1* g_adapter = nullptr;
@@ -185,6 +189,7 @@ D2D1_RECT_F g_btnSystemRect{};
 D2D1_RECT_F g_btnPowerRect{};
 D2D1_RECT_F g_pillRect{};
 D2D1_RECT_F g_btnAspectRect{};
+D2D1_RECT_F g_btnControlVirtualRect{};
 
 bool g_closeHovered = false;
 bool g_powerHeaderHovered = false;
@@ -194,6 +199,7 @@ bool g_btnStereo3dHovered = false;
 bool g_btnAspectHovered = false;
 bool g_btnProjectScreenHovered = false;
 bool g_btnProjectAppHovered = false;
+bool g_btnControlVirtualHovered = false;
 bool g_btnFsHovered = false;
 bool g_btnRecenterHovered = false;
 bool g_btnMenuHovered = false;
@@ -234,13 +240,27 @@ ID2D1SolidColorBrush* g_brushFeedStandby = nullptr;
 ID2D1SolidColorBrush* g_brushPowerOn = nullptr;
 ID2D1SolidColorBrush* g_brushPowerOff = nullptr;
 
-// Isolated App Projection State
+// Isolated Screen / Virtual Screen Projection State
 enum class ProjectionMode {
     None,
     Screen,
+    VirtualScreen,
     App
 };
 ProjectionMode g_projectionMode = ProjectionMode::None;
+
+struct MonitorEntry {
+    std::wstring deviceName;
+    std::wstring label;
+    RECT rect{};
+    bool isPrimary = false;
+};
+std::wstring g_virtualMonitorDev;
+RECT g_virtualMonitorRect{};
+bool g_virtualScreenLoaded = false;
+std::wstring g_selectedScreenLabel;
+RECT g_projectedMonitorRect{};
+bool g_controlVirtualScreen = false;
 
 HWND g_projectedHwnd = nullptr;
 std::wstring g_projectedTitle;
@@ -279,8 +299,43 @@ uint32_t g_sharedDesktopH = 0;
 
 HANDLE g_projectedVideoMapping = nullptr;
 bigscreen_projected_video::State* g_projectedVideoState = nullptr;
+HANDLE g_fallbackMapping = nullptr;
+uint8_t* g_fallbackView = nullptr;
+ID3D11Texture2D* g_fallbackScaleTex = nullptr;
+ID3D11RenderTargetView* g_fallbackScaleRtv = nullptr;
+ID3D11Texture2D* g_fallbackReadTex = nullptr;
+uint32_t g_fallbackW = 0;
+uint32_t g_fallbackH = 0;
+uint64_t g_fallbackSeq = 0;
 DWORD g_lastInjectedBigscreenPid = 0;
 ULONGLONG g_lastInjectionCheck = 0;
+
+void EnsureProjectedFallbackIpc() {
+    if (!g_fallbackMapping) {
+        const size_t totalBytes = sizeof(bigscreen_projected_video::FallbackHeader) +
+            static_cast<size_t>(bigscreen_projected_video::kFallbackMaxWidth) *
+            bigscreen_projected_video::kFallbackMaxHeight * 4u;
+        g_fallbackMapping = CreateFileMappingW(
+            INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+            static_cast<DWORD>(totalBytes),
+            bigscreen_projected_video::kFallbackMappingName);
+    }
+    if (g_fallbackMapping && !g_fallbackView) {
+        const size_t totalBytes = sizeof(bigscreen_projected_video::FallbackHeader) +
+            static_cast<size_t>(bigscreen_projected_video::kFallbackMaxWidth) *
+            bigscreen_projected_video::kFallbackMaxHeight * 4u;
+        g_fallbackView = static_cast<uint8_t*>(
+            MapViewOfFile(g_fallbackMapping, FILE_MAP_ALL_ACCESS, 0, 0, totalBytes));
+    }
+}
+
+void ReleaseFallbackGpuResources() {
+    if (g_fallbackReadTex) { g_fallbackReadTex->Release(); g_fallbackReadTex = nullptr; }
+    if (g_fallbackScaleRtv) { g_fallbackScaleRtv->Release(); g_fallbackScaleRtv = nullptr; }
+    if (g_fallbackScaleTex) { g_fallbackScaleTex->Release(); g_fallbackScaleTex = nullptr; }
+    g_fallbackW = 0;
+    g_fallbackH = 0;
+}
 
 void EnsureProjectedVideoIpc() {
     if (!g_projectedVideoMapping) {
@@ -410,7 +465,7 @@ void RenderVideoToSharedDesktop() {
     const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     g_context->ClearRenderTargetView(g_sharedDesktopRtv, black);
 
-    if (g_projectionMode == ProjectionMode::App && g_projectedSrv && g_projectedWidth > 0 && g_projectedHeight > 0) {
+    if (g_projectionMode != ProjectionMode::None && g_projectedSrv && g_projectedWidth > 0 && g_projectedHeight > 0) {
         float ov = GetSelectedAspectOverride();
         float videoAspect = (ov > 0.0f) ? ov : (static_cast<float>(g_projectedWidth) / static_cast<float>(g_projectedHeight));
         float canvasAspect = static_cast<float>(deskW) / static_cast<float>(deskH);
@@ -450,13 +505,88 @@ void RenderVideoToSharedDesktop() {
 
     g_context->Flush();
 
+    // Cross-GPU CPU fallback writer (only runs when Bigscreen DLL requests fallback due to multi-GPU OpenSharedResource failure)
+    if (g_projectedVideoState && g_projectedVideoState->needCpuFallback != 0 && g_sharedDesktopSrv) {
+        EnsureProjectedFallbackIpc();
+        if (g_fallbackView) {
+            uint32_t fbW = (std::min)(deskW, bigscreen_projected_video::kFallbackMaxWidth);
+            uint32_t fbH = static_cast<uint32_t>((static_cast<uint64_t>(fbW) * deskH) / (std::max)(1u, deskW));
+            if (fbH > bigscreen_projected_video::kFallbackMaxHeight) {
+                fbH = bigscreen_projected_video::kFallbackMaxHeight;
+                fbW = static_cast<uint32_t>((static_cast<uint64_t>(fbH) * deskW) / (std::max)(1u, deskH));
+            }
+            fbW = (std::max)(64u, fbW & ~1u);
+            fbH = (std::max)(64u, fbH & ~1u);
+
+            if (!g_fallbackScaleTex || g_fallbackW != fbW || g_fallbackH != fbH) {
+                ReleaseFallbackGpuResources();
+                D3D11_TEXTURE2D_DESC sd{};
+                sd.Width = fbW;
+                sd.Height = fbH;
+                sd.MipLevels = 1;
+                sd.ArraySize = 1;
+                sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                sd.SampleDesc.Count = 1;
+                sd.Usage = D3D11_USAGE_DEFAULT;
+                sd.BindFlags = D3D11_BIND_RENDER_TARGET;
+                if (SUCCEEDED(g_device->CreateTexture2D(&sd, nullptr, &g_fallbackScaleTex)) &&
+                    SUCCEEDED(g_device->CreateRenderTargetView(g_fallbackScaleTex, nullptr, &g_fallbackScaleRtv))) {
+                    sd.BindFlags = 0;
+                    sd.Usage = D3D11_USAGE_STAGING;
+                    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    if (SUCCEEDED(g_device->CreateTexture2D(&sd, nullptr, &g_fallbackReadTex))) {
+                        g_fallbackW = fbW;
+                        g_fallbackH = fbH;
+                    } else {
+                        ReleaseFallbackGpuResources();
+                    }
+                } else {
+                    ReleaseFallbackGpuResources();
+                }
+            }
+
+            if (g_fallbackScaleRtv && g_fallbackReadTex) {
+                g_context->OMSetRenderTargets(1, &g_fallbackScaleRtv, nullptr);
+                D3D11_VIEWPORT fvp{ 0.0f, 0.0f, static_cast<float>(fbW), static_cast<float>(fbH), 0.0f, 1.0f };
+                g_context->RSSetViewports(1, &fvp);
+                g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                g_context->VSSetShader(g_vs, nullptr, 0);
+                g_context->PSSetShader(g_ps, nullptr, 0);
+                g_context->PSSetSamplers(0, 1, &g_sampler);
+                g_context->PSSetShaderResources(0, 1, &g_sharedDesktopSrv);
+                g_context->Draw(3, 0);
+                ID3D11ShaderResourceView* nullSrv2 = nullptr;
+                g_context->PSSetShaderResources(0, 1, &nullSrv2);
+                g_context->CopyResource(g_fallbackReadTex, g_fallbackScaleTex);
+                D3D11_MAPPED_SUBRESOURCE mapped{};
+                if (SUCCEEDED(g_context->Map(g_fallbackReadTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+                    auto* hdr = reinterpret_cast<bigscreen_projected_video::FallbackHeader*>(g_fallbackView);
+                    uint8_t* dst = g_fallbackView + sizeof(bigscreen_projected_video::FallbackHeader);
+                    const uint32_t dstStride = fbW * 4u;
+                    for (uint32_t y = 0; y < fbH; ++y) {
+                        std::memcpy(dst + static_cast<size_t>(y) * dstStride,
+                                    static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch,
+                                    dstStride);
+                    }
+                    hdr->width = fbW;
+                    hdr->height = fbH;
+                    hdr->stride = dstStride;
+                    hdr->magic = bigscreen_projected_video::kMagic;
+                    ++g_fallbackSeq;
+                    hdr->sequence = g_fallbackSeq;
+                    g_context->Unmap(g_fallbackReadTex, 0);
+                }
+            }
+        }
+    }
+
     g_context->OMSetRenderTargets(1, &prevRtv, prevDsv);
     if (prevRtv) prevRtv->Release();
     if (prevDsv) prevDsv->Release();
     if (numVp > 0) g_context->RSSetViewports(1, &prevVp);
 
     PublishProjectedVideoState(
-        g_projectionMode == ProjectionMode::App,
+        g_projectionMode != ProjectionMode::None,
         true,
         reinterpret_cast<uint64_t>(g_sharedDesktopHandle),
         deskW, deskH,
@@ -1340,6 +1470,520 @@ void ShowProjectAppMenu(HWND parentHwnd, float clickX, float clickY) {
     }
 }
 
+HWND g_lastVirtualTargetHwnd = nullptr;
+
+bool IsVirtualDisplayDeviceString(const wchar_t* devString) {
+    if (!devString || !*devString) return false;
+    return wcsstr(devString, L"Virtual Display") != nullptr ||
+           wcsstr(devString, L"MttVDD") != nullptr ||
+           wcsstr(devString, L"Indirect Display") != nullptr;
+}
+
+bool SendMttVddCommand(const wchar_t* cmd) {
+    if (!cmd || !*cmd) return false;
+    HANDLE hPipe = CreateFileW(L"\\\\.\\pipe\\MTTVirtualDisplayPipe",
+                               GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD bytes = static_cast<DWORD>((wcslen(cmd) + 1) * sizeof(wchar_t));
+    DWORD written = 0;
+    BOOL ok = WriteFile(hPipe, cmd, bytes, &written, nullptr);
+    CloseHandle(hPipe);
+    return ok && written == bytes;
+}
+
+std::wstring FindVirtualDisplayDeviceName(bool* outAttached) {
+    if (outAttached) *outAttached = false;
+    std::wstring fallbackName;
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        if (IsVirtualDisplayDeviceString(dd.DeviceString)) {
+            const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+            if (attached) {
+                if (outAttached) *outAttached = true;
+                return dd.DeviceName;
+            }
+            if (fallbackName.empty()) {
+                fallbackName = dd.DeviceName;
+            }
+        }
+        dd = {};
+        dd.cb = sizeof(dd);
+    }
+    return fallbackName;
+}
+
+std::vector<MonitorEntry> EnumerateSelectableScreens() {
+    std::vector<MonitorEntry> screens;
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    int screenNum = 1;
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+        const bool isVdd = IsVirtualDisplayDeviceString(dd.DeviceString) ||
+                           (!g_virtualMonitorDev.empty() && _wcsicmp(dd.DeviceName, g_virtualMonitorDev.c_str()) == 0);
+        if (attached && !isVdd) {
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0) &&
+                dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0) {
+                MonitorEntry entry;
+                entry.deviceName = dd.DeviceName;
+                entry.isPrimary = (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+                entry.rect = {
+                    dm.dmPosition.x,
+                    dm.dmPosition.y,
+                    dm.dmPosition.x + static_cast<LONG>(dm.dmPelsWidth),
+                    dm.dmPosition.y + static_cast<LONG>(dm.dmPelsHeight)
+                };
+                wchar_t buf[160]{};
+                swprintf_s(buf, L"Screen %d%ls  (%ux%u)",
+                           screenNum++,
+                           entry.isPrimary ? L" [Primary]" : L"",
+                           dm.dmPelsWidth, dm.dmPelsHeight);
+                entry.label = buf;
+                screens.push_back(entry);
+            }
+        }
+        dd = {};
+        dd.cb = sizeof(dd);
+    }
+    return screens;
+}
+
+bool LoadVirtualScreen() {
+    bool alreadyAttached = false;
+    std::wstring devName = FindVirtualDisplayDeviceName(&alreadyAttached);
+    if (devName.empty()) {
+        Log("No VDD display device enumerated yet; requesting SETDISPLAYCOUNT 1 via MTT pipe...");
+        if (SendMttVddCommand(L"SETDISPLAYCOUNT 1")) {
+            Sleep(400);
+            devName = FindVirtualDisplayDeviceName(&alreadyAttached);
+        }
+    }
+    if (devName.empty()) {
+        Log("Failed to locate Virtual Display Driver display device.");
+        return false;
+    }
+
+    // Place Virtual Screen cleanly to the right of all currently attached real displays
+    LONG posX = 0;
+    bool anyAttached = false;
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        if ((dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0 &&
+            _wcsicmp(dd.DeviceName, devName.c_str()) != 0) {
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0)) {
+                LONG rightEdge = dm.dmPosition.x + static_cast<LONG>(dm.dmPelsWidth);
+                if (!anyAttached || rightEdge > posX) {
+                    posX = rightEdge;
+                    anyAttached = true;
+                }
+            }
+        }
+        dd = {};
+        dd.cb = sizeof(dd);
+    }
+    if (!anyAttached) posX = (std::max)(1920, GetSystemMetrics(SM_CXSCREEN));
+
+    bool configured = false;
+    DEVMODEW curDm{};
+    curDm.dmSize = sizeof(curDm);
+    if (alreadyAttached &&
+        EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &curDm, 0) &&
+        curDm.dmPelsWidth == 1920 && curDm.dmPelsHeight == 1080) {
+        configured = true;
+    } else {
+        DEVMODEW targetDm{};
+        targetDm.dmSize = sizeof(targetDm);
+        targetDm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY | DM_POSITION;
+        targetDm.dmPelsWidth = 1920;
+        targetDm.dmPelsHeight = 1080;
+        targetDm.dmBitsPerPel = 32;
+        targetDm.dmDisplayFrequency = 60;
+        targetDm.dmPosition.x = posX;
+        targetDm.dmPosition.y = 0;
+
+        LONG res = ChangeDisplaySettingsExW(devName.c_str(), &targetDm, nullptr,
+                                            CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+        if (res != DISP_CHANGE_SUCCESSFUL) {
+            targetDm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_POSITION;
+            res = ChangeDisplaySettingsExW(devName.c_str(), &targetDm, nullptr,
+                                           CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+        }
+        if (res == DISP_CHANGE_SUCCESSFUL) {
+            res = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+        }
+        if (res == DISP_CHANGE_SUCCESSFUL) {
+            configured = true;
+        } else {
+            // Retry without registry persistence flags in case dynamic-only attach succeeds
+            targetDm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_POSITION;
+            res = ChangeDisplaySettingsExW(devName.c_str(), &targetDm, nullptr, CDS_NORESET, nullptr);
+            if (res == DISP_CHANGE_SUCCESSFUL) {
+                res = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+            }
+            configured = (res == DISP_CHANGE_SUCCESSFUL);
+        }
+    }
+
+    DEVMODEW verifyDm{};
+    verifyDm.dmSize = sizeof(verifyDm);
+    if (!configured || !EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &verifyDm, 0) ||
+        verifyDm.dmPelsWidth == 0 || verifyDm.dmPelsHeight == 0) {
+        Log("LoadVirtualScreen failed to activate %ls at 1920x1080", devName.c_str());
+        return false;
+    }
+
+    g_virtualMonitorDev = devName;
+    g_virtualMonitorRect = {
+        verifyDm.dmPosition.x,
+        verifyDm.dmPosition.y,
+        verifyDm.dmPosition.x + static_cast<LONG>(verifyDm.dmPelsWidth),
+        verifyDm.dmPosition.y + static_cast<LONG>(verifyDm.dmPelsHeight)
+    };
+    g_virtualScreenLoaded = true;
+    g_projectedMonitorRect = g_virtualMonitorRect;
+    g_selectedScreenLabel = L"Virtual Screen (1920x1080)";
+    g_controlVirtualScreen = true;
+    Log("Loaded Virtual Screen %ls at (%ld,%ld) %ux%u",
+        g_virtualMonitorDev.c_str(),
+        g_virtualMonitorRect.left, g_virtualMonitorRect.top,
+        verifyDm.dmPelsWidth, verifyDm.dmPelsHeight);
+    return true;
+}
+
+void RescueWindowsFromRect(const RECT& vrect) {
+    if (vrect.right <= vrect.left || vrect.bottom <= vrect.top) return;
+    RECT workArea{};
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0)) {
+        workArea = { 0, 0, 1280, 720 };
+    }
+    struct RescueCtx {
+        RECT vrect;
+        RECT workArea;
+    } ctx{ vrect, workArea };
+
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        const auto* c = reinterpret_cast<const RescueCtx*>(lp);
+        if (hwnd == g_hwnd || !IsWindowVisible(hwnd)) return TRUE;
+        wchar_t title[64]{};
+        if (GetWindowTextW(hwnd, title, 64) <= 0) return TRUE;
+        if (wcscmp(title, L"Program Manager") == 0) return TRUE;
+
+        RECT r{};
+        if (IsIconic(hwnd)) {
+            WINDOWPLACEMENT wp{ sizeof(wp) };
+            if (GetWindowPlacement(hwnd, &wp)) r = wp.rcNormalPosition;
+        } else {
+            GetWindowRect(hwnd, &r);
+        }
+        LONG cx = (r.left + r.right) / 2;
+        LONG cy = (r.top + r.bottom) / 2;
+        if (cx >= c->vrect.left && cx < c->vrect.right &&
+            cy >= c->vrect.top && cy < c->vrect.bottom) {
+            ShowWindow(hwnd, SW_RESTORE);
+            int w = (std::min)(1280, static_cast<int>(c->workArea.right - c->workArea.left - 80));
+            int h = (std::min)(720, static_cast<int>(c->workArea.bottom - c->workArea.top - 80));
+            w = (std::max)(480, w);
+            h = (std::max)(360, h);
+            SetWindowPos(hwnd, HWND_TOP, c->workArea.left + 60, c->workArea.top + 60, w, h,
+                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+}
+
+void UnloadVirtualScreen() {
+    g_controlVirtualScreen = false;
+    g_lastVirtualTargetHwnd = nullptr;
+    if (!g_virtualScreenLoaded && g_virtualMonitorDev.empty()) return;
+
+    RescueWindowsFromRect(g_virtualMonitorRect);
+
+    std::wstring devName = g_virtualMonitorDev;
+    if (!devName.empty()) {
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_POSITION;
+        dm.dmPelsWidth = 0;
+        dm.dmPelsHeight = 0;
+        LONG res = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
+                                            CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+        if (res != DISP_CHANGE_SUCCESSFUL) {
+            ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr, CDS_NORESET, nullptr);
+        }
+        ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+        Log("Unloaded Virtual Screen %ls", devName.c_str());
+    }
+
+    g_virtualScreenLoaded = false;
+    g_virtualMonitorDev.clear();
+    g_virtualMonitorRect = {};
+}
+
+void StopAllProjectionAndUnloadVirtual() {
+    ReleaseProjectedAppResources();
+    g_controlVirtualScreen = false;
+    g_selectedScreenLabel.clear();
+    g_projectedMonitorRect = {};
+    g_projectionMode = ProjectionMode::None;
+    UnloadVirtualScreen();
+    ClearSharedDesktopToBlack();
+    SyncPointerAndLook();
+}
+
+bool CaptureProjectedMonitorFrame() {
+    const LONG wLong = g_projectedMonitorRect.right - g_projectedMonitorRect.left;
+    const LONG hLong = g_projectedMonitorRect.bottom - g_projectedMonitorRect.top;
+    if (wLong <= 32 || hLong <= 32) return false;
+    const uint32_t w = static_cast<uint32_t>(wLong);
+    const uint32_t h = static_cast<uint32_t>(hLong);
+
+    if (!EnsureFullWinBuffers(w, h)) return false;
+    HDC hdcScreen = GetDC(nullptr);
+    if (!hdcScreen) return false;
+    BOOL ok = BitBlt(g_fullWinMemDc, 0, 0, static_cast<int>(w), static_cast<int>(h),
+                     hdcScreen, g_projectedMonitorRect.left, g_projectedMonitorRect.top,
+                     SRCCOPY | CAPTUREBLT);
+    ReleaseDC(nullptr, hdcScreen);
+    if (!ok || !g_fullWinBitmapBits) return false;
+
+    // Draw real OS cursor onto Virtual/Projected monitor frame if currently inside it
+    CURSORINFO ci{ sizeof(ci) };
+    if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) != 0 && ci.hCursor) {
+        if (ci.ptScreenPos.x >= g_projectedMonitorRect.left &&
+            ci.ptScreenPos.x < g_projectedMonitorRect.right &&
+            ci.ptScreenPos.y >= g_projectedMonitorRect.top &&
+            ci.ptScreenPos.y < g_projectedMonitorRect.bottom) {
+            ICONINFO ii{};
+            int hotX = 0, hotY = 0;
+            if (GetIconInfo(ci.hCursor, &ii)) {
+                hotX = static_cast<int>(ii.xHotspot);
+                hotY = static_cast<int>(ii.yHotspot);
+                if (ii.hbmMask) DeleteObject(ii.hbmMask);
+                if (ii.hbmColor) DeleteObject(ii.hbmColor);
+            }
+            DrawIconEx(g_fullWinMemDc,
+                       ci.ptScreenPos.x - g_projectedMonitorRect.left - hotX,
+                       ci.ptScreenPos.y - g_projectedMonitorRect.top - hotY,
+                       ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+        }
+    }
+
+    if (!EnsureProjectedTexture(w, h)) return false;
+
+    const size_t pixelCount = static_cast<size_t>(w) * h;
+    if (g_croppedBits.size() < pixelCount) {
+        g_croppedBits.resize(pixelCount);
+    }
+    const uint32_t* srcBits = static_cast<const uint32_t*>(g_fullWinBitmapBits);
+    for (size_t i = 0; i < pixelCount; ++i) {
+        g_croppedBits[i] = srcBits[i] | 0xFF000000u;
+    }
+
+    D3D11_BOX box{ 0, 0, 0, w, h, 1 };
+    g_context->UpdateSubresource(g_projectedTexture, 0, &box, g_croppedBits.data(), w * 4, 0);
+    g_projectedWidth = w;
+    g_projectedHeight = h;
+
+    RenderVideoToSharedDesktop();
+    return true;
+}
+
+void ShowProjectScreenMenu(HWND parentHwnd, float clickX, float clickY) {
+    auto screens = EnumerateSelectableScreens();
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, L"--- Choose Screen to Project Privately ---");
+    AppendMenuW(hMenu, MF_STRING, 2000, L"Virtual Screen (1920x1080)  [Isolated Private Display]");
+    if (!screens.empty()) {
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        for (size_t i = 0; i < screens.size() && i < 16; ++i) {
+            AppendMenuW(hMenu, MF_STRING, static_cast<UINT_PTR>(2001 + i), screens[i].label.c_str());
+        }
+    }
+
+    POINT pt{ static_cast<LONG>(clickX), static_cast<LONG>(clickY) };
+    ClientToScreen(parentHwnd, &pt);
+    g_inProjectAppMenu = true;
+    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, parentHwnd, nullptr);
+    g_inProjectAppMenu = false;
+    DestroyMenu(hMenu);
+
+    if (!CanProjectInCurrentRoom()) return;
+
+    if (cmd == 2000) {
+        if (LoadVirtualScreen()) {
+            ReleaseProjectedAppResources();
+            g_projectionMode = ProjectionMode::VirtualScreen;
+            g_lookYaw = 0.0f;
+            g_lookPitch = 0.0f;
+            SyncPointerAndLook();
+            CaptureProjectedMonitorFrame();
+            Log("Projection started on Virtual Screen (1920x1080)");
+        } else {
+            MessageBoxW(parentHwnd,
+                        L"Could not activate the Virtual Display Driver (1920x1080).\n"
+                        L"Please check Virtual Display Driver installation.",
+                        L"Virtual Screen Unavailable", MB_OK | MB_ICONWARNING);
+        }
+    } else if (cmd >= 2001 && static_cast<size_t>(cmd - 2001) < screens.size()) {
+        UnloadVirtualScreen();
+        ReleaseProjectedAppResources();
+        const auto& sel = screens[cmd - 2001];
+        g_projectedMonitorRect = sel.rect;
+        g_selectedScreenLabel = sel.label;
+        g_projectionMode = ProjectionMode::Screen;
+        g_lookYaw = 0.0f;
+        g_lookPitch = 0.0f;
+        SyncPointerAndLook();
+        CaptureProjectedMonitorFrame();
+        Log("Projection started on screen: %ls", sel.label.c_str());
+    }
+}
+
+void ShowMoveToVirtualMenu(HWND parentHwnd, float clickX, float clickY) {
+    if (!g_virtualScreenLoaded) return;
+    auto windows = EnumerateSelectableAppWindows();
+    HMENU hMenu = CreatePopupMenu();
+    if (windows.empty()) {
+        AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, L"No open app windows found");
+    } else {
+        AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, L"--- Move App Window to Virtual Screen ---");
+        for (size_t i = 0; i < windows.size() && i < 25; ++i) {
+            std::wstring itemText = windows[i].title;
+            if (itemText.length() > 45) {
+                itemText = itemText.substr(0, 42) + L"...";
+            }
+            AppendMenuW(hMenu, MF_STRING, static_cast<UINT_PTR>(3000 + i), itemText.c_str());
+        }
+    }
+    POINT pt{ static_cast<LONG>(clickX), static_cast<LONG>(clickY) };
+    ClientToScreen(parentHwnd, &pt);
+    g_inProjectAppMenu = true;
+    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, parentHwnd, nullptr);
+    g_inProjectAppMenu = false;
+    DestroyMenu(hMenu);
+
+    if (cmd >= 3000 && static_cast<size_t>(cmd - 3000) < windows.size()) {
+        HWND target = windows[cmd - 3000].hwnd;
+        if (target && IsWindow(target)) {
+            if (IsIconic(target)) {
+                ShowWindow(target, SW_RESTORE);
+            }
+            const LONG vw = g_virtualMonitorRect.right - g_virtualMonitorRect.left;
+            const LONG vh = g_virtualMonitorRect.bottom - g_virtualMonitorRect.top;
+            SetWindowPos(target, HWND_TOP, g_virtualMonitorRect.left, g_virtualMonitorRect.top,
+                         vw, vh, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+            ShowWindow(target, SW_MAXIMIZE);
+            g_lastVirtualTargetHwnd = target;
+            g_controlVirtualScreen = true;
+            SetForegroundWindow(parentHwnd);
+            Log("Moved '%ls' onto Virtual Screen (%ldx%ld)", windows[cmd - 3000].title.c_str(), vw, vh);
+        }
+    }
+}
+
+bool MapViewerPointToVirtualScreen(float mx, float my, LONG* outX, LONG* outY) {
+    if (g_projectionMode != ProjectionMode::VirtualScreen || !g_virtualScreenLoaded) return false;
+    const LONG vwMon = g_projectedMonitorRect.right - g_projectedMonitorRect.left;
+    const LONG vhMon = g_projectedMonitorRect.bottom - g_projectedMonitorRect.top;
+    if (vwMon <= 0 || vhMon <= 0) return false;
+
+    const float vx0 = g_activeViewport.Width > 0.0f ? g_activeViewport.TopLeftX : 0.0f;
+    const float vy0 = g_activeViewport.Height > 0.0f ? g_activeViewport.TopLeftY : 0.0f;
+    const float vw = g_activeViewport.Width;
+    const float vh = g_activeViewport.Height;
+    if (vw <= 1.0f || vh <= 1.0f) return false;
+
+    const float u = (mx - vx0) / vw;
+    const float v = (my - vy0) / vh;
+    if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) return false;
+
+    LONG tx = g_projectedMonitorRect.left + static_cast<LONG>(std::lround(u * static_cast<float>(vwMon - 1)));
+    LONG ty = g_projectedMonitorRect.top + static_cast<LONG>(std::lround(v * static_cast<float>(vhMon - 1)));
+    tx = std::clamp(tx, g_projectedMonitorRect.left, g_projectedMonitorRect.right - 1);
+    ty = std::clamp(ty, g_projectedMonitorRect.top, g_projectedMonitorRect.bottom - 1);
+    if (outX) *outX = tx;
+    if (outY) *outY = ty;
+    return true;
+}
+
+HWND FindTargetWindowOnVirtualScreen(LONG tx, LONG ty) {
+    HWND ptWnd = WindowFromPoint({ tx, ty });
+    if (ptWnd && IsWindow(ptWnd)) {
+        HWND root = GetAncestor(ptWnd, GA_ROOT);
+        if (root && root != g_hwnd) return root;
+    }
+    if (g_lastVirtualTargetHwnd && IsWindow(g_lastVirtualTargetHwnd)) {
+        return g_lastVirtualTargetHwnd;
+    }
+    return nullptr;
+}
+
+void ForwardVirtualMouseHover(LONG tx, LONG ty) {
+    HWND child = WindowFromPoint({ tx, ty });
+    if (!child || !IsWindow(child)) return;
+    HWND root = GetAncestor(child, GA_ROOT);
+    if (root == g_hwnd) return;
+    POINT pt{ tx, ty };
+    ScreenToClient(child, &pt);
+    PostMessageW(child, WM_MOUSEMOVE, 0, MAKELPARAM(pt.x, pt.y));
+}
+
+void ForwardVirtualMouseInput(DWORD mouseFlags, LONG tx, LONG ty, DWORD mouseData = 0, bool restoreCursor = true) {
+    POINT savedPt{};
+    if (restoreCursor) GetCursorPos(&savedPt);
+
+    const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int vw = (std::max)(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
+    const int vh = (std::max)(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
+
+    LONG absX = static_cast<LONG>(((static_cast<double>(tx - vx) + 0.5) * 65535.0) / vw);
+    LONG absY = static_cast<LONG>(((static_cast<double>(ty - vy) + 0.5) * 65535.0) / vh);
+    absX = std::clamp<LONG>(absX, 0, 65535);
+    absY = std::clamp<LONG>(absY, 0, 65535);
+
+    INPUT inp[2]{};
+    inp[0].type = INPUT_MOUSE;
+    inp[0].mi.dx = absX;
+    inp[0].mi.dy = absY;
+    inp[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+
+    int count = 1;
+    if (mouseFlags != 0) {
+        inp[1].type = INPUT_MOUSE;
+        inp[1].mi.dx = absX;
+        inp[1].mi.dy = absY;
+        inp[1].mi.mouseData = mouseData;
+        inp[1].mi.dwFlags = mouseFlags | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        count = 2;
+    }
+    SendInput(static_cast<UINT>(count), inp, sizeof(INPUT));
+
+    HWND hitRoot = FindTargetWindowOnVirtualScreen(tx, ty);
+    if (hitRoot) g_lastVirtualTargetHwnd = hitRoot;
+
+    if (restoreCursor) {
+        SetCursorPos(savedPt.x, savedPt.y);
+    }
+}
+
+void ForwardVirtualKey(UINT msg, WPARAM wParam, LPARAM lParam) {
+    LONG cx = (g_projectedMonitorRect.left + g_projectedMonitorRect.right) / 2;
+    LONG cy = (g_projectedMonitorRect.top + g_projectedMonitorRect.bottom) / 2;
+    HWND target = FindTargetWindowOnVirtualScreen(cx, cy);
+    if (target && IsWindow(target)) {
+        PostMessageW(target, msg, wParam, lParam);
+    }
+}
+
 void ToggleFullscreen(HWND hwnd) {
     const DWORD style = GetWindowLong(hwnd, GWL_STYLE);
     if (!g_isFullscreen) {
@@ -1612,7 +2256,7 @@ void DrawPointerReticle(float x, float y, bool active) {
 
 void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
     const float panelWidth = 310.0f;
-    const float panelHeight = 602.0f;
+    const float panelHeight = 640.0f;
     const float left = windowWidth - panelWidth - 20.0f;
     const float top = 20.0f;
     const float right = left + panelWidth;
@@ -1703,57 +2347,79 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
         s2Text, static_cast<UINT32>(wcslen(s2Text)),
         g_textFormatSection, &s2Rect, g_brushTextSection);
 
-    g_btnProjectScreenRect = D2D1::RectF(left + 18.0f, top + 208.0f, left + 148.0f, top + 240.0f);
-    g_btnProjectAppRect = D2D1::RectF(left + 156.0f, top + 208.0f, right - 18.0f, top + 240.0f);
+    const bool isVirtualProj = (g_projectionMode == ProjectionMode::VirtualScreen);
     const bool isScreenProj = (g_projectionMode == ProjectionMode::Screen);
     const bool isAppProj = (g_projectionMode == ProjectionMode::App);
     const bool canProject = CanProjectInCurrentRoom();
 
-    if (isAppProj) {
+    g_btnControlVirtualRect = D2D1::RectF(left + 18.0f, top + 246.0f, right - 18.0f, top + 278.0f);
+
+    if (isVirtualProj) {
+        g_btnProjectScreenRect = D2D1::RectF(left + 18.0f, top + 208.0f, left + 148.0f, top + 240.0f);
+        g_btnProjectAppRect = D2D1::RectF(left + 156.0f, top + 208.0f, right - 18.0f, top + 240.0f);
+        DrawButton(g_btnProjectScreenRect, L"Move App to Virtual", false, g_btnProjectScreenHovered);
+        DrawButton(g_btnProjectAppRect, L"Stop Projecting", true, g_btnProjectAppHovered);
+        const wchar_t* ctrlText = g_controlVirtualScreen
+            ? L"Control Virtual Screen: ON  (Esc = VR)"
+            : L"Control Virtual Screen: OFF  (VR Laser)";
+        DrawButton(g_btnControlVirtualRect, ctrlText, g_controlVirtualScreen, g_btnControlVirtualHovered);
+    } else if (isScreenProj) {
+        g_btnProjectScreenRect = D2D1::RectF(left + 18.0f, top + 208.0f, left + 148.0f, top + 240.0f);
+        g_btnProjectAppRect = D2D1::RectF(left + 156.0f, top + 208.0f, right - 18.0f, top + 240.0f);
+        DrawButton(g_btnProjectScreenRect, L"Switch Screen \x25BC", false, g_btnProjectScreenHovered);
+        DrawButton(g_btnProjectAppRect, L"Stop Projecting", true, g_btnProjectAppHovered);
+        const wchar_t* label = !g_selectedScreenLabel.empty() ? g_selectedScreenLabel.c_str() : L"Real Screen Active";
+        DrawButton(g_btnControlVirtualRect, label, false, false, 6.0f, true);
+    } else if (isAppProj) {
+        g_btnProjectScreenRect = D2D1::RectF(left + 18.0f, top + 208.0f, left + 148.0f, top + 240.0f);
+        g_btnProjectAppRect = D2D1::RectF(left + 156.0f, top + 208.0f, right - 18.0f, top + 240.0f);
         const wchar_t* winToggleText = g_appIsHidden ? L"Show App Window" : L"Hide App Window";
         DrawButton(g_btnProjectScreenRect, winToggleText, false, g_btnProjectScreenHovered);
         DrawButton(g_btnProjectAppRect, L"Stop Projecting", true, g_btnProjectAppHovered);
-    } else if (isScreenProj) {
-        DrawButton(g_btnProjectScreenRect, L"Stop Projecting", true, g_btnProjectScreenHovered);
-        DrawButton(g_btnProjectAppRect, L"Project Video App", false, false, 6.0f, true);
+        DrawButton(g_btnControlVirtualRect, L"Isolated App Window Active", false, false, 6.0f, true);
     } else {
-        DrawButton(g_btnProjectScreenRect, L"Project Screen", false, canProject && g_btnProjectScreenHovered, 6.0f, !canProject);
-        DrawButton(g_btnProjectAppRect, L"Project Video App", false, canProject && g_btnProjectAppHovered, 6.0f, !canProject);
+        g_btnProjectScreenRect = D2D1::RectF(left + 18.0f, top + 208.0f, right - 18.0f, top + 240.0f);
+        g_btnProjectAppRect = D2D1::RectF();
+        DrawButton(g_btnProjectScreenRect, L"Project Screen \x25BC  (Virtual / Real)", false, canProject && g_btnProjectScreenHovered, 6.0f, !canProject);
+        const wchar_t* hintText = canProject
+            ? L"Pick Virtual Screen (1920x1080) or Monitor"
+            : L"Enter Your Own Room to Project";
+        DrawButton(g_btnControlVirtualRect, hintText, false, false, 6.0f, true);
     }
 
     // SECTION 3: WINDOW & DISPLAY
     const wchar_t* s3Text = L"WINDOW & DISPLAY";
-    D2D1_RECT_F s3Rect = D2D1::RectF(left + 18.0f, top + 250.0f, right - 18.0f, top + 266.0f);
+    D2D1_RECT_F s3Rect = D2D1::RectF(left + 18.0f, top + 288.0f, right - 18.0f, top + 304.0f);
     g_d2dRenderTarget->DrawText(
         s3Text, static_cast<UINT32>(wcslen(s3Text)),
         g_textFormatSection, &s3Rect, g_brushTextSection);
 
-    g_btnFullscreenRect = D2D1::RectF(left + 18.0f, top + 268.0f, right - 18.0f, top + 300.0f);
+    g_btnFullscreenRect = D2D1::RectF(left + 18.0f, top + 306.0f, right - 18.0f, top + 338.0f);
     DrawButton(g_btnFullscreenRect, g_isFullscreen ? L"Exit Fullscreen (Windowed)" : L"Toggle Fullscreen", g_isFullscreen, g_btnFsHovered);
 
     // SECTION 4: QUICK ACTIONS
     const wchar_t* s4Text = L"QUICK ACTIONS";
-    D2D1_RECT_F s4Rect = D2D1::RectF(left + 18.0f, top + 310.0f, right - 18.0f, top + 326.0f);
+    D2D1_RECT_F s4Rect = D2D1::RectF(left + 18.0f, top + 348.0f, right - 18.0f, top + 364.0f);
     g_d2dRenderTarget->DrawText(
         s4Text, static_cast<UINT32>(wcslen(s4Text)),
         g_textFormatSection, &s4Rect, g_brushTextSection);
 
-    g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 328.0f, left + 148.0f, top + 360.0f);
-    g_btnMenuRect = D2D1::RectF(left + 156.0f, top + 328.0f, right - 18.0f, top + 360.0f);
+    g_btnRecenterRect = D2D1::RectF(left + 18.0f, top + 366.0f, left + 148.0f, top + 398.0f);
+    g_btnMenuRect = D2D1::RectF(left + 156.0f, top + 366.0f, right - 18.0f, top + 398.0f);
     DrawButton(g_btnRecenterRect, L"Recenter", false, g_btnRecenterHovered);
     DrawButton(g_btnMenuRect, L"BigScreen Menu", false, g_btnMenuHovered);
 
-    g_btnSystemRect = D2D1::RectF(left + 18.0f, top + 366.0f, right - 18.0f, top + 396.0f);
+    g_btnSystemRect = D2D1::RectF(left + 18.0f, top + 404.0f, right - 18.0f, top + 434.0f);
     DrawButton(g_btnSystemRect, L"SteamVR Dashboard", false, g_btnSystemHovered);
 
     // SECTION 5: VR SYSTEM POWER
     const wchar_t* s5Text = L"VR SYSTEM POWER";
-    D2D1_RECT_F s5Rect = D2D1::RectF(left + 18.0f, top + 406.0f, right - 18.0f, top + 422.0f);
+    D2D1_RECT_F s5Rect = D2D1::RectF(left + 18.0f, top + 444.0f, right - 18.0f, top + 460.0f);
     g_d2dRenderTarget->DrawText(
         s5Text, static_cast<UINT32>(wcslen(s5Text)),
         g_textFormatSection, &s5Rect, g_brushTextSection);
 
-    g_btnPowerRect = D2D1::RectF(left + 18.0f, top + 424.0f, right - 18.0f, top + 456.0f);
+    g_btnPowerRect = D2D1::RectF(left + 18.0f, top + 462.0f, right - 18.0f, top + 494.0f);
     const wchar_t* pwrBtnText = nullptr;
     if (g_btnPowerHovered) {
         pwrBtnText = vrRunning ? L"\x23FB Turn off BigScreen" : L"\x23FB Turn on BigScreen";
@@ -1764,12 +2430,12 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
     // SECTION 6: MEDIA FEED STATUS
     const wchar_t* s6Text = L"MEDIA FEED STATUS";
-    D2D1_RECT_F s6Rect = D2D1::RectF(left + 18.0f, top + 466.0f, right - 18.0f, top + 482.0f);
+    D2D1_RECT_F s6Rect = D2D1::RectF(left + 18.0f, top + 504.0f, right - 18.0f, top + 520.0f);
     g_d2dRenderTarget->DrawText(
         s6Text, static_cast<UINT32>(wcslen(s6Text)),
         g_textFormatSection, &s6Rect, g_brushTextSection);
 
-    D2D1_RECT_F feedBoxRect = D2D1::RectF(left + 18.0f, top + 484.0f, right - 18.0f, top + 514.0f);
+    D2D1_RECT_F feedBoxRect = D2D1::RectF(left + 18.0f, top + 522.0f, right - 18.0f, top + 552.0f);
     D2D1_ROUNDED_RECT feedBox = D2D1::RoundedRect(feedBoxRect, 6.0f, 6.0f);
     g_d2dRenderTarget->FillRoundedRectangle(&feedBox, g_brushBtnInactiveBg);
     
@@ -1782,13 +2448,16 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
     g_d2dRenderTarget->FillEllipse(&feedDot, isIndicatorActive ? g_brushFeedActive : g_brushFeedStandby);
 
     wchar_t feedText[80]{};
-    if (g_projectionMode == ProjectionMode::App && !g_projectedTitle.empty()) {
+    if (g_projectionMode == ProjectionMode::VirtualScreen) {
+        swprintf_s(feedText, L"PROJECTING  |  Virtual Screen (1920x1080)");
+    } else if (g_projectionMode == ProjectionMode::Screen) {
+        swprintf_s(feedText, L"PROJECTING  |  %ls",
+                   !g_selectedScreenLabel.empty() ? g_selectedScreenLabel.c_str() : L"Desktop Screen Active");
+    } else if (g_projectionMode == ProjectionMode::App && !g_projectedTitle.empty()) {
         std::wstring shortTitle = g_projectedTitle;
         if (shortTitle.length() > 20) shortTitle = shortTitle.substr(0, 17) + L"...";
         const wchar_t* hiddenState = g_appIsHidden ? L"(Cloaked)" : L"(Visible)";
         swprintf_s(feedText, L"PROJECTING  |  %ls %ls", shortTitle.c_str(), hiddenState);
-    } else if (g_projectionMode == ProjectionMode::Screen) {
-        swprintf_s(feedText, L"PROJECTING  |  Desktop Screen Active");
     } else if (g_peerStreamActive || (g_roomHookReady && !g_inOwnRoom)) {
         if (g_feedActive || g_peerStreamActive) {
             swprintf_s(feedText, L"OTHER ROOM STREAM  |  Own Room Only to Project");
@@ -1809,19 +2478,23 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
 
     // Footer separator line
     g_d2dRenderTarget->DrawLine(
-        D2D1::Point2F(left + 18.0f, top + 524.0f),
-        D2D1::Point2F(right - 18.0f, top + 524.0f),
+        D2D1::Point2F(left + 18.0f, top + 562.0f),
+        D2D1::Point2F(right - 18.0f, top + 562.0f),
         g_brushSeparator, 1.0f);
 
     // Footer Hotkey Hints
-    const wchar_t* footerText = L"Mouse Move: Laser Pointer  |  Left-Click: Trigger\nRight-Click Drag: Look  |  Esc: SteamVR Dashboard\nR: Recenter  |  Alt+Drag or Header: Move Window";
-    D2D1_RECT_F footerRect = D2D1::RectF(left + 8.0f, top + 528.0f, right - 8.0f, bottom - 6.0f);
+    const wchar_t* footerText = (g_projectionMode == ProjectionMode::VirtualScreen && g_controlVirtualScreen)
+        ? L"Virtual Screen Control Active: Click/Scroll/Type here\nEsc: Switch to VR Laser  |  Right-Click: App Context\nStop Projecting or Close Viewer unloads Virtual Screen"
+        : L"Mouse Move: Laser Pointer  |  Left-Click: Trigger\nRight-Click Drag: Look  |  Esc: SteamVR Dashboard\nR: Recenter  |  Alt+Drag or Header: Move Window";
+    D2D1_RECT_F footerRect = D2D1::RectF(left + 8.0f, top + 566.0f, right - 8.0f, bottom - 6.0f);
     g_d2dRenderTarget->DrawText(
         footerText, static_cast<UINT32>(wcslen(footerText)),
         g_textFormatFooter, &footerRect, g_brushTextMuted);
 }
 
 void ReleaseAll() {
+    StopAllProjectionAndUnloadVirtual();
+    ReleaseFallbackGpuResources();
     ReleaseProjectedAppResources();
     ReleaseSharedDesktopTexture();
     ReleaseSharedResources();
@@ -1848,6 +2521,11 @@ void ReleaseAll() {
     if (g_controlMapping) CloseHandle(g_controlMapping);
     g_controlState = nullptr;
     g_controlMapping = nullptr;
+
+    if (g_fallbackView) UnmapViewOfFile(g_fallbackView);
+    if (g_fallbackMapping) CloseHandle(g_fallbackMapping);
+    g_fallbackView = nullptr;
+    g_fallbackMapping = nullptr;
 
     if (g_projectedVideoState) UnmapViewOfFile(g_projectedVideoState);
     if (g_projectedVideoMapping) CloseHandle(g_projectedVideoMapping);
@@ -2057,19 +2735,43 @@ bool OpenLiveMapping() {
 bool SelectGraphicsAdapter() {
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+    IDXGIAdapter1* primaryAdapter = nullptr;
+    DXGI_ADAPTER_DESC1 primaryDesc{};
+    IDXGIAdapter1* nvidiaFallback = nullptr;
+    DXGI_ADAPTER_DESC1 nvidiaDesc{};
     IDXGIAdapter1* fallback = nullptr;
     DXGI_ADAPTER_DESC1 fallbackDesc{};
+
     for (UINT index = 0; ; ++index) {
         IDXGIAdapter1* candidate = nullptr;
         if (factory->EnumAdapters1(index, &candidate) == DXGI_ERROR_NOT_FOUND) break;
         DXGI_ADAPTER_DESC1 desc{};
         if (candidate && SUCCEEDED(candidate->GetDesc1(&desc)) &&
             (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
-            if (desc.VendorId == 0x10DE) {
-                g_adapter = candidate;
-                Log("Viewer adapter (NVIDIA): %ls", desc.Description);
-                break;
-            } else if (!fallback) {
+            bool ownsPrimaryMonitor = false;
+            for (UINT outIdx = 0; ; ++outIdx) {
+                IDXGIOutput* output = nullptr;
+                if (candidate->EnumOutputs(outIdx, &output) == DXGI_ERROR_NOT_FOUND) break;
+                DXGI_OUTPUT_DESC outDesc{};
+                if (output && SUCCEEDED(output->GetDesc(&outDesc))) {
+                    if (outDesc.DesktopCoordinates.left == 0 && outDesc.DesktopCoordinates.top == 0) {
+                        ownsPrimaryMonitor = true;
+                    }
+                }
+                if (output) output->Release();
+                if (ownsPrimaryMonitor) break;
+            }
+            if (ownsPrimaryMonitor && !primaryAdapter) {
+                primaryAdapter = candidate;
+                primaryDesc = desc;
+                continue;
+            }
+            if (desc.VendorId == 0x10DE && !nvidiaFallback) {
+                nvidiaFallback = candidate;
+                nvidiaDesc = desc;
+                continue;
+            }
+            if (!fallback) {
                 fallback = candidate;
                 fallbackDesc = desc;
                 continue;
@@ -2077,13 +2779,23 @@ bool SelectGraphicsAdapter() {
         }
         if (candidate) candidate->Release();
     }
-    if (!g_adapter && fallback) {
+
+    if (primaryAdapter) {
+        g_adapter = primaryAdapter;
+        Log("Viewer adapter (Primary Display): %ls", primaryDesc.Description);
+        primaryAdapter = nullptr;
+    } else if (nvidiaFallback) {
+        g_adapter = nvidiaFallback;
+        Log("Viewer adapter (NVIDIA): %ls", nvidiaDesc.Description);
+        nvidiaFallback = nullptr;
+    } else if (fallback) {
         g_adapter = fallback;
         Log("Viewer adapter (Hardware): %ls", fallbackDesc.Description);
         fallback = nullptr;
-    } else if (fallback) {
-        fallback->Release();
     }
+    if (primaryAdapter) primaryAdapter->Release();
+    if (nvidiaFallback) nvidiaFallback->Release();
+    if (fallback) fallback->Release();
     factory->Release();
     return g_adapter != nullptr;
 }
@@ -2324,7 +3036,9 @@ void Render(ID3D11ShaderResourceView* source, bool flipVertical) {
     const float windowAspect = windowWidth / windowHeight;
 
     ID3D11ShaderResourceView* activeSource = source;
-    if (g_projectionMode == ProjectionMode::App) {
+    if (g_projectionMode == ProjectionMode::VirtualScreen ||
+        g_projectionMode == ProjectionMode::Screen ||
+        g_projectionMode == ProjectionMode::App) {
         if (g_movieOnly) {
             activeSource = g_projectedSrv;
         } else {
@@ -2418,13 +3132,16 @@ void UpdateMetrics() {
         fps, static_cast<unsigned long long>(g_lastSequence), static_cast<unsigned long long>(g_copies),
         static_cast<unsigned long long>(g_dropped), static_cast<unsigned long long>(g_opens));
     if (g_projectedVideoState) {
-        Log("Route/Aspect diag: hookLocal=%u desktops=%u openHr=0x%08X deskFmt=%u vidFmt=%u copied=%u aspMask=0x%X aspApplied=%u",
+        Log("Route/Cap/Aspect diag: hookLocal=%u desktops=%u openHr=0x%08X deskFmt=%u vidFmt=%u copied=%u capHooks=%u capOpenHr=0x%08X capCopied=%u aspMask=0x%X aspApplied=%u",
             g_projectedVideoState->diagHookLocal,
             g_projectedVideoState->diagDesktopCount,
             static_cast<unsigned>(g_projectedVideoState->diagOpenHr),
             g_projectedVideoState->diagDeskFmt,
             g_projectedVideoState->diagVidFmt,
             g_projectedVideoState->diagCopiedCount,
+            g_projectedVideoState->diagCapHookCalls,
+            static_cast<unsigned>(g_projectedVideoState->diagCapOpenHr),
+            g_projectedVideoState->diagCapCopiedCount,
             g_projectedVideoState->diagAspectMask,
             g_projectedVideoState->diagAspectAppliedCount);
     }
@@ -2432,6 +3149,9 @@ void UpdateMetrics() {
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    static bool s_virtualLeftDown = false;
+    static bool s_virtualRightDown = false;
+
     if (message == WM_KEYDOWN) {
         if (wParam == VK_TAB || wParam == 'M' || wParam == VK_F1) {
             g_showRemote = !g_showRemote;
@@ -2439,6 +3159,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         if (wParam == VK_F11) {
             ToggleFullscreen(hwnd);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            if (g_projectionMode == ProjectionMode::VirtualScreen && g_controlVirtualScreen) {
+                g_controlVirtualScreen = false;
+                s_virtualLeftDown = false;
+                s_virtualRightDown = false;
+                SyncPointerAndLook();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            EnsureControlMapping();
+            if (g_controlState) {
+                bigscreen_controller_control_ipc::PulseSystemClick(g_controlState);
+            }
+            return 0;
+        }
+        if (g_projectionMode == ProjectionMode::VirtualScreen && g_controlVirtualScreen) {
+            ForwardVirtualKey(message, wParam, lParam);
             return 0;
         }
         if (wParam == VK_LEFT) {
@@ -2465,21 +3204,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             ResetLook();
             return 0;
         }
-        if (wParam == VK_ESCAPE) {
-            EnsureControlMapping();
-            if (g_controlState) {
-                bigscreen_controller_control_ipc::PulseSystemClick(g_controlState);
-            }
-            return 0;
-        }
     }
 
-    if (message == WM_KEYUP) {
-        if (wParam == VK_ESCAPE) {
+    if (message == WM_KEYUP || message == WM_CHAR) {
+        if (message == WM_KEYUP && wParam == VK_ESCAPE) {
             EnsureControlMapping();
             if (g_controlState) {
                 bigscreen_controller_control_ipc::ClearSystemClick(g_controlState);
             }
+            return 0;
+        }
+        if (g_projectionMode == ProjectionMode::VirtualScreen && g_controlVirtualScreen &&
+            wParam != VK_TAB && wParam != VK_F1 && wParam != VK_F11 && wParam != VK_ESCAPE) {
+            ForwardVirtualKey(message, wParam, lParam);
             return 0;
         }
     }
@@ -2525,6 +3262,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_btnAspectHovered = inRect(mx, my, g_btnAspectRect);
             g_btnProjectScreenHovered = inRect(mx, my, g_btnProjectScreenRect);
             g_btnProjectAppHovered = inRect(mx, my, g_btnProjectAppRect);
+            g_btnControlVirtualHovered = inRect(mx, my, g_btnControlVirtualRect);
             g_btnFsHovered = inRect(mx, my, g_btnFullscreenRect);
             g_btnRecenterHovered = inRect(mx, my, g_btnRecenterRect);
             g_btnMenuHovered = inRect(mx, my, g_btnMenuRect);
@@ -2534,7 +3272,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_pointerActive = false;
             g_pillHovered = true;
         } else {
-            // Interactive VR Client Area: mouse controls pointer aim & look
+            // Interactive VR Client Area: mouse controls pointer aim & look (or Virtual Screen when active)
             g_pillHovered = false;
             g_closeHovered = false;
             g_powerHeaderHovered = false;
@@ -2544,6 +3282,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_btnAspectHovered = false;
             g_btnProjectScreenHovered = false;
             g_btnProjectAppHovered = false;
+            g_btnControlVirtualHovered = false;
             g_btnFsHovered = false;
             g_btnRecenterHovered = false;
             g_btnMenuHovered = false;
@@ -2553,6 +3292,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_pointerActive = true;
             g_cursorX = mx;
             g_cursorY = my;
+
+            if (g_projectionMode == ProjectionMode::VirtualScreen && g_controlVirtualScreen) {
+                LONG tx = 0, ty = 0;
+                if (MapViewerPointToVirtualScreen(mx, my, &tx, &ty)) {
+                    ForwardVirtualMouseHover(tx, ty);
+                    if (s_virtualLeftDown) {
+                        ForwardVirtualMouseInput(0, tx, ty, 0, true);
+                    }
+                }
+                return 0;
+            }
 
             if (g_movieOnly) {
                 // Movie Only mode locks look squarely at the screen
@@ -2598,6 +3348,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         g_btnAspectHovered = false;
         g_btnProjectScreenHovered = false;
         g_btnProjectAppHovered = false;
+        g_btnControlVirtualHovered = false;
         g_btnFsHovered = false;
         g_btnRecenterHovered = false;
         g_btnMenuHovered = false;
@@ -2624,6 +3375,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             if (inRect(mx, my, g_powerHeaderRect) || inRect(mx, my, g_btnPowerRect)) {
                 if (IsVrRunning()) {
+                    StopAllProjectionAndUnloadVirtual();
                     TerminateVrProcesses();
                 } else {
                     LaunchVrProcesses();
@@ -2639,7 +3391,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_lookYaw = 0.0f;
                 g_lookPitch = 0.0f;
                 SyncPointerAndLook();
-                if (g_projectionMode == ProjectionMode::App && g_projectedWidth && g_projectedHeight) {
+                if (g_projectionMode != ProjectionMode::None && g_projectedWidth && g_projectedHeight) {
                     AdjustWindowToVideoAspect(hwnd, ComputeMovieDisplayAspect(g_projectedWidth, g_projectedHeight));
                 }
                 return 0;
@@ -2654,7 +3406,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                         g_stereoMode = StereoSplitMode::Normal2D;
                     }
                     g_lastAdjustedAspect = 0.0f;
-                    if (g_projectionMode == ProjectionMode::App && g_projectedWidth && g_projectedHeight) {
+                    if (g_projectionMode != ProjectionMode::None && g_projectedWidth && g_projectedHeight) {
                         AdjustWindowToVideoAspect(hwnd, ComputeMovieDisplayAspect(g_projectedWidth, g_projectedHeight));
                     }
                 }
@@ -2665,8 +3417,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 g_lastAdjustedAspect = 0.0f;
                 SyncAspectOverrideToIpc();
                 if (g_movieOnly) {
-                    uint32_t w = (g_projectionMode == ProjectionMode::App) ? g_projectedWidth : g_peerWidth;
-                    uint32_t h = (g_projectionMode == ProjectionMode::App) ? g_projectedHeight : g_peerHeight;
+                    uint32_t w = (g_projectionMode != ProjectionMode::None) ? g_projectedWidth : g_peerWidth;
+                    uint32_t h = (g_projectionMode != ProjectionMode::None) ? g_projectedHeight : g_peerHeight;
                     if (w == 0 || h == 0) { w = g_sourceWidth; h = g_sourceHeight; }
                     AdjustWindowToVideoAspect(hwnd, ComputeMovieDisplayAspect(w, h));
                 }
@@ -2674,24 +3426,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 return 0;
             }
             if (inRect(mx, my, g_btnProjectScreenRect)) {
-                if (g_projectionMode == ProjectionMode::App) {
-                    ToggleAppWindowVisibility();
+                if (g_projectionMode == ProjectionMode::VirtualScreen) {
+                    ShowMoveToVirtualMenu(hwnd, g_btnProjectScreenRect.left, g_btnProjectScreenRect.bottom);
                 } else if (g_projectionMode == ProjectionMode::Screen) {
-                    g_projectionMode = ProjectionMode::None;
-                    ClearSharedDesktopToBlack();
+                    ShowProjectScreenMenu(hwnd, g_btnProjectScreenRect.left, g_btnProjectScreenRect.bottom);
+                } else if (g_projectionMode == ProjectionMode::App) {
+                    ToggleAppWindowVisibility();
                 } else if (CanProjectInCurrentRoom()) {
-                    g_projectionMode = ProjectionMode::Screen;
-                    PublishProjectedVideoState(false, false, 0, 0, 0, 0, 0);
-                    ToggleDesktopMenu();
+                    ShowProjectScreenMenu(hwnd, g_btnProjectScreenRect.left, g_btnProjectScreenRect.bottom);
                 }
                 return 0;
             }
-            if (inRect(mx, my, g_btnProjectAppRect)) {
-                if (g_projectionMode == ProjectionMode::App) {
-                    ReleaseProjectedAppResources();
-                    g_projectionMode = ProjectionMode::None;
-                } else if (g_projectionMode == ProjectionMode::None && CanProjectInCurrentRoom()) {
-                    ShowProjectAppMenu(hwnd, g_btnProjectAppRect.left, g_btnProjectAppRect.bottom);
+            if (g_btnProjectAppRect.right > g_btnProjectAppRect.left && inRect(mx, my, g_btnProjectAppRect)) {
+                if (g_projectionMode != ProjectionMode::None) {
+                    StopAllProjectionAndUnloadVirtual();
+                }
+                return 0;
+            }
+            if (inRect(mx, my, g_btnControlVirtualRect)) {
+                if (g_projectionMode == ProjectionMode::VirtualScreen) {
+                    g_controlVirtualScreen = !g_controlVirtualScreen;
+                    InvalidateRect(hwnd, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -2715,9 +3470,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 }
                 return 0;
             }
+            if (inRect(mx, my, g_remoteRect)) {
+                return 0;
+            }
         } else {
             if (inRect(mx, my, g_pillRect)) {
                 g_showRemote = true;
+                return 0;
+            }
+        }
+
+        if (g_projectionMode == ProjectionMode::VirtualScreen && g_controlVirtualScreen) {
+            LONG tx = 0, ty = 0;
+            if (MapViewerPointToVirtualScreen(mx, my, &tx, &ty)) {
+                s_virtualLeftDown = true;
+                SetCapture(hwnd);
+                ForwardVirtualMouseInput(MOUSEEVENTF_LEFTDOWN, tx, ty, 0, true);
                 return 0;
             }
         }
@@ -2729,6 +3497,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
     }
 
     if (message == WM_LBUTTONUP) {
+        if (s_virtualLeftDown) {
+            s_virtualLeftDown = false;
+            ReleaseCapture();
+            const float mx = static_cast<float>(GET_X_LPARAM(lParam));
+            const float my = static_cast<float>(GET_Y_LPARAM(lParam));
+            LONG tx = 0, ty = 0;
+            if (MapViewerPointToVirtualScreen(mx, my, &tx, &ty)) {
+                ForwardVirtualMouseInput(MOUSEEVENTF_LEFTUP, tx, ty, 0, true);
+            }
+            return 0;
+        }
         if (g_btnSystemDown) {
             g_btnSystemDown = false;
             EnsureControlMapping();
@@ -2751,6 +3530,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         };
 
         if (!g_showRemote || !inRect(mx, my, g_remoteRect)) {
+            if (g_projectionMode == ProjectionMode::VirtualScreen && g_controlVirtualScreen) {
+                LONG tx = 0, ty = 0;
+                if (MapViewerPointToVirtualScreen(mx, my, &tx, &ty)) {
+                    s_virtualRightDown = true;
+                    SetCapture(hwnd);
+                    ForwardVirtualMouseInput(MOUSEEVENTF_RIGHTDOWN, tx, ty, 0, true);
+                    return 0;
+                }
+            }
             g_isRightDragging = true;
             g_lastRightPt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             SetCapture(hwnd);
@@ -2759,6 +3547,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
     }
 
     if (message == WM_RBUTTONUP) {
+        if (s_virtualRightDown) {
+            s_virtualRightDown = false;
+            ReleaseCapture();
+            const float mx = static_cast<float>(GET_X_LPARAM(lParam));
+            const float my = static_cast<float>(GET_Y_LPARAM(lParam));
+            LONG tx = 0, ty = 0;
+            if (MapViewerPointToVirtualScreen(mx, my, &tx, &ty)) {
+                ForwardVirtualMouseInput(MOUSEEVENTF_RIGHTUP, tx, ty, 0, true);
+            }
+            return 0;
+        }
         if (g_isRightDragging) {
             g_isRightDragging = false;
             ReleaseCapture();
@@ -2775,8 +3574,37 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         };
 
         if (!g_showRemote || !inRect(mx, my, g_remoteRect)) {
+            if (g_projectionMode == ProjectionMode::VirtualScreen && g_controlVirtualScreen) {
+                LONG tx = 0, ty = 0;
+                if (MapViewerPointToVirtualScreen(mx, my, &tx, &ty)) {
+                    s_virtualLeftDown = true;
+                    SetCapture(hwnd);
+                    ForwardVirtualMouseInput(MOUSEEVENTF_LEFTDOWN, tx, ty, 0, true);
+                }
+                return 0;
+            }
             ToggleFullscreen(hwnd);
             return 0;
+        }
+    }
+
+    if (message == WM_MOUSEWHEEL) {
+        if (g_projectionMode == ProjectionMode::VirtualScreen && g_controlVirtualScreen) {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ScreenToClient(hwnd, &pt);
+            const float mx = static_cast<float>(pt.x);
+            const float my = static_cast<float>(pt.y);
+            auto inRect = [](float x, float y, const D2D1_RECT_F& r) {
+                return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+            };
+            if (!g_showRemote || !inRect(mx, my, g_remoteRect)) {
+                LONG tx = 0, ty = 0;
+                if (MapViewerPointToVirtualScreen(mx, my, &tx, &ty)) {
+                    ForwardVirtualMouseInput(MOUSEEVENTF_WHEEL, tx, ty,
+                                             static_cast<DWORD>(GET_WHEEL_DELTA_WPARAM(wParam)), true);
+                    return 0;
+                }
+            }
         }
     }
 
@@ -2812,7 +3640,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         return HTCLIENT;
     }
 
+    if (message == WM_CLOSE) {
+        StopAllProjectionAndUnloadVirtual();
+        DestroyWindow(hwnd);
+        return 0;
+    }
+
     if (message == WM_DESTROY) {
+        UnloadVirtualScreen();
         PostQuitMessage(0);
         return 0;
     }
@@ -2853,13 +3688,8 @@ void UpdateRoomOwnershipState() {
     // Projection is only valid in the user's own room; automatically stop if user leaves or disconnects
     if (g_projectionMode != ProjectionMode::None &&
         (!g_bigscreenRunning || !g_roomHookReady || (!g_inOwnRoom && !g_isLoadingRoom))) {
-        if (g_projectionMode == ProjectionMode::App) {
-            ReleaseProjectedAppResources();
-        } else {
-            ClearSharedDesktopToBlack();
-        }
-        g_projectionMode = ProjectionMode::None;
-        Log("Stopped projection because user is no longer in their own room");
+        StopAllProjectionAndUnloadVirtual();
+        Log("Stopped projection and unloaded Virtual Screen because user is no longer in their own room");
     }
 }
 
@@ -2897,7 +3727,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         ID3D11ShaderResourceView* source = nullptr;
         bool flipVertical = false;
 
-        if (g_projectionMode == ProjectionMode::App) {
+        if (g_projectionMode == ProjectionMode::VirtualScreen ||
+            g_projectionMode == ProjectionMode::Screen) {
+            CaptureProjectedMonitorFrame();
+            source = g_movieOnly ? g_projectedSrv : (g_localSrv ? g_localSrv : g_projectedSrv);
+            flipVertical = false;
+            if (!g_movieOnly) {
+                OpenLiveMapping();
+                if (g_state) CopyNewFrame();
+            }
+        } else if (g_projectionMode == ProjectionMode::App) {
             if (!g_projectedHwnd || !IsWindow(g_projectedHwnd)) {
                 ReleaseProjectedAppResources();
                 g_projectionMode = ProjectionMode::None;
@@ -2912,7 +3751,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 }
             }
         } else {
-            // Normal Bigscreen Room / Movie theater viewing (or Project Screen mode)
+            // Normal Bigscreen Room / Movie theater viewing
             OpenLiveMapping();
             if (g_state) CopyNewFrame();
             if (g_movieOnly && CopyPeerMovieFrame()) {
@@ -2925,12 +3764,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
         char title[256]{};
         const char* mode = g_movieOnly ? " | Mode: MOVIE ONLY" : " | Mode: THEATER MODE";
-        if (g_projectionMode == ProjectionMode::App && !g_projectedTitle.empty()) {
+        if (g_projectionMode == ProjectionMode::VirtualScreen) {
+            sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING VIRTUAL SCREEN (1920x1080)%s | Tab/M=REMOTE", mode);
+        } else if (g_projectionMode == ProjectionMode::Screen) {
+            sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING SCREEN%s | Tab/M=REMOTE", mode);
+        } else if (g_projectionMode == ProjectionMode::App && !g_projectedTitle.empty()) {
             std::wstring shortTitle = g_projectedTitle;
             if (shortTitle.length() > 28) shortTitle = shortTitle.substr(0, 25) + L"...";
             sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING APP: %ls%s | Tab/M=REMOTE", shortTitle.c_str(), mode);
-        } else if (g_projectionMode == ProjectionMode::Screen) {
-            sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING SCREEN%s | Tab/M=REMOTE", mode);
         } else if (g_feedActive) {
             sprintf_s(title, "Bigscreen Desktop Live Viewer | ROOM MOVIE ACTIVE%s | Tab/M=REMOTE", mode);
         } else {
