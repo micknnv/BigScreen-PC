@@ -1279,7 +1279,7 @@ ID3D11Texture2D* ResolveDesktopTexture2D(void* nativePtr) {
     return tex;
 }
 
-void RouteDesktopTexture() {
+void RouteDesktopTextureImpl() {
     const auto* pState = GetProjectedVideoState();
     if (!pState) {
         return;
@@ -1329,7 +1329,14 @@ void RouteDesktopTexture() {
     pDesktopTex->Release();
 }
 
-void __stdcall OnDesktopCaptureHook(void* captureThis) {
+void RouteDesktopTexture() {
+    __try {
+        RouteDesktopTextureImpl();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+void OnDesktopCaptureHookImpl(void* captureThis) {
     if (!captureThis) return;
     const auto* pState = GetProjectedVideoState();
     if (!pState) return;
@@ -1353,6 +1360,13 @@ void __stdcall OnDesktopCaptureHook(void* captureThis) {
 
     RouteIntoTargetTexture(g_capBlitCtx, pDevice, pContext, pCaptureTex, state, false);
     pCaptureTex->Release();
+}
+
+void __stdcall OnDesktopCaptureHook(void* captureThis) {
+    __try {
+        OnDesktopCaptureHookImpl(captureThis);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
 }
 
 // --------------------------------------------------------------------------

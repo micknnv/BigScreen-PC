@@ -1805,17 +1805,116 @@ bool EnsureVirtualDisplayDriverInstalled(HWND parentHwnd) {
         }
     }
 
-    // Give UMDF IddCx driver host up to ~4s to initialize the virtual monitor
+    // Give UMDF IddCx driver host up to ~4s to initialize the virtual monitor and settle PnP
     for (int i = 0; i < 20; ++i) {
         SendMttVddCommand(L"SETDISPLAYCOUNT 1");
-        Sleep(200);
+        Sleep(250);
         if (!FindVirtualDisplayDeviceName(&attached).empty()) {
+            Sleep(400); // allow Windows Display Manager to finish initial PnP topology
             return true;
         }
     }
 
     g_lastVddError = L"Virtual Display Driver was installed, but Windows has not exposed the virtual display output yet.";
     return false;
+}
+
+bool IsVirtualDisplayClonedOrPrimary(const std::wstring& devName, bool* outIsPrimary = nullptr, bool* outIsCloned = nullptr) {
+    if (outIsPrimary) *outIsPrimary = false;
+    if (outIsCloned) *outIsCloned = false;
+    if (devName.empty()) return false;
+
+    bool isPrimary = false;
+    bool isCloned = false;
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        if (_wcsicmp(dd.DeviceName, devName.c_str()) == 0) {
+            isPrimary = (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+            int monCount = 0;
+            for (DWORD m = 0;; ++m) {
+                DISPLAY_DEVICEW mon{};
+                mon.cb = sizeof(mon);
+                if (!EnumDisplayDevicesW(dd.DeviceName, m, &mon, EDD_GET_DEVICE_INTERFACE_NAME)) break;
+                ++monCount;
+                if (!ContainsCaseInsensitive(mon.DeviceID, L"MTT")) {
+                    isCloned = true;
+                }
+            }
+            if (monCount > 1) {
+                isCloned = true;
+            }
+            break;
+        }
+        dd = {};
+        dd.cb = sizeof(dd);
+    }
+    if (outIsPrimary) *outIsPrimary = isPrimary;
+    if (outIsCloned) *outIsCloned = isCloned;
+    return isPrimary || isCloned;
+}
+
+void EnsureExtendedTopologyForVirtualScreen(std::wstring& devName, bool& alreadyAttached) {
+    bool isPrimary = false;
+    bool isCloned = false;
+    IsVirtualDisplayClonedOrPrimary(devName, &isPrimary, &isCloned);
+
+    // Also check CCD directly for any active clone group involving our target
+    bool hasClonePath = false;
+    UINT32 np = 0, nm = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) == ERROR_SUCCESS && np > 0) {
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(np);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(nm);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), nullptr) == ERROR_SUCCESS) {
+            for (UINT32 a = 0; a < np; ++a) {
+                for (UINT32 b = a + 1; b < np; ++b) {
+                    if (paths[a].sourceInfo.adapterId.LowPart == paths[b].sourceInfo.adapterId.LowPart &&
+                        paths[a].sourceInfo.adapterId.HighPart == paths[b].sourceInfo.adapterId.HighPart &&
+                        paths[a].sourceInfo.id == paths[b].sourceInfo.id) {
+                        hasClonePath = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (isCloned || hasClonePath) {
+        Log("Detected Duplicate/Clone display state on Virtual Screen (%ls); switching to Extended mode...",
+            devName.c_str());
+        SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND | SDC_SAVE_TO_DATABASE);
+        Sleep(600);
+        std::wstring refreshed = FindVirtualDisplayDeviceName(&alreadyAttached);
+        if (!refreshed.empty()) devName = refreshed;
+    }
+
+    // Ensure a real physical display remains Primary at (0,0) if Windows promoted Virtual Screen to Primary
+    IsVirtualDisplayClonedOrPrimary(devName, &isPrimary, &isCloned);
+    if (isPrimary) {
+        DISPLAY_DEVICEW dd{};
+        dd.cb = sizeof(dd);
+        for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+            const bool attached = (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+            if (attached && !IsVirtualDisplayDevice(dd) && wcsstr(dd.DeviceString, L"Immersed") == nullptr) {
+                DEVMODEW physDm{};
+                physDm.dmSize = sizeof(physDm);
+                if (EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &physDm, 0) &&
+                    physDm.dmPelsWidth > 0 && physDm.dmPelsHeight > 0) {
+                    physDm.dmFields |= DM_POSITION;
+                    physDm.dmPosition.x = 0;
+                    physDm.dmPosition.y = 0;
+                    ChangeDisplaySettingsExW(dd.DeviceName, &physDm, nullptr,
+                                             CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+                    ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+                    Sleep(300);
+                    break;
+                }
+            }
+            dd = {};
+            dd.cb = sizeof(dd);
+        }
+        std::wstring refreshed = FindVirtualDisplayDeviceName(&alreadyAttached);
+        if (!refreshed.empty()) devName = refreshed;
+    }
 }
 
 bool ActivateDisplayPathViaCcd(const std::wstring& devName) {
@@ -1929,14 +2028,17 @@ bool LoadVirtualScreen() {
         return false;
     }
 
-    // Place Virtual Screen cleanly to the right of all currently attached real displays
+    EnsureExtendedTopologyForVirtualScreen(devName, alreadyAttached);
+
+    // Place Virtual Screen cleanly to the right of all currently attached real displays (never at (0,0) Primary)
     LONG posX = 0;
     bool anyAttached = false;
     DISPLAY_DEVICEW dd{};
     dd.cb = sizeof(dd);
     for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
         if ((dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0 &&
-            _wcsicmp(dd.DeviceName, devName.c_str()) != 0) {
+            _wcsicmp(dd.DeviceName, devName.c_str()) != 0 &&
+            !IsVirtualDisplayDevice(dd)) {
             DEVMODEW dm{};
             dm.dmSize = sizeof(dm);
             if (EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0)) {
@@ -1950,7 +2052,7 @@ bool LoadVirtualScreen() {
         dd = {};
         dd.cb = sizeof(dd);
     }
-    if (!anyAttached) posX = (std::max)(1920, GetSystemMetrics(SM_CXSCREEN));
+    if (!anyAttached || posX <= 0) posX = (std::max)(1920, GetSystemMetrics(SM_CXSCREEN));
 
     // Find an exact enumerated 1920x1080 mode supported by the driver (prefer 60Hz)
     DEVMODEW exactMode{};
@@ -1972,12 +2074,15 @@ bool LoadVirtualScreen() {
     curDm.dmSize = sizeof(curDm);
     bool isNowAttached = alreadyAttached &&
                          EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &curDm, 0) &&
-                         curDm.dmPelsWidth == 1920 && curDm.dmPelsHeight == 1080;
+                         curDm.dmPelsWidth == 1920 && curDm.dmPelsHeight == 1080 &&
+                         (curDm.dmPosition.x != 0 || curDm.dmPosition.y != 0);
 
     if (!isNowAttached) {
         if (!alreadyAttached) {
-            // Try CCD first if display was detached/inactive
             ActivateDisplayPathViaCcd(devName);
+            Sleep(300);
+            std::wstring refreshed = FindVirtualDisplayDeviceName(&alreadyAttached);
+            if (!refreshed.empty()) devName = refreshed;
         }
 
         DEVMODEW targetDm{};
@@ -2010,6 +2115,17 @@ bool LoadVirtualScreen() {
                 ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
             }
         }
+        Sleep(250);
+    }
+
+    // Re-query GDI device name in case Windows renumbered DISPLAY18 -> DISPLAY19 during attach
+    std::wstring finalDev = FindVirtualDisplayDeviceName(&alreadyAttached);
+    if (!finalDev.empty()) devName = finalDev;
+
+    // Final duplicate check so we never expose a cloned primary display as Virtual Screen
+    bool finalPrimary = false, finalCloned = false;
+    if (IsVirtualDisplayClonedOrPrimary(devName, &finalPrimary, &finalCloned)) {
+        EnsureExtendedTopologyForVirtualScreen(devName, alreadyAttached);
     }
 
     DEVMODEW verifyDm{};
@@ -2091,17 +2207,26 @@ void UnloadVirtualScreen() {
 
     std::wstring devName = g_virtualMonitorDev;
     if (!devName.empty()) {
-        DEVMODEW dm{};
-        dm.dmSize = sizeof(dm);
-        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_POSITION;
-        dm.dmPelsWidth = 0;
-        dm.dmPelsHeight = 0;
-        LONG res = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
-                                            CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
-        if (res != DISP_CHANGE_SUCCESSFUL) {
-            ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr, CDS_NORESET, nullptr);
+        bool attached = false;
+        if (IsVirtualDisplayClonedOrPrimary(devName)) {
+            SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND | SDC_SAVE_TO_DATABASE);
+            Sleep(400);
+            std::wstring refreshed = FindVirtualDisplayDeviceName(&attached);
+            if (!refreshed.empty()) devName = refreshed;
         }
-        ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+        if (!IsVirtualDisplayClonedOrPrimary(devName)) {
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_POSITION;
+            dm.dmPelsWidth = 0;
+            dm.dmPelsHeight = 0;
+            LONG res = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
+                                                CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+            if (res != DISP_CHANGE_SUCCESSFUL) {
+                ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr, CDS_NORESET, nullptr);
+            }
+            ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+        }
         SendMttVddCommand(L"SETDISPLAYCOUNT 0");
         Log("Unloaded Virtual Screen %ls", devName.c_str());
     }
