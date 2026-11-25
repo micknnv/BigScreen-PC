@@ -122,18 +122,16 @@ bool g_isFullscreen = false;
 bool g_alwaysOnTop = false;
 WINDOWPLACEMENT g_wpPrev = { sizeof(g_wpPrev) };
 
-// Room Ownership & Pending Own-Room Projection State
+// Room Ownership State
 bool g_bigscreenRunning = false;
 bool g_roomHookReady = false;
 bool g_inOwnRoom = false;
 bool g_isLoadingRoom = false;
-uint64_t g_requestOwnRoomSeq = 0;
+bool g_peerStreamActive = false;
 
-enum class PendingProjection { None, Screen, App };
-PendingProjection g_pendingProj = PendingProjection::None;
-HWND g_pendingAppHwnd = nullptr;
-std::wstring g_pendingAppTitle;
-ULONGLONG g_pendingProjMs = 0;
+bool CanProjectInCurrentRoom() {
+    return g_bigscreenRunning && g_roomHookReady && g_inOwnRoom && !g_isLoadingRoom && !g_peerStreamActive;
+}
 
 // Mouse Pointer & Look State
 bool g_pointerActive = false;
@@ -291,21 +289,9 @@ void PublishProjectedVideoState(bool active, bool privacyMode, uint64_t sharedHa
         g_projectedVideoState->height = height;
         g_projectedVideoState->videoWidth = vidW;
         g_projectedVideoState->videoHeight = vidH;
-        g_projectedVideoState->requestOwnRoomSeq = g_requestOwnRoomSeq;
         ++g_projectedVideoState->frameSequence;
         g_projectedVideoState->lastFrameMicros = GetTickCount64() * 1000ull;
     }
-}
-
-void RequestMoveToOwnRoom() {
-    ++g_requestOwnRoomSeq;
-    EnsureProjectedVideoIpc();
-    if (g_projectedVideoState) {
-        g_projectedVideoState->magic = bigscreen_projected_video::kMagic;
-        g_projectedVideoState->version = bigscreen_projected_video::kVersion;
-        g_projectedVideoState->requestOwnRoomSeq = g_requestOwnRoomSeq;
-    }
-    Log("Requested Bigscreen leave current room -> move to own projection room (seq=%llu)", g_requestOwnRoomSeq);
 }
 
 float ComputeMovieDisplayAspect(uint32_t rawW, uint32_t rawH) {
@@ -1238,17 +1224,8 @@ void ShowProjectAppMenu(HWND parentHwnd, float clickX, float clickY) {
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, parentHwnd, nullptr);
     DestroyMenu(hMenu);
     if (cmd >= 1000 && static_cast<size_t>(cmd - 1000) < windows.size()) {
-        HWND chosenHwnd = windows[cmd - 1000].hwnd;
-        std::wstring chosenTitle = windows[cmd - 1000].title;
-        if (g_inOwnRoom) {
-            g_pendingProj = PendingProjection::None;
-            StartProjectingAppWindow(chosenHwnd, chosenTitle);
-        } else if (g_bigscreenRunning && g_roomHookReady) {
-            g_pendingAppHwnd = chosenHwnd;
-            g_pendingAppTitle = chosenTitle;
-            g_pendingProj = PendingProjection::App;
-            g_pendingProjMs = GetTickCount64();
-            RequestMoveToOwnRoom();
+        if (CanProjectInCurrentRoom()) {
+            StartProjectingAppWindow(windows[cmd - 1000].hwnd, windows[cmd - 1000].title);
         }
     }
 }
@@ -1614,21 +1591,18 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
     g_btnProjectAppRect = D2D1::RectF(left + 156.0f, top + 166.0f, right - 18.0f, top + 198.0f);
     const bool isScreenProj = (g_projectionMode == ProjectionMode::Screen);
     const bool isAppProj = (g_projectionMode == ProjectionMode::App);
-    const bool projReady = g_bigscreenRunning && g_roomHookReady;
+    const bool canProject = CanProjectInCurrentRoom();
 
     if (isAppProj) {
         const wchar_t* winToggleText = g_appIsHidden ? L"Show App Window" : L"Hide App Window";
         DrawButton(g_btnProjectScreenRect, winToggleText, false, g_btnProjectScreenHovered);
         DrawButton(g_btnProjectAppRect, L"Stop Projecting", true, g_btnProjectAppHovered);
-    } else if (g_pendingProj == PendingProjection::Screen) {
-        DrawButton(g_btnProjectScreenRect, L"Moving to Room...", true, g_btnProjectScreenHovered);
-        DrawButton(g_btnProjectAppRect, L"Project Video App", false, g_btnProjectAppHovered, 6.0f, true);
-    } else if (g_pendingProj == PendingProjection::App) {
-        DrawButton(g_btnProjectScreenRect, L"Project Screen", false, g_btnProjectScreenHovered, 6.0f, true);
-        DrawButton(g_btnProjectAppRect, L"Moving to Room...", true, g_btnProjectAppHovered);
+    } else if (isScreenProj) {
+        DrawButton(g_btnProjectScreenRect, L"Stop Projecting", true, g_btnProjectScreenHovered);
+        DrawButton(g_btnProjectAppRect, L"Project Video App", false, false, 6.0f, true);
     } else {
-        DrawButton(g_btnProjectScreenRect, isScreenProj ? L"Stop Projecting" : L"Project Screen", isScreenProj, g_btnProjectScreenHovered, 6.0f, !projReady);
-        DrawButton(g_btnProjectAppRect, L"Project Video App", false, g_btnProjectAppHovered, 6.0f, !projReady);
+        DrawButton(g_btnProjectScreenRect, L"Project Screen", false, canProject && g_btnProjectScreenHovered, 6.0f, !canProject);
+        DrawButton(g_btnProjectAppRect, L"Project Video App", false, canProject && g_btnProjectAppHovered, 6.0f, !canProject);
     }
 
     // SECTION 3: WINDOW & DISPLAY
@@ -1692,20 +1666,18 @@ void DrawRemotePanel(float windowWidth, float /*windowHeight*/) {
     g_d2dRenderTarget->FillEllipse(&feedDot, isIndicatorActive ? g_brushFeedActive : g_brushFeedStandby);
 
     wchar_t feedText[80]{};
-    if (g_pendingProj != PendingProjection::None) {
-        swprintf_s(feedText, L"MOVING TO OWN ROOM  |  Please Wait...");
-    } else if (g_projectionMode == ProjectionMode::App && !g_projectedTitle.empty()) {
+    if (g_projectionMode == ProjectionMode::App && !g_projectedTitle.empty()) {
         std::wstring shortTitle = g_projectedTitle;
         if (shortTitle.length() > 20) shortTitle = shortTitle.substr(0, 17) + L"...";
         const wchar_t* hiddenState = g_appIsHidden ? L"(Cloaked)" : L"(Visible)";
         swprintf_s(feedText, L"PROJECTING  |  %ls %ls", shortTitle.c_str(), hiddenState);
     } else if (g_projectionMode == ProjectionMode::Screen) {
         swprintf_s(feedText, L"PROJECTING  |  Desktop Screen Active");
-    } else if (g_roomHookReady && !g_inOwnRoom) {
-        if (g_feedActive) {
-            swprintf_s(feedText, L"OTHER ROOM FEED  |  Project Moves to Own Room");
+    } else if (g_peerStreamActive || (g_roomHookReady && !g_inOwnRoom)) {
+        if (g_feedActive || g_peerStreamActive) {
+            swprintf_s(feedText, L"OTHER ROOM STREAM  |  Own Room Only to Project");
         } else {
-            swprintf_s(feedText, L"OTHER ROOM  |  Project Moves to Own Room");
+            swprintf_s(feedText, L"OTHER ROOM  |  Enter Own Room to Project");
         }
     } else {
         if (g_feedActive) {
@@ -2546,36 +2518,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 return 0;
             }
             if (inRect(mx, my, g_btnProjectScreenRect)) {
-                const bool projReady = g_bigscreenRunning && g_roomHookReady;
                 if (g_projectionMode == ProjectionMode::App) {
                     ToggleAppWindowVisibility();
                 } else if (g_projectionMode == ProjectionMode::Screen) {
                     g_projectionMode = ProjectionMode::None;
                     ClearSharedDesktopToBlack();
-                } else if (g_pendingProj == PendingProjection::Screen) {
-                    g_pendingProj = PendingProjection::None;
-                } else if (projReady) {
-                    if (g_inOwnRoom) {
-                        g_projectionMode = ProjectionMode::Screen;
-                        PublishProjectedVideoState(false, false, 0, 0, 0, 0, 0);
-                        ToggleDesktopMenu();
-                    } else {
-                        g_pendingProj = PendingProjection::Screen;
-                        g_pendingProjMs = GetTickCount64();
-                        RequestMoveToOwnRoom();
-                    }
+                } else if (CanProjectInCurrentRoom()) {
+                    g_projectionMode = ProjectionMode::Screen;
+                    PublishProjectedVideoState(false, false, 0, 0, 0, 0, 0);
+                    ToggleDesktopMenu();
                 }
                 return 0;
             }
             if (inRect(mx, my, g_btnProjectAppRect)) {
-                const bool projReady = g_bigscreenRunning && g_roomHookReady;
                 if (g_projectionMode == ProjectionMode::App) {
                     ReleaseProjectedAppResources();
                     g_projectionMode = ProjectionMode::None;
-                } else if (g_pendingProj == PendingProjection::App) {
-                    g_pendingProj = PendingProjection::None;
-                    g_pendingAppHwnd = nullptr;
-                } else if (projReady) {
+                } else if (g_projectionMode == ProjectionMode::None && CanProjectInCurrentRoom()) {
                     ShowProjectAppMenu(hwnd, g_btnProjectAppRect.left, g_btnProjectAppRect.bottom);
                 }
                 return 0;
@@ -2717,46 +2676,27 @@ void UpdateRoomOwnershipState() {
 
     OpenPeerMovieMapping();
     if (g_bigscreenRunning && g_peerState &&
-        g_peerState->magic == bigscreen_peer_movie::kMagic &&
-        g_peerState->roomHookReady != 0) {
-        g_roomHookReady = true;
-        g_inOwnRoom = (g_peerState->inOwnRoom != 0);
-        g_isLoadingRoom = (g_peerState->isLoadingRoom != 0);
+        g_peerState->magic == bigscreen_peer_movie::kMagic) {
+        g_peerStreamActive = (g_peerState->active != 0);
+        if (g_peerState->roomHookReady != 0) {
+            g_roomHookReady = true;
+            g_inOwnRoom = (g_peerState->inOwnRoom != 0);
+            g_isLoadingRoom = (g_peerState->isLoadingRoom != 0);
+        } else {
+            g_roomHookReady = false;
+            g_inOwnRoom = false;
+            g_isLoadingRoom = false;
+        }
     } else {
+        g_peerStreamActive = false;
         g_roomHookReady = false;
         g_inOwnRoom = false;
         g_isLoadingRoom = false;
     }
 
-    if (g_pendingProj != PendingProjection::None) {
-        if (!g_bigscreenRunning || !g_roomHookReady) {
-            g_pendingProj = PendingProjection::None;
-            g_pendingAppHwnd = nullptr;
-        } else if (g_inOwnRoom && !g_isLoadingRoom) {
-            if (g_pendingProj == PendingProjection::Screen) {
-                g_projectionMode = ProjectionMode::Screen;
-                PublishProjectedVideoState(false, false, 0, 0, 0, 0, 0);
-                ToggleDesktopMenu();
-                Log("Entered own projection room; Screen projection activated");
-            } else if (g_pendingProj == PendingProjection::App) {
-                if (g_pendingAppHwnd && IsWindow(g_pendingAppHwnd)) {
-                    StartProjectingAppWindow(g_pendingAppHwnd, g_pendingAppTitle);
-                }
-            }
-            g_pendingProj = PendingProjection::None;
-            g_pendingAppHwnd = nullptr;
-            g_pendingAppTitle.clear();
-        } else if (now - g_pendingProjMs > 15000) {
-            g_pendingProj = PendingProjection::None;
-            g_pendingAppHwnd = nullptr;
-            g_pendingAppTitle.clear();
-            Log("Timed out waiting for Bigscreen room transition to own room");
-        }
-    }
-
     // Projection is only valid in the user's own room; automatically stop if user leaves or disconnects
     if (g_projectionMode != ProjectionMode::None &&
-        (!g_bigscreenRunning || !g_roomHookReady || (!g_inOwnRoom && !g_isLoadingRoom && g_pendingProj == PendingProjection::None))) {
+        (!g_bigscreenRunning || !g_roomHookReady || (!g_inOwnRoom && !g_isLoadingRoom))) {
         if (g_projectionMode == ProjectionMode::App) {
             ReleaseProjectedAppResources();
         } else {
