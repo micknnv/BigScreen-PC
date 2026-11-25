@@ -5757,18 +5757,35 @@ void UpdateRoomOwnershipState() {
     s_prevRoomHookReady = g_roomHookReady;
     s_prevBigscreenRunning = g_bigscreenRunning;
 
+    if (roomChanged) {
+        const bool wasMovieMode = g_movieOnly;
+        const bool hadCustomAspect = (g_aspectPresetIndex != 0);
+        if (wasMovieMode) {
+            g_movieOnly = false;
+            g_heldDpadBtn = RemoteBtn::None;
+            g_lastAdjustedAspect = 0.0f;
+            ResetLook();
+            Log("Switched from Movie Mode to Theater Mode after room change");
+        }
+        if (hadCustomAspect) {
+            g_aspectPresetIndex = 0; // Reset Aspect Ratio to Auto when changing rooms
+            g_lastAdjustedAspect = 0.0f;
+            SyncAspectOverrideToIpc();
+            Log("Reset Aspect Ratio override to Auto after room change");
+        }
+        if (wasMovieMode && hadCustomAspect) {
+            SetLcdNotification(L"THEATER MODE", L"ASPECT: AUTO", 2500);
+        } else if (wasMovieMode) {
+            SetLcdNotification(L"THEATER MODE", L"NEW ROOM", 2500);
+        } else if (hadCustomAspect) {
+            SetLcdNotification(L"ASPECT RATIO", L"RESET TO AUTO", 2500);
+        }
+    }
+
     if (g_waitingOwnRoomForProject && CanProjectInCurrentRoom()) {
         g_waitingOwnRoomForProject = false;
         SetLcdNotification(L"OWN ROOM READY", L"CLICK PROJECT", 3500);
         Log("Own room finished loading; Project Screen is ready to select monitor or Virtual Screen");
-    }
-
-    if (roomChanged && g_aspectPresetIndex != 0) {
-        g_aspectPresetIndex = 0; // Reset Aspect Ratio to Auto when changing rooms
-        g_lastAdjustedAspect = 0.0f;
-        SyncAspectOverrideToIpc();
-        SetLcdNotification(L"ASPECT RATIO", L"RESET TO AUTO", 2500);
-        Log("Reset Aspect Ratio override to Auto after room change");
     }
 
     // Projection is only valid in the user's own room; automatically stop if user leaves or disconnects
