@@ -80,10 +80,16 @@ bool g_mediaHookInstalled = false;
 // Local Desktop Projection Routing State
 // --------------------------------------------------------------------------
 HANDLE g_projectedMapping = nullptr;
-const bigscreen_projected_video::State* g_projectedState = nullptr;
+bigscreen_projected_video::State* g_projectedState = nullptr;
 ID3D11Texture2D* g_sharedVideoTex = nullptr;
+ID3D11ShaderResourceView* g_sharedVideoSrv = nullptr;
 uint64_t g_currentSharedHandle = 0;
 ID3D11Texture2D* g_blackTex = nullptr;
+ID3D11Texture2D* g_routeStagingTex = nullptr;
+ID3D11RenderTargetView* g_routeStagingRtv = nullptr;
+uint32_t g_routeStagingW = 0;
+uint32_t g_routeStagingH = 0;
+DXGI_FORMAT g_routeStagingFmt = DXGI_FORMAT_UNKNOWN;
 
 // --------------------------------------------------------------------------
 // Remote Peer / MediaPlayer Movie Isolation State
@@ -114,6 +120,10 @@ typedef size_t (*pfnIl2CppFieldGetOffset)(const void* field);
 typedef void (*pfnIl2CppFieldGetValue)(void* obj, const void* field, void* value);
 typedef void (*pfnIl2CppFieldSetValue)(void* obj, const void* field, void* value);
 typedef uint32_t (*pfnIl2CppArrayLength)(const void* arr);
+typedef const void* (*pfnIl2CppClassGetMethods)(const void* klass, void** iter);
+typedef const char* (*pfnIl2CppMethodGetName)(const void* method);
+typedef uint32_t (*pfnIl2CppMethodGetParamCount)(const void* method);
+typedef uint8_t (*pfnIl2CppMethodIsGeneric)(const void* method);
 
 typedef void (*pfnMonitorSetAspectRatio)(void* self, int width, int height, const void* mi);
 typedef void (*pfnMirroredUpdateAspect)(void* self, void* texture, const void* mi);
@@ -129,13 +139,16 @@ pfnIl2CppArrayLength g_fnArrayLength = nullptr;
 void* g_klassMonitorSizer = nullptr;
 void* g_klassMirroredScreen = nullptr;
 void* g_klassBigMediaRenderer = nullptr;
+void* g_klassPresentationSectionSizer = nullptr;
 void* g_typeMonitorSizer = nullptr;
 void* g_typeMirroredScreen = nullptr;
 void* g_typeBigMediaRenderer = nullptr;
+void* g_typePresentationSectionSizer = nullptr;
 
 const void* g_mFindObjectsOfType = nullptr;
 const void* g_mCompGetTransform = nullptr;
 const void* g_mGoGetTransform = nullptr;
+const void* g_mTransformGetLocalScale = nullptr;
 const void* g_mTransformSetLocalScale = nullptr;
 const void* g_mMonitorSetAspect = nullptr;
 const void* g_mMirroredUpdateAspect = nullptr;
@@ -166,8 +179,13 @@ struct TrackedMirrored {
     void* ptr;
     void* lastTex;
 };
+struct TrackedPresSizer {
+    void* ptr;
+    Il2CppVec3 origScale;
+};
 TrackedSizer g_trackedSizers[32]{};
 TrackedMirrored g_trackedMirrored[32]{};
+TrackedPresSizer g_trackedPresSizers[32]{};
 bool g_inAspectReapply = false;
 float g_lastAppliedAspectOverride = -1.0f;
 ULONGLONG g_lastAspectSweepMs = 0;
@@ -798,17 +816,132 @@ void EnsureBlackTexture(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC& deskD
 const bigscreen_projected_video::State* GetProjectedVideoState() {
     if (!g_projectedState) {
         if (!g_projectedMapping) {
-            g_projectedMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, bigscreen_projected_video::kMappingName);
+            g_projectedMapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, bigscreen_projected_video::kMappingName);
+            if (!g_projectedMapping) {
+                g_projectedMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, bigscreen_projected_video::kMappingName);
+            }
         }
         if (g_projectedMapping) {
-            g_projectedState = static_cast<const bigscreen_projected_video::State*>(
-                MapViewOfFile(g_projectedMapping, FILE_MAP_READ, 0, 0, sizeof(bigscreen_projected_video::State)));
+            g_projectedState = static_cast<bigscreen_projected_video::State*>(
+                MapViewOfFile(g_projectedMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(bigscreen_projected_video::State)));
+            if (!g_projectedState) {
+                g_projectedState = static_cast<bigscreen_projected_video::State*>(
+                    MapViewOfFile(g_projectedMapping, FILE_MAP_READ, 0, 0, sizeof(bigscreen_projected_video::State)));
+            }
         }
     }
     if (!g_projectedState || g_projectedState->magic != bigscreen_projected_video::kMagic) {
         return nullptr;
     }
     return g_projectedState;
+}
+
+DXGI_FORMAT ResolveRtvFormat(DXGI_FORMAT fmt) {
+    switch (fmt) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM;
+        default: return fmt;
+    }
+}
+
+void ReleaseRouteStaging() {
+    if (g_routeStagingRtv) { g_routeStagingRtv->Release(); g_routeStagingRtv = nullptr; }
+    if (g_routeStagingTex) { g_routeStagingTex->Release(); g_routeStagingTex = nullptr; }
+    g_routeStagingW = 0;
+    g_routeStagingH = 0;
+    g_routeStagingFmt = DXGI_FORMAT_UNKNOWN;
+}
+
+bool EnsureRouteStaging(ID3D11Device* pDevice, uint32_t w, uint32_t h, DXGI_FORMAT fmt) {
+    if (!pDevice || w == 0 || h == 0) return false;
+    if (!EnsurePeerPipeline(pDevice)) return false;
+    if (g_routeStagingTex && g_routeStagingRtv &&
+        g_routeStagingW == w && g_routeStagingH == h && g_routeStagingFmt == fmt) {
+        return true;
+    }
+    ReleaseRouteStaging();
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    if (FAILED(pDevice->CreateTexture2D(&td, nullptr, &g_routeStagingTex)) || !g_routeStagingTex) {
+        return false;
+    }
+    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+    rtvDesc.Format = ResolveRtvFormat(fmt);
+    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    if (FAILED(pDevice->CreateRenderTargetView(g_routeStagingTex, &rtvDesc, &g_routeStagingRtv)) || !g_routeStagingRtv) {
+        ReleaseRouteStaging();
+        return false;
+    }
+    g_routeStagingW = w;
+    g_routeStagingH = h;
+    g_routeStagingFmt = fmt;
+    return true;
+}
+
+bool BlitSharedVideoToDesktop(ID3D11Device* pDevice, ID3D11DeviceContext* pContext,
+                              ID3D11Texture2D* pDesktopTex, const D3D11_TEXTURE2D_DESC& deskDesc,
+                              ID3D11Texture2D* pSharedTex) {
+    if (!pDevice || !pContext || !pDesktopTex || !pSharedTex) return false;
+
+    D3D11_TEXTURE2D_DESC vidDesc{};
+    pSharedTex->GetDesc(&vidDesc);
+
+    if (vidDesc.Width == deskDesc.Width && vidDesc.Height == deskDesc.Height && vidDesc.Format == deskDesc.Format) {
+        pContext->CopyResource(pDesktopTex, pSharedTex);
+        return true;
+    }
+
+    if (!g_sharedVideoSrv) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = ResolveRtvFormat(vidDesc.Format);
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        if (FAILED(pDevice->CreateShaderResourceView(pSharedTex, &srvDesc, &g_sharedVideoSrv)) || !g_sharedVideoSrv) {
+            return false;
+        }
+    }
+
+    if (!EnsureRouteStaging(pDevice, deskDesc.Width, deskDesc.Height, deskDesc.Format)) {
+        return false;
+    }
+
+    SavedD3D11State saved;
+    saved.Save(pContext);
+
+    const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    pContext->ClearRenderTargetView(g_routeStagingRtv, black);
+
+    D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(deskDesc.Width), static_cast<float>(deskDesc.Height), 0.0f, 1.0f };
+    pContext->OMSetRenderTargets(1, &g_routeStagingRtv, nullptr);
+    pContext->RSSetViewports(1, &vp);
+    pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    pContext->IASetInputLayout(nullptr);
+    pContext->VSSetShader(g_peerVs, nullptr, 0);
+    pContext->PSSetShader(g_peerPsRgba, nullptr, 0);
+    pContext->PSSetShaderResources(0, 1, &g_sharedVideoSrv);
+    pContext->PSSetSamplers(0, 1, &g_peerSampler);
+    pContext->OMSetBlendState(g_peerBlend, nullptr, 0xFFFFFFFF);
+    pContext->OMSetDepthStencilState(g_peerDepth, 0);
+    pContext->RSSetState(g_peerRaster);
+    pContext->Draw(3, 0);
+
+    ID3D11ShaderResourceView* nullSrv = nullptr;
+    pContext->PSSetShaderResources(0, 1, &nullSrv);
+    pContext->CopyResource(pDesktopTex, g_routeStagingTex);
+    pContext->Flush();
+
+    saved.Restore(pContext);
+    return true;
 }
 
 ID3D11Texture2D* ResolveDesktopTexture2D(void* nativePtr) {
@@ -837,84 +970,89 @@ void RouteDesktopTexture() {
         return;
     }
 
+    if (g_projectedState) {
+        g_projectedState->diagHookLocal = g_localHookInstalled ? 1u : 0u;
+    }
+
     const auto state = *pState;
     if (!state.active && !state.privacyMode) {
-        if (g_sharedVideoTex) {
-            g_sharedVideoTex->Release();
-            g_sharedVideoTex = nullptr;
-            g_currentSharedHandle = 0;
-        }
+        if (g_sharedVideoSrv) { g_sharedVideoSrv->Release(); g_sharedVideoSrv = nullptr; }
+        if (g_sharedVideoTex) { g_sharedVideoTex->Release(); g_sharedVideoTex = nullptr; }
+        g_currentSharedHandle = 0;
         return;
     }
 
     if (!g_pfnGetNativeDesktop) return;
-    void* rawDesktopPtr = g_pfnGetNativeDesktop(0);
-    ID3D11Texture2D* pDesktopTex = ResolveDesktopTexture2D(rawDesktopPtr);
-    if (!pDesktopTex) return;
 
-    ID3D11Device* pDevice = nullptr;
-    pDesktopTex->GetDevice(&pDevice);
-    if (!pDevice) {
-        pDesktopTex->Release();
-        return;
-    }
+    uint32_t foundCount = 0;
+    for (int deskIdx = 0; deskIdx < 4; ++deskIdx) {
+        void* rawDesktopPtr = g_pfnGetNativeDesktop(deskIdx);
+        ID3D11Texture2D* pDesktopTex = ResolveDesktopTexture2D(rawDesktopPtr);
+        if (!pDesktopTex) continue;
+        ++foundCount;
 
-    ID3D11DeviceContext* pContext = nullptr;
-    pDevice->GetImmediateContext(&pContext);
-    if (!pContext) {
+        ID3D11Device* pDevice = nullptr;
+        pDesktopTex->GetDevice(&pDevice);
+        if (!pDevice) {
+            pDesktopTex->Release();
+            continue;
+        }
+
+        ID3D11DeviceContext* pContext = nullptr;
+        pDevice->GetImmediateContext(&pContext);
+        if (!pContext) {
+            pDevice->Release();
+            pDesktopTex->Release();
+            continue;
+        }
+
+        D3D11_TEXTURE2D_DESC deskDesc{};
+        pDesktopTex->GetDesc(&deskDesc);
+        if (g_projectedState && deskIdx == 0) {
+            g_projectedState->diagDeskFmt = static_cast<uint32_t>(deskDesc.Format);
+        }
+
+        if (state.active && state.sharedHandle) {
+            if (!g_sharedVideoTex || g_currentSharedHandle != state.sharedHandle) {
+                if (g_sharedVideoSrv) { g_sharedVideoSrv->Release(); g_sharedVideoSrv = nullptr; }
+                if (g_sharedVideoTex) { g_sharedVideoTex->Release(); g_sharedVideoTex = nullptr; }
+                g_currentSharedHandle = 0;
+                HRESULT hr = pDevice->OpenSharedResource(reinterpret_cast<HANDLE>(state.sharedHandle), IID_PPV_ARGS(&g_sharedVideoTex));
+                if (g_projectedState) {
+                    g_projectedState->diagOpenHr = static_cast<int32_t>(hr);
+                }
+                if (SUCCEEDED(hr) && g_sharedVideoTex) {
+                    g_currentSharedHandle = state.sharedHandle;
+                }
+            }
+
+            if (g_sharedVideoTex) {
+                D3D11_TEXTURE2D_DESC vidDesc{};
+                g_sharedVideoTex->GetDesc(&vidDesc);
+                if (g_projectedState) {
+                    g_projectedState->diagVidFmt = static_cast<uint32_t>(vidDesc.Format);
+                }
+                if (BlitSharedVideoToDesktop(pDevice, pContext, pDesktopTex, deskDesc, g_sharedVideoTex)) {
+                    if (g_projectedState) {
+                        ++g_projectedState->diagCopiedCount;
+                    }
+                }
+            }
+        } else if (state.privacyMode) {
+            EnsureBlackTexture(pDevice, deskDesc);
+            if (g_blackTex) {
+                pContext->CopyResource(pDesktopTex, g_blackTex);
+            }
+        }
+
+        pContext->Release();
         pDevice->Release();
         pDesktopTex->Release();
-        return;
     }
 
-    D3D11_TEXTURE2D_DESC deskDesc{};
-    pDesktopTex->GetDesc(&deskDesc);
-
-    if (state.active && state.sharedHandle) {
-        if (!g_sharedVideoTex || g_currentSharedHandle != state.sharedHandle) {
-            if (g_sharedVideoTex) {
-                g_sharedVideoTex->Release();
-                g_sharedVideoTex = nullptr;
-                g_currentSharedHandle = 0;
-            }
-            HRESULT hr = pDevice->OpenSharedResource(reinterpret_cast<HANDLE>(state.sharedHandle), IID_PPV_ARGS(&g_sharedVideoTex));
-            if (SUCCEEDED(hr) && g_sharedVideoTex) {
-                g_currentSharedHandle = state.sharedHandle;
-            }
-        }
-
-        if (g_sharedVideoTex) {
-            D3D11_TEXTURE2D_DESC vidDesc{};
-            g_sharedVideoTex->GetDesc(&vidDesc);
-
-            auto isBgra8 = [](DXGI_FORMAT f) {
-                return f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
-                       f == DXGI_FORMAT_B8G8R8A8_TYPELESS || f == DXGI_FORMAT_B8G8R8X8_UNORM;
-            };
-            const bool compatFmt = (vidDesc.Format == deskDesc.Format) ||
-                                   (isBgra8(vidDesc.Format) && isBgra8(deskDesc.Format));
-
-            if (vidDesc.Width == deskDesc.Width && vidDesc.Height == deskDesc.Height && compatFmt) {
-                pContext->CopyResource(pDesktopTex, g_sharedVideoTex);
-            } else if (compatFmt) {
-                UINT copyW = (std::min)(vidDesc.Width, deskDesc.Width);
-                UINT copyH = (std::min)(vidDesc.Height, deskDesc.Height);
-                UINT dstX = (deskDesc.Width > copyW) ? (deskDesc.Width - copyW) / 2 : 0;
-                UINT dstY = (deskDesc.Height > copyH) ? (deskDesc.Height - copyH) / 2 : 0;
-                D3D11_BOX box{ 0, 0, 0, copyW, copyH, 1 };
-                pContext->CopySubresourceRegion(pDesktopTex, 0, dstX, dstY, 0, g_sharedVideoTex, 0, &box);
-            }
-        }
-    } else if (state.privacyMode) {
-        EnsureBlackTexture(pDevice, deskDesc);
-        if (g_blackTex) {
-            pContext->CopyResource(pDesktopTex, g_blackTex);
-        }
+    if (g_projectedState) {
+        g_projectedState->diagDesktopCount = foundCount;
     }
-
-    pContext->Release();
-    pDevice->Release();
-    pDesktopTex->Release();
 }
 
 // --------------------------------------------------------------------------
@@ -1316,15 +1454,36 @@ bool InstallNonRipPrologueHook(const void* methodInfo, const uint8_t* prefix, si
     return true;
 }
 
+bool GetTransformScale(void* obj, bool isGameObject, Il2CppVec3* outScale) {
+    if (!obj || !outScale || !g_il2cppInvoke || !g_mTransformGetLocalScale || !g_il2cppUnbox) return false;
+    const void* mGetTr = isGameObject ? g_mGoGetTransform : g_mCompGetTransform;
+    if (!mGetTr) return false;
+    void* exc = nullptr;
+    void* tr = g_il2cppInvoke(mGetTr, obj, nullptr, &exc);
+    if (exc || !tr) return false;
+    exc = nullptr;
+    void* boxed = g_il2cppInvoke(g_mTransformGetLocalScale, tr, nullptr, &exc);
+    if (exc || !boxed) return false;
+    const auto* vec = reinterpret_cast<const Il2CppVec3*>(g_il2cppUnbox(boxed));
+    if (!vec) return false;
+    *outScale = *vec;
+    return true;
+}
+
 void ApplyScreenAspectOverridesOnMainThread() {
     float ov = GetActiveAspectOverride();
     ULONGLONG now = GetTickCount64();
     bool changed = (std::fabs(ov - g_lastAppliedAspectOverride) > 0.001f);
-    bool periodic = (ov > 0.1f) && (now - g_lastAspectSweepMs >= 250);
+    bool periodic = (ov > 0.1f) && (now - g_lastAspectSweepMs >= 100);
     if (!changed && !periodic) return;
 
     g_lastAppliedAspectOverride = ov;
     g_lastAspectSweepMs = now;
+
+    uint32_t diagMask = 0;
+    if (g_mFindObjectsOfType) diagMask |= 0x01;
+    if (g_mTransformSetLocalScale) diagMask |= 0x02;
+    uint32_t appliedCount = 0;
 
     // 1. MonitorSizer (desktop monitors / personal & presentation screens)
     if (g_mFindObjectsOfType && g_typeMonitorSizer && g_origMonitorSetAspect && g_fnArrayLength) {
@@ -1333,6 +1492,7 @@ void ApplyScreenAspectOverridesOnMainThread() {
         void* arr = g_il2cppInvoke(g_mFindObjectsOfType, nullptr, args, &exc);
         if (!exc && arr) {
             uint32_t n = g_fnArrayLength(arr);
+            if (n > 0) diagMask |= 0x04;
             auto** elems = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(arr) + 0x20);
             for (uint32_t i = 0; i < n && i < 64; ++i) {
                 void* sizer = elems[i];
@@ -1358,6 +1518,7 @@ void ApplyScreenAspectOverridesOnMainThread() {
                 g_inAspectReapply = true;
                 g_origMonitorSetAspect(sizer, applyW, applyH, g_mMonitorSetAspect);
                 g_inAspectReapply = false;
+                ++appliedCount;
             }
         }
     }
@@ -1369,6 +1530,7 @@ void ApplyScreenAspectOverridesOnMainThread() {
         void* arr = g_il2cppInvoke(g_mFindObjectsOfType, nullptr, args, &exc);
         if (!exc && arr) {
             uint32_t n = g_fnArrayLength(arr);
+            if (n > 0) diagMask |= 0x08;
             auto** elems = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(arr) + 0x20);
             for (uint32_t i = 0; i < n && i < 32; ++i) {
                 void* mirrored = elems[i];
@@ -1382,11 +1544,13 @@ void ApplyScreenAspectOverridesOnMainThread() {
                         g_inAspectReapply = true;
                         g_origMirroredUpdateAspect(mirrored, trackedTex, g_mMirroredUpdateAspect);
                         g_inAspectReapply = false;
+                        ++appliedCount;
                     }
                 } else if (ov > 0.1f) {
                     const auto* orig = reinterpret_cast<const Il2CppVec3*>(reinterpret_cast<const uint8_t*>(mirrored) + 0x80);
                     if (orig->x > 0.001f && orig->x < 5000.0f && orig->z > 0.0001f && orig->z < 5000.0f) {
                         ApplyTransformScale(mirrored, false, ComputeFittedScale(*orig, ov));
+                        ++appliedCount;
                     }
                 }
             }
@@ -1400,6 +1564,7 @@ void ApplyScreenAspectOverridesOnMainThread() {
         void* arr = g_il2cppInvoke(g_mFindObjectsOfType, nullptr, args, &exc);
         if (!exc && arr) {
             uint32_t n = g_fnArrayLength(arr);
+            if (n > 0) diagMask |= 0x10;
             auto** elems = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(arr) + 0x20);
             size_t offOrig = g_fnFieldGetOffset(g_fldMediaOrigScale);
             size_t offGo = g_fldMediaScreensGo ? g_fnFieldGetOffset(g_fldMediaScreensGo) : 0;
@@ -1412,6 +1577,7 @@ void ApplyScreenAspectOverridesOnMainThread() {
                 if (offSrc && !*reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(mr) + offSrc)) continue;
                 if (changed && ov <= 0.1f) {
                     if (offResize) *reinterpret_cast<uint8_t*>(reinterpret_cast<uint8_t*>(mr) + offResize) = 1;
+                    ++appliedCount;
                 } else if (ov > 0.1f) {
                     Il2CppVec3 orig = *reinterpret_cast<const Il2CppVec3*>(reinterpret_cast<const uint8_t*>(mr) + offOrig);
                     if (orig.x > 0.001f && orig.x < 5000.0f && orig.z > 0.0001f && orig.z < 5000.0f) {
@@ -1419,14 +1585,65 @@ void ApplyScreenAspectOverridesOnMainThread() {
                         void* go = offGo ? *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(mr) + offGo) : nullptr;
                         if (go) {
                             ApplyTransformScale(go, true, fitted);
+                            ++appliedCount;
                         } else if (offRend) {
                             void* rend = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(mr) + offRend);
-                            if (rend) ApplyTransformScale(rend, false, fitted);
+                            if (rend) {
+                                ApplyTransformScale(rend, false, fitted);
+                                ++appliedCount;
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    // 4. PresentationSectionSizer (VR User & Theater presentation sections)
+    if (g_mFindObjectsOfType && g_typePresentationSectionSizer && g_fnArrayLength) {
+        void* exc = nullptr;
+        void* args[1] = { g_typePresentationSectionSizer };
+        void* arr = g_il2cppInvoke(g_mFindObjectsOfType, nullptr, args, &exc);
+        if (!exc && arr) {
+            uint32_t n = g_fnArrayLength(arr);
+            if (n > 0) diagMask |= 0x20;
+            auto** elems = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(arr) + 0x20);
+            for (uint32_t i = 0; i < n && i < 32; ++i) {
+                void* ps = elems[i];
+                if (!ps) continue;
+
+                Il2CppVec3 baseScale{};
+                bool haveBase = false;
+                for (const auto& e : g_trackedPresSizers) {
+                    if (e.ptr == ps) { baseScale = e.origScale; haveBase = true; break; }
+                }
+                if (!haveBase && GetTransformScale(ps, false, &baseScale)) {
+                    if (baseScale.x > 0.001f && baseScale.y > 0.001f) {
+                        for (auto& e : g_trackedPresSizers) {
+                            if (!e.ptr) { e = { ps, baseScale }; haveBase = true; break; }
+                        }
+                        if (!haveBase) {
+                            g_trackedPresSizers[0] = { ps, baseScale };
+                            haveBase = true;
+                        }
+                    }
+                }
+                if (!haveBase || baseScale.x <= 0.001f || baseScale.y <= 0.001f) continue;
+
+                if (changed && ov <= 0.1f) {
+                    ApplyTransformScale(ps, false, baseScale);
+                    ++appliedCount;
+                } else if (ov > 0.1f) {
+                    ApplyTransformScale(ps, false, ComputeFittedScale(baseScale, ov));
+                    ++appliedCount;
+                }
+            }
+        }
+    }
+
+    if (g_projectedState) {
+        g_projectedState->diagAspectMask = diagMask;
+        g_projectedState->diagAspectAppliedCount += appliedCount;
     }
 }
 
@@ -1482,6 +1699,7 @@ void TryInstallAppTickHook() {
             if (!g_klassMonitorSizer) g_klassMonitorSizer = fnClassFromName(img, "Bigscreen.Monitors", "MonitorSizer");
             if (!g_klassMirroredScreen) g_klassMirroredScreen = fnClassFromName(img, "Bigscreen.Effects", "MirroredScreen");
             if (!g_klassBigMediaRenderer) g_klassBigMediaRenderer = fnClassFromName(img, "Bigscreen.Media", "BigMediaRenderer");
+            if (!g_klassPresentationSectionSizer) g_klassPresentationSectionSizer = fnClassFromName(img, "Bigscreen.Monitors.Presentation", "PresentationSectionSizer");
             if (!unityObjClass) unityObjClass = fnClassFromName(img, "UnityEngine", "Object");
             if (!unityCompClass) unityCompClass = fnClassFromName(img, "UnityEngine", "Component");
             if (!unityGoClass) unityGoClass = fnClassFromName(img, "UnityEngine", "GameObject");
@@ -1496,11 +1714,32 @@ void TryInstallAppTickHook() {
         g_fnClassGetField = reinterpret_cast<pfnIl2CppClassGetFieldFromName>(GetProcAddress(hGame, "il2cpp_class_get_field_from_name"));
         g_fnFieldGetOffset = reinterpret_cast<pfnIl2CppFieldGetOffset>(GetProcAddress(hGame, "il2cpp_field_get_offset"));
         g_fnArrayLength = reinterpret_cast<pfnIl2CppArrayLength>(GetProcAddress(hGame, "il2cpp_array_length"));
+        auto fnClassGetMethods = reinterpret_cast<pfnIl2CppClassGetMethods>(GetProcAddress(hGame, "il2cpp_class_get_methods"));
+        auto fnMethodGetName = reinterpret_cast<pfnIl2CppMethodGetName>(GetProcAddress(hGame, "il2cpp_method_get_name"));
+        auto fnMethodGetParamCount = reinterpret_cast<pfnIl2CppMethodGetParamCount>(GetProcAddress(hGame, "il2cpp_method_get_param_count"));
+        auto fnMethodIsGeneric = reinterpret_cast<pfnIl2CppMethodIsGeneric>(GetProcAddress(hGame, "il2cpp_method_is_generic"));
 
-        g_mFindObjectsOfType = fnMethodFromName(unityObjClass, "FindObjectsOfType", 1);
-        g_mCompGetTransform = fnMethodFromName(unityCompClass, "get_transform", 0);
-        g_mGoGetTransform = fnMethodFromName(unityGoClass, "get_transform", 0);
-        g_mTransformSetLocalScale = fnMethodFromName(unityTransformClass, "set_localScale", 1);
+        auto findNonGeneric = [&](void* klass, const char* name, uint32_t paramCount) -> const void* {
+            if (!klass || !fnClassGetMethods || !fnMethodGetName || !fnMethodGetParamCount) {
+                return fnMethodFromName(klass, name, static_cast<int>(paramCount));
+            }
+            void* iter = nullptr;
+            while (const void* m = fnClassGetMethods(klass, &iter)) {
+                const char* mn = fnMethodGetName(m);
+                if (mn && std::strcmp(mn, name) == 0 &&
+                    fnMethodGetParamCount(m) == paramCount &&
+                    (!fnMethodIsGeneric || fnMethodIsGeneric(m) == 0)) {
+                    return m;
+                }
+            }
+            return fnMethodFromName(klass, name, static_cast<int>(paramCount));
+        };
+
+        g_mFindObjectsOfType = findNonGeneric(unityObjClass, "FindObjectsOfType", 1);
+        g_mCompGetTransform = findNonGeneric(unityCompClass, "get_transform", 0);
+        g_mGoGetTransform = findNonGeneric(unityGoClass, "get_transform", 0);
+        g_mTransformGetLocalScale = findNonGeneric(unityTransformClass, "get_localScale", 0);
+        g_mTransformSetLocalScale = findNonGeneric(unityTransformClass, "set_localScale", 1);
 
         if (g_fnClassGetType && g_fnTypeGetObject) {
             const void* tSizer = g_fnClassGetType(g_klassMonitorSizer);
@@ -1510,6 +1749,10 @@ void TryInstallAppTickHook() {
             if (g_klassBigMediaRenderer) {
                 const void* tMedia = g_fnClassGetType(g_klassBigMediaRenderer);
                 if (tMedia) g_typeBigMediaRenderer = g_fnTypeGetObject(tMedia);
+            }
+            if (g_klassPresentationSectionSizer) {
+                const void* tPres = g_fnClassGetType(g_klassPresentationSectionSizer);
+                if (tPres) g_typePresentationSectionSizer = g_fnTypeGetObject(tPres);
             }
         }
         if (g_fnClassGetField) {
@@ -1684,7 +1927,9 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
 
         if (g_projectedState) { UnmapViewOfFile(g_projectedState); g_projectedState = nullptr; }
         if (g_projectedMapping) { CloseHandle(g_projectedMapping); g_projectedMapping = nullptr; }
+        if (g_sharedVideoSrv) { g_sharedVideoSrv->Release(); g_sharedVideoSrv = nullptr; }
         if (g_sharedVideoTex) { g_sharedVideoTex->Release(); g_sharedVideoTex = nullptr; }
+        ReleaseRouteStaging();
         if (g_blackTex) { g_blackTex->Release(); g_blackTex = nullptr; }
         if (g_pTrampolineLocal) { VirtualFree(g_pTrampolineLocal, 0, MEM_RELEASE); g_pTrampolineLocal = nullptr; }
         if (g_pTrampolinePeer) { VirtualFree(g_pTrampolinePeer, 0, MEM_RELEASE); g_pTrampolinePeer = nullptr; }

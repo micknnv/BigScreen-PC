@@ -27,6 +27,15 @@ struct State {
     uint64_t requestOwnRoomSeq; // Incremented by viewer to request Bigscreen leave current room -> own room
     float aspectOverride;      // > 0.0f to override film/screen aspect ratio (0.0f = Auto)
     uint32_t aspectReserved;
+    // Diagnostics populated by BigscreenThirdPersonGpuExport.dll
+    uint32_t diagHookLocal;
+    uint32_t diagDesktopCount;
+    int32_t  diagOpenHr;
+    uint32_t diagDeskFmt;
+    uint32_t diagVidFmt;
+    uint32_t diagCopiedCount;
+    uint32_t diagAspectMask;
+    uint32_t diagAspectAppliedCount;
 };
 
 } // namespace bigscreen_projected_video

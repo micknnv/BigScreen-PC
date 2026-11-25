@@ -2416,6 +2416,17 @@ void UpdateMetrics() {
     Log("Viewer metrics: fps=%.1f sourceSeq=%llu copies=%llu dropped=%llu opens=%llu cpuCopy=GPU-only",
         fps, static_cast<unsigned long long>(g_lastSequence), static_cast<unsigned long long>(g_copies),
         static_cast<unsigned long long>(g_dropped), static_cast<unsigned long long>(g_opens));
+    if (g_projectedVideoState) {
+        Log("Route/Aspect diag: hookLocal=%u desktops=%u openHr=0x%08X deskFmt=%u vidFmt=%u copied=%u aspMask=0x%X aspApplied=%u",
+            g_projectedVideoState->diagHookLocal,
+            g_projectedVideoState->diagDesktopCount,
+            static_cast<unsigned>(g_projectedVideoState->diagOpenHr),
+            g_projectedVideoState->diagDeskFmt,
+            g_projectedVideoState->diagVidFmt,
+            g_projectedVideoState->diagCopiedCount,
+            g_projectedVideoState->diagAspectMask,
+            g_projectedVideoState->diagAspectAppliedCount);
+    }
     g_lastMetrics = now;
 }
 
