@@ -372,7 +372,11 @@ RECT g_projectedMonitorRect{};
 bool g_controlVirtualScreen = false;
 
 HWND g_projectedHwnd = nullptr;
+DWORD g_projectedPid = 0;
+std::wstring g_projectedExeName;
+std::wstring g_projectedAppDisplayName;
 std::wstring g_projectedTitle;
+ULONGLONG g_appWindowLostSinceMs = 0;
 ID3D11Texture2D* g_projectedTexture = nullptr;
 ID3D11ShaderResourceView* g_projectedSrv = nullptr;
 uint32_t g_projectedWidth = 0;
@@ -1062,11 +1066,6 @@ void CheckFeedStatus() {
 
             if (newFeedDetected) {
                 g_waitingForNewFeed = false;
-                g_movieOnly = false; // When the user enters a room that is playing a movie, load in Theater Mode!
-                g_lookYaw = 0.0f;
-                g_lookPitch = 0.0f;
-                g_lookZoom = 0.0f;
-                SyncPointerAndLook();
                 HWND hwndBig = FindBigscreenWindow();
                 if (hwndBig && !IsIconic(hwndBig)) {
                     ShowWindow(hwndBig, SW_MINIMIZE);
@@ -1074,7 +1073,7 @@ void CheckFeedStatus() {
                         SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
                     }
                     SetForegroundWindow(g_hwnd);
-                    Log("New audio/video feed detected (audio peak=%.3f). Loaded Theater Mode & auto-minimized Bigscreen menu.", g_audioPeak);
+                    Log("New audio/video feed detected (audio peak=%.3f). Auto-minimized Bigscreen menu.", g_audioPeak);
                 }
             }
         }
@@ -1206,7 +1205,11 @@ void ReleaseProjectedAppResources() {
     g_projectedWidth = 0;
     g_projectedHeight = 0;
     g_projectedHwnd = nullptr;
+    g_projectedPid = 0;
+    g_projectedExeName.clear();
+    g_projectedAppDisplayName.clear();
     g_projectedTitle.clear();
+    g_appWindowLostSinceMs = 0;
     g_croppedBits.clear();
     g_lastKnownWinW = 0;
     g_lastKnownWinH = 0;
@@ -1322,11 +1325,44 @@ HWND FindVideoChildWindow(HWND parent) {
     return data.bestHwnd;
 }
 
+bool ResolveWindowAppIdentity(HWND hwnd, DWORD& outPid, std::wstring& outExeName);
+HWND FindBestWindowForProjectedApp(DWORD targetPid, const std::wstring& targetExeName);
+
 bool CaptureProjectedWindowFrame() {
-    if (!g_projectedHwnd || !IsWindow(g_projectedHwnd)) {
-        ReleaseProjectedAppResources();
-        g_projectionMode = ProjectionMode::None;
-        return false;
+    bool needsRebind = (!g_projectedHwnd || !IsWindow(g_projectedHwnd) ||
+                        (!IsWindowVisible(g_projectedHwnd) && !IsIconic(g_projectedHwnd)));
+    if (needsRebind) {
+        HWND rebound = FindBestWindowForProjectedApp(g_projectedPid, g_projectedExeName);
+        if (rebound) {
+            g_projectedHwnd = rebound;
+            DWORD newPid = 0;
+            std::wstring newExe;
+            if (ResolveWindowAppIdentity(rebound, newPid, newExe)) {
+                if (newPid) g_projectedPid = newPid;
+                if (!newExe.empty()) g_projectedExeName = newExe;
+            }
+            g_appIsHidden = false;
+            g_appWindowLostSinceMs = 0;
+            CloakAppWindow(g_projectedHwnd);
+            Log("Rebound Project App stream to updated window for %ls", g_projectedExeName.c_str());
+        } else {
+            const bool processAlive = !g_projectedExeName.empty() && IsProcessRunning(g_projectedExeName.c_str());
+            if (processAlive) {
+                const ULONGLONG nowMs = GetTickCount64();
+                if (g_appWindowLostSinceMs == 0) {
+                    g_appWindowLostSinceMs = nowMs;
+                }
+                // Keep app projection active across playlist/window recreation while process is running
+                if (nowMs - g_appWindowLostSinceMs < 5000) {
+                    return false;
+                }
+            }
+            ReleaseProjectedAppResources();
+            g_projectionMode = ProjectionMode::None;
+            return false;
+        }
+    } else {
+        g_appWindowLostSinceMs = 0;
     }
 
     const bool isIconic = IsIconic(g_projectedHwnd) != FALSE;
@@ -1440,8 +1476,158 @@ bool CaptureProjectedWindowFrame() {
 
 struct AppWindowInfo {
     HWND hwnd = nullptr;
+    DWORD pid = 0;
+    std::wstring exeName;
+    std::wstring appDisplay;
     std::wstring title;
 };
+
+struct SupportedVideoApp {
+    const wchar_t* exeName;
+    const wchar_t* displayName;
+};
+
+static const SupportedVideoApp kSupportedVideoApps[] = {
+    { L"Microsoft.Media.Player.exe", L"Windows Media Player (Modern)" },
+    { L"wmplayer.exe",               L"Windows Media Player Legacy" },
+    { L"Video.UI.exe",               L"Movies & TV" },
+    { L"vlc.exe",                    L"VLC media player" },
+    { L"mpc-hc64.exe",               L"MPC-HC (64-bit)" },
+    { L"mpc-hc.exe",                 L"MPC-HC" },
+    { L"mpv.exe",                    L"mpv" },
+    { L"GOM.exe",                    L"GOM Player" },
+    { L"GOM64.exe",                  L"GOM Player" },
+    { L"KMPlayer.exe",               L"KMPlayer" },
+    { L"KMPlayer64.exe",             L"KMPlayer" },
+    { L"smplayer.exe",               L"SMPlayer" },
+    { L"DivXPlayer.exe",             L"DivX Player" },
+    { L"Screenbox.exe",              L"Screenbox" },
+    { L"Plex.exe",                   L"Plex" },
+    { L"Plex Media Server.exe",      L"Plex Media Server" },
+    { L"JellyfinDesktop.exe",        L"Jellyfin" },
+    { L"JellyfinMediaPlayer.exe",    L"Jellyfin" },
+    { L"jellyfin.exe",               L"Jellyfin" },
+    { L"kodi.exe",                   L"Kodi" },
+    { L"MediaMonkey.exe",            L"MediaMonkey" },
+    { L"MediaMonkeyEngine.exe",      L"MediaMonkey" },
+    { L"iTunes.exe",                 L"iTunes" },
+};
+
+bool QueryProcessBaseName(DWORD pid, std::wstring& outBaseName) {
+    outBaseName.clear();
+    if (!pid) return false;
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess) return false;
+    wchar_t exePath[MAX_PATH]{};
+    DWORD size = MAX_PATH;
+    bool ok = QueryFullProcessImageNameW(hProcess, 0, exePath, &size) != FALSE;
+    CloseHandle(hProcess);
+    if (!ok || !exePath[0]) return false;
+    const wchar_t* slash = wcsrchr(exePath, L'\\');
+    outBaseName = slash ? (slash + 1) : exePath;
+    return true;
+}
+
+bool ResolveWindowAppIdentity(HWND hwnd, DWORD& outPid, std::wstring& outExeName) {
+    outPid = 0;
+    outExeName.clear();
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    std::wstring exeName;
+    if (!QueryProcessBaseName(pid, exeName)) return false;
+
+    // UWP / Windows Store apps (Modern Media Player, Movies & TV, Screenbox) host their CoreWindow inside ApplicationFrameHost.exe
+    if (_wcsicmp(exeName.c_str(), L"ApplicationFrameHost.exe") == 0) {
+        struct UwpSearchCtx {
+            DWORD framePid = 0;
+            DWORD childPid = 0;
+            std::wstring childExe;
+        } ctx{ pid, 0, L"" };
+        EnumChildWindows(hwnd, [](HWND child, LPARAM lp) -> BOOL {
+            auto* c = reinterpret_cast<UwpSearchCtx*>(lp);
+            DWORD cpid = 0;
+            GetWindowThreadProcessId(child, &cpid);
+            if (cpid && cpid != c->framePid) {
+                if (QueryProcessBaseName(cpid, c->childExe)) {
+                    c->childPid = cpid;
+                    return FALSE;
+                }
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        if (!ctx.childExe.empty()) {
+            pid = ctx.childPid;
+            exeName = ctx.childExe;
+        }
+    }
+
+    outPid = pid;
+    outExeName = exeName;
+    return !outExeName.empty();
+}
+
+const wchar_t* MatchSupportedVideoAppDisplayName(HWND hwnd, DWORD* outPid = nullptr, std::wstring* outExeName = nullptr) {
+    DWORD pid = 0;
+    std::wstring exeName;
+    if (!ResolveWindowAppIdentity(hwnd, pid, exeName)) return nullptr;
+    if (outPid) *outPid = pid;
+    if (outExeName) *outExeName = exeName;
+
+    for (const auto& app : kSupportedVideoApps) {
+        if (_wcsicmp(exeName.c_str(), app.exeName) == 0) {
+            return app.displayName;
+        }
+    }
+    return nullptr;
+}
+
+HWND FindBestWindowForProjectedApp(DWORD targetPid, const std::wstring& targetExeName) {
+    if (targetPid == 0 && targetExeName.empty()) return nullptr;
+    struct MatchSearch {
+        DWORD targetPid;
+        const std::wstring* targetExe;
+        HWND bestPidMatch = nullptr;
+        int bestPidArea = -1;
+        HWND bestExeMatch = nullptr;
+        int bestExeArea = -1;
+    } ctx{ targetPid, &targetExeName };
+
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<MatchSearch*>(lp);
+        if (hwnd == g_hwnd) return TRUE;
+        if (!IsWindowVisible(hwnd) && !IsIconic(hwnd)) return TRUE;
+        LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
+
+        DWORD pid = 0;
+        std::wstring exe;
+        if (!ResolveWindowAppIdentity(hwnd, pid, exe)) return TRUE;
+
+        const bool sameExe = !c->targetExe->empty() && _wcsicmp(exe.c_str(), c->targetExe->c_str()) == 0;
+        const bool samePid = (c->targetPid != 0 && pid == c->targetPid);
+        if (!sameExe && !samePid) return TRUE;
+
+        RECT r{};
+        GetWindowRect(hwnd, &r);
+        int w = (std::max)(0L, r.right - r.left);
+        int h = (std::max)(0L, r.bottom - r.top);
+        int area = (w >= 120 && h >= 120) ? (w * h) : 1;
+
+        if (samePid && area > c->bestPidArea) {
+            c->bestPidArea = area;
+            c->bestPidMatch = hwnd;
+        }
+        if (sameExe && area > c->bestExeArea) {
+            c->bestExeArea = area;
+            c->bestExeMatch = hwnd;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+
+    return ctx.bestPidMatch ? ctx.bestPidMatch : ctx.bestExeMatch;
+}
 
 std::vector<AppWindowInfo> EnumerateSelectableAppWindows() {
     std::vector<AppWindowInfo> list;
@@ -1459,31 +1645,21 @@ std::vector<AppWindowInfo> EnumerateSelectableAppWindows() {
         int len = GetWindowTextW(hwnd, title, 256);
         if (len <= 0) return TRUE;
 
-        if (wcscmp(title, L"Program Manager") == 0 ||
-            wcscmp(title, L"Windows Input Experience") == 0 ||
-            wcscmp(title, L"Settings") == 0) {
+        DWORD pid = 0;
+        std::wstring exeName;
+        const wchar_t* appDisplay = MatchSupportedVideoAppDisplayName(hwnd, &pid, &exeName);
+        if (!appDisplay) {
             return TRUE;
         }
 
-        DWORD pid = 0;
-        GetWindowThreadProcessId(hwnd, &pid);
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (hProcess) {
-            wchar_t exePath[MAX_PATH]{};
-            DWORD size = MAX_PATH;
-            if (QueryFullProcessImageNameW(hProcess, 0, exePath, &size)) {
-                if (wcsstr(exePath, L"BigscreenDesktopViewer") ||
-                    wcsstr(exePath, L"SteamVR") ||
-                    wcsstr(exePath, L"vrserver") ||
-                    wcsstr(exePath, L"vrmonitor")) {
-                    CloseHandle(hProcess);
-                    return TRUE;
-                }
-            }
-            CloseHandle(hProcess);
+        std::wstring label = appDisplay;
+        if (wcsstr(title, appDisplay) == nullptr) {
+            label += L"  -  ";
+            label += title;
+        } else {
+            label = title;
         }
-
-        outList->push_back({ hwnd, title });
+        outList->push_back({ hwnd, pid, exeName, appDisplay, label });
         return TRUE;
     }, reinterpret_cast<LPARAM>(&list));
 
@@ -1605,12 +1781,20 @@ void ExecuteRemoteDpadStep(RemoteBtn btn, bool updateLcd = true) {
     }
 }
 
-void StartProjectingAppWindow(HWND targetHwnd, const std::wstring& title) {
+void StartProjectingAppWindow(HWND targetHwnd, const std::wstring& title,
+                              DWORD pid = 0, const std::wstring& exeName = L"", const std::wstring& appDisplay = L"") {
     if (!targetHwnd || !IsWindow(targetHwnd)) return;
     UnloadVirtualScreen();
     ReleaseProjectedAppResources();
     g_projectedHwnd = targetHwnd;
     g_projectedTitle = title;
+    g_projectedPid = pid;
+    g_projectedExeName = exeName;
+    if (g_projectedPid == 0 || g_projectedExeName.empty()) {
+        ResolveWindowAppIdentity(targetHwnd, g_projectedPid, g_projectedExeName);
+    }
+    g_projectedAppDisplayName = !appDisplay.empty() ? appDisplay : (!g_projectedExeName.empty() ? g_projectedExeName : title);
+    g_appWindowLostSinceMs = 0;
     g_projectionMode = ProjectionMode::App;
     g_lookYaw = 0.0f;
     g_lookPitch = 0.0f;
@@ -1619,20 +1803,21 @@ void StartProjectingAppWindow(HWND targetHwnd, const std::wstring& title) {
     CaptureProjectedWindowFrame();
     CloakAppWindow(g_projectedHwnd);
     SetLcdNotification(L"PROJECTING APP", L"PRIVATE WINDOW", 3500);
-    Log("Started projecting isolated application window: %ls (Cloaked from desktop)", g_projectedTitle.c_str());
+    Log("Started projecting isolated video app: %ls (pid=%u exe=%ls)",
+        g_projectedAppDisplayName.c_str(), g_projectedPid, g_projectedExeName.c_str());
 }
 
 void ShowProjectAppMenu(HWND parentHwnd, float clickX, float clickY) {
     auto windows = EnumerateSelectableAppWindows();
     HMENU hMenu = CreatePopupMenu();
     if (windows.empty()) {
-        AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, L"No eligible video/app windows found");
+        AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, L"No supported video apps currently running");
     } else {
-        AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, L"--- Select Video App to Project Privately ---");
+        AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, L"--- Select Video App to Project ---");
         for (size_t i = 0; i < windows.size() && i < 25; ++i) {
             std::wstring itemText = windows[i].title;
-            if (itemText.length() > 45) {
-                itemText = itemText.substr(0, 42) + L"...";
+            if (itemText.length() > 55) {
+                itemText = itemText.substr(0, 52) + L"...";
             }
             AppendMenuW(hMenu, MF_STRING, static_cast<UINT_PTR>(1000 + i), itemText.c_str());
         }
@@ -1645,7 +1830,8 @@ void ShowProjectAppMenu(HWND parentHwnd, float clickX, float clickY) {
     DestroyMenu(hMenu);
     if (cmd >= 1000 && static_cast<size_t>(cmd - 1000) < windows.size()) {
         if (CanProjectInCurrentRoom()) {
-            StartProjectingAppWindow(windows[cmd - 1000].hwnd, windows[cmd - 1000].title);
+            const auto& sel = windows[cmd - 1000];
+            StartProjectingAppWindow(sel.hwnd, sel.title, sel.pid, sel.exeName, sel.appDisplay);
         }
     }
 }
@@ -3643,9 +3829,9 @@ void GetRemoteLcdLines(std::wstring& l1, std::wstring& l2) {
                 l2 = L"PLEASE WAIT...";
             } else if (CanLeaveToOwnRoomToProject()) {
                 l1 = L"LOAD OWN ROOM";
-                l2 = L"TO PROJECT SCREEN";
+                l2 = L"PROJECTION ROOM";
             } else {
-                l1 = L"PROJECT SCREEN";
+                l1 = L"PROJECTION ROOM";
                 l2 = g_bigscreenRunning ? L"INITIALIZING..." : L"BIGSCREEN OFF";
             }
             return;
@@ -3935,9 +4121,9 @@ void GetInfoSlideOutContent(RemoteBtn hovered, std::wstring& outTitle, std::wstr
             outBody = L"Toggles the viewer window between Fullscreen and normal Windowed mode (shortcut: F11).";
             break;
         case RemoteBtn::ProjectScreen:
-            outTitle = L"PROJECT SCREEN";
+            outTitle = L"PROJECTION ROOM";
             outBody = L"Click to project a connected monitor or Virtual Screen (1920x1080) onto your Bigscreen theater screen.\n\n"
-                      L"Hold for 2 seconds to open the Project App menu.\n\n"
+                      L"Hold for 2 seconds to choose a running video app to project.\n\n"
                       L"In another user's room, click once to load your own room first.";
             break;
         case RemoteBtn::MovieMode:
@@ -4333,7 +4519,7 @@ void DrawRemotePanel(float windowWidth, float windowHeight) {
         g_d2dRenderTarget->DrawText(L"Full Screen /\nWindowed", 22, g_textFormatRemoteLbl, &lbl, g_brushRemoteLabel);
     }
 
-    // 4b. Project Screen
+    // 4b. Projection Room
     const bool projActive = (g_projectionMode != ProjectionMode::None);
     const bool projEnabled = projActive || CanProjectInCurrentRoom() || CanLeaveToOwnRoomToProject();
     DrawRemoteCirclePad(g_rBtnProject, RemoteBtn::ProjectScreen, projEnabled);
@@ -4345,8 +4531,8 @@ void DrawRemotePanel(float windowWidth, float windowHeight) {
         g_d2dRenderTarget->DrawRoundedRectangle(&mon, br, 1.6f);
         g_d2dRenderTarget->DrawLine(D2D1::Point2F(cx, cy + 4.0f), D2D1::Point2F(cx, cy + 7.5f), br, 1.6f);
         g_d2dRenderTarget->DrawLine(D2D1::Point2F(cx - 5.0f, cy + 7.5f), D2D1::Point2F(cx + 5.0f, cy + 7.5f), br, 1.6f);
-        D2D1_RECT_F lbl = D2D1::RectF(g_rBtnProject.left - 14.0f, g_rBtnProject.bottom + 3.0f, g_rBtnProject.right + 14.0f, g_rBtnProject.bottom + 28.0f);
-        g_d2dRenderTarget->DrawText(L"Project\nScreen", 14, g_textFormatRemoteLbl, &lbl, g_brushRemoteLabel);
+        D2D1_RECT_F lbl = D2D1::RectF(g_rBtnProject.left - 16.0f, g_rBtnProject.bottom + 3.0f, g_rBtnProject.right + 16.0f, g_rBtnProject.bottom + 28.0f);
+        g_d2dRenderTarget->DrawText(L"Projection\nRoom", 15, g_textFormatRemoteLbl, &lbl, g_brushRemoteLabel);
     }
 
     // 4c. Info
@@ -5545,6 +5731,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     break;
                 case RemoteBtn::MovieMode:
                     g_movieOnly = true;
+                    g_waitingForNewFeed = false;
                     g_heldDpadBtn = RemoteBtn::None;
                     g_lookYaw = 0.0f;
                     g_lookPitch = 0.0f;
@@ -5557,6 +5744,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     break;
                 case RemoteBtn::TheaterMode:
                     g_movieOnly = false;
+                    g_waitingForNewFeed = false;
                     SetLcdNotification(L"THEATER MODE", L"SELECTED", 3000);
                     break;
                 case RemoteBtn::VolUp: {
@@ -5856,10 +6044,6 @@ void UpdateRoomOwnershipState() {
                 s_lastRoomChangeSeq = g_peerState->roomChangeSeq;
                 roomChanged = true;
             }
-            if ((!s_prevLoadingRoom && g_isLoadingRoom) ||
-                (s_prevRoomHookReady && s_prevInOwnRoom != g_inOwnRoom && !g_isLoadingRoom)) {
-                roomChanged = true;
-            }
         } else {
             g_roomHookReady = false;
             g_inOwnRoom = false;
@@ -6008,18 +6192,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
                 if (g_state) CopyNewFrame();
             }
         } else if (g_projectionMode == ProjectionMode::App) {
-            if (!g_projectedHwnd || !IsWindow(g_projectedHwnd)) {
-                ReleaseProjectedAppResources();
-                g_projectionMode = ProjectionMode::None;
-                source = g_localSrv;
-            } else {
-                CaptureProjectedWindowFrame();
+            CaptureProjectedWindowFrame();
+            if (g_projectionMode == ProjectionMode::App) {
                 source = g_movieOnly ? g_projectedSrv : (g_localSrv ? g_localSrv : g_projectedSrv);
                 flipVertical = false;
                 if (!g_movieOnly) {
                     OpenLiveMapping();
                     if (g_state) CopyNewFrame();
                 }
+            } else {
+                source = g_localSrv;
             }
         } else {
             // Normal Bigscreen Room / Movie theater viewing
@@ -6039,8 +6221,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
             sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING VIRTUAL SCREEN (1920x1080)%s | Tab/M=REMOTE", mode);
         } else if (g_projectionMode == ProjectionMode::Screen) {
             sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING SCREEN%s | Tab/M=REMOTE", mode);
-        } else if (g_projectionMode == ProjectionMode::App && !g_projectedTitle.empty()) {
-            std::wstring shortTitle = g_projectedTitle;
+        } else if (g_projectionMode == ProjectionMode::App && (!g_projectedAppDisplayName.empty() || !g_projectedTitle.empty())) {
+            std::wstring shortTitle = !g_projectedAppDisplayName.empty() ? g_projectedAppDisplayName : g_projectedTitle;
             if (shortTitle.length() > 28) shortTitle = shortTitle.substr(0, 25) + L"...";
             sprintf_s(title, "Bigscreen Desktop Live Viewer | PROJECTING APP: %ls%s | Tab/M=REMOTE", shortTitle.c_str(), mode);
         } else if (g_feedActive) {
