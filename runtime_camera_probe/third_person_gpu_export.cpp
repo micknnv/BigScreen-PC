@@ -275,6 +275,9 @@ const void* g_mLeaveRoom = nullptr;
 const void* g_mGetIsLocalUserOwner = nullptr;
 const void* g_mGetIsSinglePlayer = nullptr;
 const void* g_mInLobby = nullptr;
+const void* g_mRoomGetRoomId = nullptr;
+const void* g_mRoomGetId = nullptr;
+const void* g_fldRoomId = nullptr;
 const void* g_mGetRemoteUsers = nullptr;
 const void* g_mGetRemoteUsersDict = nullptr;
 
@@ -315,7 +318,7 @@ uint64_t g_handledMicToggleSeq = 0;
 uint64_t g_handledMuteAllToggleSeq = 0;
 ULONGLONG g_lastRoomPollMs = 0;
 ULONGLONG g_lastLeaveRoomMs = 0;
-const void* g_lastRoomPtr = nullptr;
+uint64_t g_lastRoomKey = 0;
 uint32_t g_roomChangeSeq = 0;
 
 struct alignas(16) PeerNv12Cb {
@@ -1775,6 +1778,39 @@ void* FindFirstUnityObjectOfType(void* typeObj) {
     return elems[0];
 }
 
+uint64_t ComputeStableRoomKey(void* pRoom, bool isSinglePlayer, bool isOwner, bool inLobby) {
+    uint64_t h = 14695981039346656037ULL;
+    auto mixU64 = [&](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ULL;
+    };
+
+    bool gotRoomId = false;
+    const void* idGetters[2] = { g_mRoomGetRoomId, g_mRoomGetId };
+    for (const void* g : idGetters) {
+        if (!g) continue;
+        void* exc = nullptr;
+        void* strObj = g_il2cppInvoke(g, pRoom, nullptr, &exc);
+        if (!exc && reinterpret_cast<uintptr_t>(strObj) > 0x10000) {
+            const int32_t len = *reinterpret_cast<const int32_t*>(reinterpret_cast<const uint8_t*>(strObj) + 0x10);
+            if (len > 0 && len < 256) {
+                const wchar_t* chars = reinterpret_cast<const wchar_t*>(reinterpret_cast<const uint8_t*>(strObj) + 0x14);
+                for (int32_t i = 0; i < len; ++i) {
+                    mixU64(static_cast<uint64_t>(chars[i]));
+                }
+                gotRoomId = true;
+                break;
+            }
+        }
+    }
+    if (!gotRoomId) {
+        mixU64(isSinglePlayer ? 0x534F4C4FULL : 0x5055424CULL);
+        mixU64(isOwner ? 1ULL : 0ULL);
+    }
+    mixU64(inLobby ? 0x4C4F4242ULL : 0x524F4F4DULL);
+    return h | (1ULL << 63);
+}
+
 void OnAppTickMainThread(void* pApp) {
     if (!g_il2cppInvoke || !pApp || !g_peerCsInit) return;
     ULONGLONG now = GetTickCount64();
@@ -1804,13 +1840,14 @@ void OnAppTickMainThread(void* pApp) {
         void* exc = nullptr;
         void* pRoom = g_mGetCurrentRoom ? g_il2cppInvoke(g_mGetCurrentRoom, pApp, nullptr, &exc) : nullptr;
         if (!exc && pRoom) {
-            if (g_lastRoomPtr != nullptr && g_lastRoomPtr != pRoom) {
-                ++g_roomChangeSeq;
-            }
-            g_lastRoomPtr = pRoom;
             const bool isSinglePlayer = InvokeBoolGetter(g_mGetIsSinglePlayer, pRoom, false);
             const bool isOwner = InvokeBoolGetter(g_mGetIsLocalUserOwner, pRoom, false);
             const bool inLobby = InvokeBoolGetter(g_mInLobby, pRoom, false);
+            const uint64_t roomKey = ComputeStableRoomKey(pRoom, isSinglePlayer, isOwner, inLobby);
+            if (g_lastRoomKey != 0 && g_lastRoomKey != roomKey) {
+                ++g_roomChangeSeq;
+            }
+            g_lastRoomKey = roomKey;
             inOwnRoom = !isLoading && (isSinglePlayer || (isOwner && !inLobby));
             remoteUsers = ReadRemoteUserCount(pRoom);
         }
@@ -2518,6 +2555,8 @@ void TryInstallAppTickHook() {
         g_mGetIsLocalUserOwner = fnMethodFromName(roomClass, "get_IsLocalUserOwner", 0);
         g_mGetIsSinglePlayer = fnMethodFromName(roomClass, "get_IsSinglePlayer", 0);
         g_mInLobby = fnMethodFromName(roomClass, "InLobby", 0);
+        g_mRoomGetRoomId = fnMethodFromName(roomClass, "get_RoomId", 0);
+        g_mRoomGetId = fnMethodFromName(roomClass, "get_Id", 0);
         g_mGetRemoteUsers = fnMethodFromName(roomClass, "get_RemoteUsers", 0);
         g_mGetRemoteUsersDict = fnMethodFromName(roomClass, "get_RemoteUsersDictionary", 0);
 
